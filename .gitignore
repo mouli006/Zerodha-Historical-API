@@ -16,6 +16,8 @@ progress.sqlite
 errors.log
 *.parquet
 *.parquet.tmp
+*.csv
+*.csv.tmp
 
 # Editors and per-user tool settings
 .vscode/
