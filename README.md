@@ -2,6 +2,8 @@
 
 A local Flask app that signs in to Zerodha Kite Connect and downloads historical candles (1-minute or daily) for every NSE equity stock, about 2,200 symbols, up to one year per run. Files are saved as CSV or Parquet, downloads can be stopped and resumed, and the dashboard shows live progress.
 
+![Dashboard with a download in progress](docs/screenshots/dashboard.png)
+
 ## Requirements
 - Python 3.10 or newer
 - A Kite Connect app with the paid **Historical data** add-on. Without it, Kite rejects the requests and the error appears in the dashboard.
@@ -19,6 +21,8 @@ A local Flask app that signs in to Zerodha Kite Connect and downloads historical
    ```
 3. Open http://127.0.0.1:5000, enter your API key and secret, and sign in with Zerodha.
 
+   ![Sign-in page](docs/screenshots/sign-in.png)
+
 Kite sessions expire every day, so you need to sign in again each day.
 
 ## Downloading data
@@ -33,6 +37,8 @@ Before you start, the dashboard estimates the number of requests and the time th
 
 ### Live progress
 While a download runs, the dashboard shows the percentage done, the stock being fetched, the time left, the request speed, rate-limit hits and errors, and a list of the stocks completed so far. The browser tab title also shows the percentage.
+
+<img src="docs/screenshots/mobile.png" alt="Live progress on a narrow screen" width="320">
 
 ### Stopping and resuming
 Progress is saved after every request. Click **Stop download** at any time. To continue, start again with the same dates, file format and save folder, and click **Resume download**. Finished chunks are skipped. Requests that fail are retried automatically at the end of the run.
@@ -49,6 +55,8 @@ Every NSE equity (`EQ`) instrument with no series suffix, plus `-BE` and `-BZ` t
 
 ## Credentials
 Your API key, secret and access token are stored only in a local `.env` file, which the app creates when you sign in. It is gitignored and never committed. `.env.example` shows the format.
+
+Screenshots show demo data, not a real account.
 
 ## Development notes
 Architecture and implementation notes are in [CLAUDE.md](CLAUDE.md).
