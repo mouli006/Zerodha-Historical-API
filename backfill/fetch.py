@@ -8,7 +8,8 @@ from .job import STOP, job_incr, job_update
 
 # Max days per request allowed by Kite for each interval
 INTERVALS = {"minute": 60, "day": 2000}
-MAX_RANGE_DAYS = 365
+MAX_RANGE_DAYS = 365          # when equity stocks are selected
+MAX_INDEX_RANGE_DAYS = 7305   # 20 years, indices only (a few requests per index)
 MAX_TRIES = 10
 
 

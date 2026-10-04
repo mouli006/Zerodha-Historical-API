@@ -76,6 +76,16 @@
   .switch input:focus-visible + span { outline: 2px solid var(--cyan); outline-offset: 2px; }
   .switch input:disabled + span { opacity: .5; }
 
+  .picks { display: grid; gap: 6px; }
+  .pick { display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 12px; cursor: pointer;
+          background: rgba(148,163,184,.05); border: 1px solid var(--border); transition: border-color .2s, background .2s; }
+  .pick:hover { border-color: var(--border-2); }
+  .pick.on { border-color: rgba(124,131,255,.55); background: rgba(124,131,255,.1); }
+  .pick input { width: 18px; height: 18px; margin: 0; flex: none; accent-color: var(--indigo); cursor: pointer; }
+  .pick b { display: block; font-size: 14px; }
+  .pick small { color: var(--muted); font-size: 12px; }
+  .pick-group { color: var(--dim); font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; margin: 10px 0 2px; }
+  .sub-toggles { margin: 0 0 4px 30px; }
   .folder { display: flex; gap: 8px; }
   .folder .input { flex: 1; min-width: 0; }
   .hint { color: var(--dim); font-size: 12px; margin-top: 8px; }
@@ -167,7 +177,7 @@
 {% endblock %}
 {% block body %}
 <script id="boot" type="application/json">{{ {
-  "user": user, "form": form, "today": today, "error": error or "",
+  "user": user, "form": form, "index_choices": index_choices, "today": today, "error": error or "",
   "urls": {"start": url_for("dashboard.download_start"), "stop": url_for("dashboard.download_stop"), "status": url_for("dashboard.download_status"),
            "browse": url_for("dashboard.browse_folder"), "logout": url_for("auth.logout"), "success": url_for("dashboard.success")}
 }|tojson }}</script>
@@ -178,6 +188,8 @@
   const U = boot.urls;
   const WINDOW_DAYS = { minute: 60, day: 2000 };
   const TYPICAL_STOCKS = 2150;
+  const MAX_DAYS_EQUITY = 365, MAX_DAYS_INDEX = 7305;   // MAX_RANGE_DAYS / MAX_INDEX_RANGE_DAYS in backfill/fetch.py
+  const SINCE_2015 = "2015-01-01";
 
   const nf = new Intl.NumberFormat("en-IN");
   const n = v => nf.format(Math.round(Number(v) || 0));
@@ -206,7 +218,10 @@
     if (!from || !to) return "Enter a start and end date.";
     if (to > parse(boot.today)) return "The end date can't be in the future.";
     if (from >= to) return "The start date must be before the end date.";
-    if ((to - from) / 864e5 > 365) return "Choose a range of one year or less. Split longer periods into separate downloads.";
+    if (!f.equity && !f.indices.length) return "Tick at least one thing to download.";
+    const days = Math.round((to - from) / 864e5);
+    if (f.equity && days > MAX_DAYS_EQUITY) return "With NSE equity stocks ticked, the range can be one year at most. Untick equity to download indices over a longer range, or split the period into separate downloads.";
+    if (days > MAX_DAYS_INDEX) return "Indices can be downloaded for up to 20 years per run.";
     if (!(speed > 0 && speed <= 3)) return "Set a speed between 0.1 and 3 requests a second.";
     if (!/^([a-zA-Z]:[\\/]|\\\\|\/|~)/.test(f.folder.trim())) return "Enter the folder as a full path, for example D:\\market_data.";
     return "";
@@ -222,19 +237,28 @@
     const err = problem(f);
     const from = parse(f.from), to = parse(f.to);
     const ws = useMemo(() => err ? [] : windows(from, to, f.interval), [f.from, f.to, f.interval, err]);
-    const stocks = (job && job.stocks_total) || TYPICAL_STOCKS;
-    const total = stocks * ws.length;
-    const runKey = `${f.interval}:${f.from}:${f.to}${f.format === "parquet" ? "" : ":" + f.format}`;   // run_key() in backfill/storage.py
-    const sameRun = !!job && job.run === runKey && !!job.folder &&
+    const stocks = (job && job.equity_total) || TYPICAL_STOCKS;
+    const count = (f.equity ? stocks : 0) + f.indices.length;
+    const total = count * ws.length;
+    // job_run_key() / run_key() in backfill/storage.py: indices first, then equity
+    const base = `${f.interval}:${f.from}:${f.to}${f.format === "parquet" ? "" : ":" + f.format}`;
+    const runKey = [...(f.indices.length ? [base + ":idx"] : []), ...(f.equity ? [base] : [])].join(" + ");
+    const sameRun = !!job && job.run === runKey && !!job.folder && job.equity === f.equity &&
+                    (job.indices || []).join() === f.indices.join() &&
                     job.folder.toLowerCase() === f.folder.trim().toLowerCase() && job.chunks_total > 0;
     const left = sameRun ? job.chunks_total - job.chunks_done : total;
     const resumable = !running && sameRun && job.chunks_done > 0 && left > 0;
     const preset = PRESETS.find(([, d]) => f.to === boot.today && f.from === iso(addDays(parse(boot.today), -d)));
+    const since2015 = f.to === boot.today && f.from === SINCE_2015;
+    const now = new Date(), stamp = `${iso(now)}_${String(now.getHours()).padStart(2, "0")}${String(now.getMinutes()).padStart(2, "0")}`;   // run_dir_name() in backfill/storage.py
+    const pickIndex = (sym, on) => setF(x => ({ ...x, indices: boot.index_choices.filter(s => s === sym ? on : x.indices.includes(s)) }));
 
     const start = async () => {
       setBusy("start");
       const body = new FormData();
       Object.entries({ interval: f.interval, from: f.from, to: f.to, speed: f.speed, folder: f.folder, format: f.format }).forEach(([k, v]) => body.append(k, v));
+      if (f.equity) body.append("equity", "1");
+      f.indices.forEach(s => body.append("indices", s));
       if (f.etfs) body.append("etfs", "1");
       if (f.t2t) body.append("t2t", "1");
       try {
@@ -259,16 +283,41 @@
 
     const speedPct = (f.speed - .5) / 2.5 * 100;
     return html`<section className="card panel" aria-labelledby="plan-title">
-      <div className="card-title"><h2 id="plan-title">New download</h2><span>All NSE equity stocks</span></div>
+      <div className="card-title"><h2 id="plan-title">New download</h2><span>${[f.equity && "NSE equity", f.indices.length && `${f.indices.length} ${f.indices.length === 1 ? "index" : "indices"}`].filter(Boolean).join(" + ") || "Nothing selected"}</span></div>
+
+      <div className="section">
+        <span className="label">Stocks</span>
+        <div className="picks" role="group" aria-label="Stocks">
+          <label className=${"pick" + (f.equity ? " on" : "")}>
+            <input type="checkbox" checked=${f.equity} disabled=${running} onChange=${e => set("equity", e.target.checked)} />
+            <span><b>NSE equity stocks</b><small>About ${n(TYPICAL_STOCKS)} stocks, one year per run at most</small></span>
+          </label>
+          ${f.equity && html`<div className="sub-toggles">
+            <label className="toggle">
+              <span><b>Trade-to-trade stocks</b><small>Include the -BE and -BZ series</small></span>
+              <span className="switch"><input type="checkbox" checked=${f.t2t} disabled=${running} onChange=${e => set("t2t", e.target.checked)} /><span></span></span>
+            </label>
+            <label className="toggle">
+              <span><b>ETFs</b><small>Index, gold and other ETFs listed on NSE</small></span>
+              <span className="switch"><input type="checkbox" checked=${f.etfs} disabled=${running} onChange=${e => set("etfs", e.target.checked)} /><span></span></span>
+            </label>
+          </div>`}
+          <div className="pick-group">NSE indices (spot)</div>
+          ${boot.index_choices.map(sym => html`<label key=${sym} className=${"pick" + (f.indices.includes(sym) ? " on" : "")}>
+            <input type="checkbox" checked=${f.indices.includes(sym)} disabled=${running} onChange=${e => pickIndex(sym, e.target.checked)} />
+            <span><b>${sym === "NIFTY 50" ? "NIFTY 50 spot" : sym}</b></span>
+          </label>`)}
+        </div>
+      </div>
 
       <div className="section">
         <span className="label">Candle size</span>
         <div className="segmented" role="group" aria-label="Candle size">
           <span className="thumb" style=${{ transform: f.interval === "day" ? "translateX(100%)" : "none" }}></span>
           <button type="button" aria-pressed=${f.interval === "minute"} disabled=${running} onClick=${() => set("interval", "minute")}>
-            1 minute<small>7 requests per stock a year</small></button>
+            1 minute${f.equity && html`<small>7 requests per stock a year</small>`}</button>
           <button type="button" aria-pressed=${f.interval === "day"} disabled=${running} onClick=${() => set("interval", "day")}>
-            Daily (EOD)<small>1 request per stock</small></button>
+            Daily (EOD)${f.equity && html`<small>1 request per stock</small>`}</button>
         </div>
       </div>
 
@@ -283,6 +332,9 @@
           ${PRESETS.map(([label, d]) => html`<button key=${label} type="button" disabled=${running}
               className=${"chip" + (preset && preset[1] === d ? " on" : "")}
               onClick=${() => setF(x => ({ ...x, to: boot.today, from: iso(addDays(parse(boot.today), -d)) }))}>Last ${label}</button>`)}
+          <button type="button" disabled=${running || f.equity} title=${f.equity ? "Untick NSE equity stocks to use a range longer than a year" : ""}
+              className=${"chip" + (since2015 ? " on" : "")}
+              onClick=${() => setF(x => ({ ...x, to: boot.today, from: SINCE_2015 }))}>Since 2015</button>
         </div>
       </div>
 
@@ -295,24 +347,15 @@
       </div>
 
       <div className="section">
-        <label className="toggle">
-          <span><b>Trade-to-trade stocks</b><small>Include the -BE and -BZ series</small></span>
-          <span className="switch"><input type="checkbox" checked=${f.t2t} disabled=${running} onChange=${e => set("t2t", e.target.checked)} /><span></span></span>
-        </label>
-        <label className="toggle">
-          <span><b>ETFs</b><small>Index, gold and other ETFs listed on NSE</small></span>
-          <span className="switch"><input type="checkbox" checked=${f.etfs} disabled=${running} onChange=${e => set("etfs", e.target.checked)} /><span></span></span>
-        </label>
-      </div>
-
-      <div className="section">
         <label className="label" htmlFor="folder">Save to</label>
         <div className="folder">
           <input className="input" id="folder" value=${f.folder} disabled=${running} spellCheck="false" onChange=${e => set("folder", e.target.value)} />
           <button type="button" className="btn btn-ghost" disabled=${running || busy === "browse"} onClick=${browse}>
             ${busy === "browse" ? html`<span className="spinner"></span> Opening` : "Browse"}</button>
         </div>
-        <div className="hint">Saved as folder / interval / SYMBOL / year.${f.format}. The folder window may open behind the browser.</div>
+        <div className="hint">Each download gets its own folder named after what, candle size, dates and start time, e.g.
+          ${" "}<code>${f.equity ? "Equity_stocks" : "Index_spot"}_${f.interval === "day" ? "EOD" : "1min"}_${f.from}_to_${f.to}_started_${stamp}</code>
+          ${" "}/ SYMBOL / year.${f.format}. Index names use _ for spaces (NIFTY_50). Resume keeps writing into the original folder. The folder window may open behind the browser.</div>
       </div>
 
       <div className="section">
@@ -328,7 +371,7 @@
 
       ${err ? html`<div className="problem" role="alert">${err}</div>` : html`<div className="estimate">
         <div className="est-nums">
-          <div><small>Stocks</small><b>${job && job.stocks_total ? "" : "~"}${n(stocks)}</b></div>
+          <div><small>${f.equity ? "Instruments" : f.indices.length === 1 ? "Index" : "Indices"}</small><b>${f.equity && !(job && job.equity_total) ? "~" : ""}${n(count)}</b></div>
           <div><small>${sameRun ? "Requests left" : "Requests"}</small><b>${n(left)}</b></div>
           <div><small>Time at full speed</small><b>${left ? dur(left / f.speed) : "Done"}</b></div>
         </div>
@@ -337,8 +380,8 @@
               className=${"win" + (running && job.chunk === iso(w.from) ? " now" : "")}>${w.days >= 15 ? short(w.from) : ""}</div>`)}
         </div>
         <div className="win-ends"><span>${long(from)}</span><span>${long(to)}</span></div>
-        <p className="est-note">${ws.length === 1 ? "One request per stock covers the whole range."
-          : `Kite allows 60 days of 1-minute candles per request, so each stock takes ${ws.length} requests.`}${resumable
+        <p className="est-note">${ws.length === 1 ? `One request per ${f.equity ? "stock" : "index"} covers the whole range.`
+          : `Kite allows ${f.interval === "day" ? "2,000 days of daily" : "60 days of 1-minute"} candles per request, so each ${f.equity ? "stock and index" : "index"} takes ${ws.length} requests.`}${f.equity && f.indices.length ? " Indices are fetched first, then stocks." : ""}${resumable
           ? ` ${n(job.chunks_done)} chunks are already saved in this folder and will be skipped.` : ""}</p>
       </div>`}
 
@@ -394,7 +437,7 @@
       setStopping(false);
     };
     const tiles = [
-      ["Stocks done", job.stocks_total ? `${n(job.stocks_done)} / ${n(job.stocks_total)}` : "None yet"],
+      [job.equity ? "Instruments done" : "Indices done", job.stocks_total ? `${n(job.stocks_done)} / ${n(job.stocks_total)}` : "None yet"],
       ["Chunks", job.chunks_total ? `${n(job.chunks_done)} / ${n(job.chunks_total)}` : "None yet"],
       ["Requests", n(job.requests)],
       ["Speed now", `${Number(job.rate || 0).toFixed(2)} req/s`, running && job.rate < job.speed ? "warn" : ""],
@@ -406,7 +449,8 @@
     ];
     const details = job.run ? [
       ["Run", `${what} candles, ${long(parse(job.from))} to ${long(parse(job.to))}`],
-      ["Saving to", job.folder],
+      ["Selection", [...(job.indices || []), ...(job.equity ? ["NSE equity stocks"] : [])].join(", ")],
+      ["Saving to", (job.out_dirs || []).length ? html`${job.folder}${job.out_dirs.map(d => html`<br key=${d} />↳ ${d}`)}` : job.folder],
       ["File format", { csv: "CSV", parquet: "Parquet" }[job.format] || "Parquet"],
       ["Pass", job.pass ? (job.pass > 1 ? `${job.pass} (retrying failed chunks)` : "1") : "Not started"],
     ] : [];
@@ -423,7 +467,7 @@
       <div className="live-top">
         <${Ring} pct=${pct} state=${job.state} failed=${job.failed} />
         <div>
-          <div className="now-label">${running && job.symbol ? "Now fetching" : "Status"}</div>
+          <div className="now-label">${running && job.symbol ? (job.part || "Now fetching") : "Status"}</div>
           <div key=${job.symbol} className=${"ticker" + (running ? " flash" : "")}>${ticker}</div>
           <div className="now-sub">${sub}</div>
           ${running && job.eta && html`<div className="eta"><b>${job.eta}</b><small>remaining</small></div>`}
@@ -443,7 +487,7 @@
       </div>
 
       ${details.length > 0 && html`<dl className="details">${details.map(([k, v]) => html`<div key=${k}><dt>${k}</dt><dd>${v}</dd></div>`)}</dl>`}
-      ${job.filter_info && html`<p className="filter">Stock list: ${job.filter_info}</p>`}
+      ${job.filter_info && html`<p className="filter">Selected: ${job.filter_info}</p>`}
       ${running && html`<div style=${{ marginTop: 18 }}><button type="button" className="btn btn-danger btn-block" disabled=${stopping} onClick=${stop}>
         ${stopping ? html`<span className="spinner"></span> Stopping` : "Stop download"}</button></div>`}
     </section>`;
@@ -451,11 +495,11 @@
 
   function Feed({ items, running }) {
     return html`<section className="card panel" aria-labelledby="feed-title">
-      <div className="card-title"><h2 id="feed-title">Recently completed</h2><span>${items.length ? `${n(items.length)} stocks, newest first` : "This job"}</span></div>
+      <div className="card-title"><h2 id="feed-title">Recently completed</h2><span>${items.length ? `${n(items.length)} done, newest first` : "This job"}</span></div>
       ${items.length ? html`<ul className="feed">${items.map(it => html`<li key=${it.symbol}>
           <span><span className="tick">✓</span><b>${it.symbol}</b></span>
           <small>${new Date(it.t).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</small></li>`)}</ul>`
-        : html`<div className="empty">${running ? "Stocks appear here as they finish." : "Nothing downloaded in this job yet."}</div>`}
+        : html`<div className="empty">${running ? "Stocks and indices appear here as they finish." : "Nothing downloaded in this job yet."}</div>`}
     </section>`;
   }
 
@@ -526,7 +570,7 @@
       <nav className="nav"><div className="brand"><${Logo} /> Kite Backfill</div><${UserMenu} /></nav>
       <header className="heading">
         <h1>${hello}${first ? `, ${first}` : ""}</h1>
-        <p>Download historical candles for every NSE stock. Progress is saved after each chunk, so you can stop and resume any time.</p>
+        <p>Download historical candles for every NSE stock and the main NSE indices. Progress is saved after each chunk, so you can stop and resume any time.</p>
       </header>
       <div className="grid">
         <${Planner} job=${job} toast=${toast} onPoll=${poll} />

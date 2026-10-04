@@ -1,4 +1,6 @@
 T2T_SERIES = {"BE", "BZ"}
+# NSE index tradingsymbols (segment INDICES) offered on the dashboard; NIFTY 50 is token 256265
+INDEX_CHOICES = ["NIFTY 50", "NIFTY BANK", "NIFTY FIN SERVICE", "NIFTY MID SELECT", "INDIA VIX"]
 MAX_STOCKS = 3000  # more than this means the series filter broke; refuse to start
 
 
@@ -19,3 +21,7 @@ def is_equity(inst, include_t2t):
     T-bills, SGBs (-N*, -Y*, -Z*, -GB, -GS, -SG, -TB, -RR, ...) and SME are excluded."""
     suffix = series_suffix(inst)
     return not suffix or (include_t2t and suffix in T2T_SERIES)
+
+
+def is_index(inst, wanted):
+    return inst["segment"] == "INDICES" and inst["tradingsymbol"] in wanted

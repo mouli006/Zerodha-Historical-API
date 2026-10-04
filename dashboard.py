@@ -7,10 +7,11 @@ from datetime import date, timedelta
 
 from flask import Blueprint, jsonify, redirect, render_template, request, session, url_for
 
-from backfill.fetch import INTERVALS, MAX_RANGE_DAYS
+from backfill.fetch import INTERVALS, MAX_INDEX_RANGE_DAYS, MAX_RANGE_DAYS
+from backfill.instruments import INDEX_CHOICES
 from backfill.job import DEFAULT_SPEED, JOB, JOB_LOCK, STOP
 from backfill.runner import bulk_download
-from backfill.storage import FILE_FORMATS, run_key
+from backfill.storage import FILE_FORMATS, job_run_key
 from config import DEFAULT_DATA_DIR, credentials, data_dir, load_env, save_env
 
 bp = Blueprint("dashboard", __name__)
@@ -27,12 +28,14 @@ def success():
             "to": JOB["to"] or today.isoformat(),
             "interval": JOB["interval"] or "minute",
             "speed": JOB["speed"],
+            "equity": JOB["equity"],
+            "indices": JOB["indices"],
             "etfs": JOB["etfs"],
             "t2t": JOB["t2t"],
             "folder": JOB["folder"] or data_dir(),
             "format": JOB["format"] or "csv",
         }
-    return render_template("success.html", user=session["user"], form=form,
+    return render_template("success.html", user=session["user"], form=form, index_choices=INDEX_CHOICES,
                            today=today.isoformat(), error=request.args.get("error"))
 
 
@@ -66,8 +69,14 @@ def download_start():
         return fail("End date cannot be in the future.")
     if start >= end:
         return fail("Start date must be before end date.")
-    if (end - start).days > MAX_RANGE_DAYS:
-        return fail("Range too long: maximum 1 year per run.")
+    equity = bool(request.form.get("equity"))
+    indices = [s for s in INDEX_CHOICES if s in request.form.getlist("indices")]
+    if not equity and not indices:
+        return fail("Choose at least one thing to download.")
+    if equity and (end - start).days > MAX_RANGE_DAYS:
+        return fail("Range too long: with NSE equity stocks ticked the maximum is 1 year per run.")
+    if (end - start).days > MAX_INDEX_RANGE_DAYS:
+        return fail("Range too long: the maximum for indices is 20 years per run.")
     fmt = request.form.get("format", "csv")
     if fmt not in FILE_FORMATS:
         return fail("Choose CSV or Parquet.")
@@ -90,7 +99,8 @@ def download_start():
     with JOB_LOCK:
         if JOB["state"] == "running":
             return redirect(url_for("dashboard.success"))
-        JOB.update(state="running", run=run_key(interval, start, end, fmt), interval=interval, format=fmt,
+        JOB.update(state="running", run=job_run_key(interval, start, end, fmt, indices, equity),
+                   interval=interval, format=fmt, equity=equity, indices=indices, part="", equity_total=0, out_dirs=[],
                    **{"from": start.isoformat()}, to=end.isoformat(), speed=speed, etfs=etfs, t2t=t2t, filter_info="", folder=folder,
                    stocks_done=0, stocks_total=0, chunks_done=0, chunks_total=0,
                    eta="", requests=0, n429=0, net_errors=0, failed=0, empty=0, rate=speed,
@@ -100,7 +110,7 @@ def download_start():
     STOP.clear()
     threading.Thread(target=bulk_download, daemon=True,
                      args=(api_key, access_token, interval, start, end, speed, etfs, t2t,
-                           folder, fmt)).start()
+                           indices, equity, folder, fmt)).start()
     return redirect(url_for("dashboard.success"))
 
 
