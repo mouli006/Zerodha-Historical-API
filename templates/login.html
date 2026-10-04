@@ -46,7 +46,7 @@
 </style>
 {% endblock %}
 {% block body %}
-<script id="boot" type="application/json">{{ {"error": error or "", "apiKey": api_key or "", "hasSecret": has_secret, "action": url_for("login")}|tojson }}</script>
+<script id="boot" type="application/json">{{ {"error": error or "", "apiKey": api_key or "", "hasSecret": has_secret, "action": url_for("auth.login")}|tojson }}</script>
 <script>{% raw %}
 (() => {
   const { useState, useMemo } = React;

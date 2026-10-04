@@ -168,8 +168,8 @@
 {% block body %}
 <script id="boot" type="application/json">{{ {
   "user": user, "form": form, "today": today, "error": error or "",
-  "urls": {"start": url_for("download_start"), "stop": url_for("download_stop"), "status": url_for("download_status"),
-           "browse": url_for("browse_folder"), "logout": url_for("logout"), "success": url_for("success")}
+  "urls": {"start": url_for("dashboard.download_start"), "stop": url_for("dashboard.download_stop"), "status": url_for("dashboard.download_status"),
+           "browse": url_for("dashboard.browse_folder"), "logout": url_for("auth.logout"), "success": url_for("dashboard.success")}
 }|tojson }}</script>
 <script>{% raw %}
 (() => {
@@ -189,7 +189,7 @@
                      return h ? `${h}h ${String(m).padStart(2, "0")}m` : `${Math.max(m, 1)} min`; };
   const addDays = (d, k) => { const x = new Date(d); x.setDate(x.getDate() + k); return x; };
 
-  // Same windows as make_chunks() in app.py
+  // Same windows as make_chunks() in backfill/fetch.py
   function windows(from, to, interval) {
     const out = [], step = WINDOW_DAYS[interval] || 60;
     for (let cur = new Date(from); cur <= to;) {
@@ -200,7 +200,7 @@
     return out;
   }
 
-  // Same checks as download_start() in app.py
+  // Same checks as download_start() in dashboard.py
   function problem(f) {
     const from = parse(f.from), to = parse(f.to), speed = Number(f.speed);
     if (!from || !to) return "Enter a start and end date.";
@@ -224,7 +224,7 @@
     const ws = useMemo(() => err ? [] : windows(from, to, f.interval), [f.from, f.to, f.interval, err]);
     const stocks = (job && job.stocks_total) || TYPICAL_STOCKS;
     const total = stocks * ws.length;
-    const runKey = `${f.interval}:${f.from}:${f.to}${f.format === "parquet" ? "" : ":" + f.format}`;   // run_key() in app.py
+    const runKey = `${f.interval}:${f.from}:${f.to}${f.format === "parquet" ? "" : ":" + f.format}`;   // run_key() in backfill/storage.py
     const sameRun = !!job && job.run === runKey && !!job.folder &&
                     job.folder.toLowerCase() === f.folder.trim().toLowerCase() && job.chunks_total > 0;
     const left = sameRun ? job.chunks_total - job.chunks_done : total;
