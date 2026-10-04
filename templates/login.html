@@ -1,0 +1,149 @@
+{% extends "base.html" %}
+{% block title %}Sign in | Kite Backfill{% endblock %}
+{% block head %}
+<style>
+  .auth { min-height: 100vh; display: grid; grid-template-columns: 1.1fr minmax(0, 440px); gap: 56px; align-items: center;
+          max-width: 1180px; margin: 0 auto; padding: 40px 24px; }
+  .brand { display: flex; align-items: center; gap: 12px; font-weight: 800; font-size: 18px; letter-spacing: -.01em; margin-bottom: 48px; }
+  .hero h1 { font-size: clamp(36px, 5vw, 60px); line-height: 1.04; letter-spacing: -.035em; font-weight: 800; margin: 0 0 18px; }
+  .hero p { color: var(--muted); font-size: 17px; max-width: 46ch; margin: 0 0 36px; }
+  .chart { position: relative; border-radius: var(--radius); padding: 22px 22px 14px; overflow: hidden; }
+  .chart-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 10px; }
+  .chart-head b { font-size: 16px; }
+  .chart-head span { color: var(--muted); font-size: 13px; }
+  .chart svg { display: block; width: 100%; height: auto; }
+  .candle { transform-box: fill-box; transform-origin: center; animation: grow .6s cubic-bezier(.2,.8,.2,1) both; }
+  @keyframes grow { from { transform: scaleY(0); opacity: 0; } }
+  .steps { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 22px; }
+  .step { display: flex; align-items: center; gap: 10px; padding: 8px 14px 8px 8px; border-radius: 999px; font-size: 13px;
+          background: rgba(148,163,184,.07); border: 1px solid var(--border); color: var(--muted); }
+  .step i { font-style: normal; width: 24px; height: 24px; border-radius: 50%; display: grid; place-items: center;
+            background: rgba(124,131,255,.18); color: var(--text); font-weight: 700; font-size: 12px; }
+
+  .card { padding: 36px; }
+  .card h2 { margin: 0 0 6px; font-size: 26px; letter-spacing: -.02em; }
+  .card .sub { color: var(--muted); margin: 0 0 26px; font-size: 14px; }
+  .field { margin-bottom: 18px; }
+  .secret { position: relative; }
+  .secret .input { padding-right: 76px; }
+  .secret button { position: absolute; right: 8px; top: 50%; transform: translateY(-50%); background: rgba(148,163,184,.1);
+                   border: 0; border-radius: 8px; padding: 6px 10px; font-size: 12px; font-weight: 700; cursor: pointer; color: var(--muted); }
+  .secret button:hover { color: var(--text); }
+  .error { display: flex; gap: 10px; padding: 12px 14px; border-radius: 12px; margin-bottom: 20px; font-size: 14px;
+           background: rgba(255, 92, 122, .1); border: 1px solid rgba(255, 92, 122, .35); color: #FFB3C1; }
+  .redirect { margin-top: 26px; padding-top: 22px; border-top: 1px solid var(--border); }
+  .redirect p { margin: 0 0 10px; font-size: 13px; color: var(--muted); }
+  .copy { display: flex; align-items: center; gap: 8px; padding: 6px 6px 6px 14px; border-radius: 12px;
+          background: rgba(7,11,22,.55); border: 1px dashed var(--border-2); }
+  .copy code { flex: 1; font-family: inherit; font-weight: 600; font-size: 14px; overflow-wrap: anywhere; }
+  .copy .btn { padding: 8px 14px; font-size: 13px; border-radius: 9px; }
+  @media (max-width: 900px) {
+    .auth { grid-template-columns: 1fr; gap: 28px; padding-top: 24px; }
+    .brand { margin-bottom: 24px; }
+    .chart { display: none; }
+    .card { padding: 26px 22px; }
+  }
+</style>
+{% endblock %}
+{% block body %}
+<script id="boot" type="application/json">{{ {"error": error or "", "apiKey": api_key or "", "hasSecret": has_secret, "action": url_for("login")}|tojson }}</script>
+<script>{% raw %}
+(() => {
+  const { useState, useMemo } = React;
+  const boot = JSON.parse(document.getElementById("boot").textContent);
+
+  // Decorative candles drawn from a fixed random walk, so the picture is the same each visit
+  function HeroChart() {
+    const candles = useMemo(() => {
+      let seed = 7, price = 100;
+      const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+      return Array.from({ length: 44 }, () => {
+        const open = price, close = open + (rnd() - .46) * 6;
+        const high = Math.max(open, close) + rnd() * 3, low = Math.min(open, close) - rnd() * 3;
+        price = close;
+        return { open, close, high, low };
+      });
+    }, []);
+    const W = 640, H = 220, pad = 8;
+    const max = Math.max(...candles.map(c => c.high)), min = Math.min(...candles.map(c => c.low));
+    const y = v => pad + (max - v) / (max - min) * (H - pad * 2);
+    const step = W / candles.length;
+    const line = candles.map((c, i) => `${i ? "L" : "M"}${i * step + step / 2},${y(c.close)}`).join(" ");
+    const last = candles[candles.length - 1], first = candles[0];
+    const pct = ((last.close - first.open) / first.open * 100).toFixed(2);
+    return html`<div className="chart panel" aria-hidden="true">
+      <div className="chart-head"><b>Sample chart</b><span>1-minute candles, 09:15 to 15:30 IST</span></div>
+      <svg viewBox=${`0 0 ${W} ${H}`}>
+        <defs><linearGradient id="area" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stopColor="#7C83FF" stopOpacity=".28"/><stop offset="1" stopColor="#7C83FF" stopOpacity="0"/></linearGradient></defs>
+        <path d=${`${line} L${W - step / 2},${H} L${step / 2},${H} Z`} fill="url(#area)"/>
+        <path d=${line} fill="none" stroke="#7C83FF" strokeWidth="1.5" strokeOpacity=".7"/>
+        ${candles.map((c, i) => {
+          const up = c.close >= c.open, col = up ? "#2EE59D" : "#FF5C7A", x = i * step + step / 2;
+          return html`<g key=${i} className="candle" style=${{ animationDelay: `${i * 22}ms` }}>
+            <line x1=${x} x2=${x} y1=${y(c.high)} y2=${y(c.low)} stroke=${col} strokeWidth="1.2"/>
+            <rect x=${x - step * .3} width=${step * .6} y=${y(Math.max(c.open, c.close))}
+                  height=${Math.max(1.5, Math.abs(y(c.open) - y(c.close)))} rx="1.5" fill=${col}/></g>`;
+        })}
+      </svg>
+      <div style=${{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "var(--dim)", marginTop: 6 }}>
+        <span>Open ${first.open.toFixed(2)}</span><span style=${{ color: pct >= 0 ? "var(--green)" : "var(--red)" }}>${pct >= 0 ? "+" : ""}${pct}%</span>
+      </div>
+    </div>`;
+  }
+
+  function Login() {
+    const [show, setShow] = useState(false);
+    const [busy, setBusy] = useState(false);
+    const [copied, setCopied] = useState("");
+    const url = "http://127.0.0.1:5000/callback";
+    const copy = async () => {
+      try { await navigator.clipboard.writeText(url); setCopied("Copied"); }
+      catch (e) { setCopied("Select and copy it"); }
+      setTimeout(() => setCopied(""), 2000);
+    };
+    return html`<main className="auth">
+      <section className="hero">
+        <div className="brand"><${Logo} /> Kite Backfill</div>
+        <h1>Every NSE stock.<br/><span className="grad-text">Every candle.</span></h1>
+        <p>Download a year of 1-minute or daily candles for all ~2,200 NSE equity stocks from your Kite Connect account, saved as Parquet and resumable at any time.</p>
+        <${HeroChart} />
+        <div className="steps">
+          <span className="step"><i>1</i>Enter your API key</span>
+          <span className="step"><i>2</i>Sign in on Zerodha</span>
+          <span className="step"><i>3</i>Choose a range and download</span>
+        </div>
+      </section>
+
+      <form className="card panel" method="post" action=${boot.action} onSubmit=${() => setBusy(true)}>
+        <h2>Sign in</h2>
+        <p className="sub">Use the credentials of your Kite Connect app. They're saved to <b>.env</b> in the project folder.</p>
+        ${boot.error && html`<div className="error" role="alert">${boot.error}</div>`}
+        <div className="field">
+          <label className="label" htmlFor="api_key">API key</label>
+          <input className="input" id="api_key" name="api_key" defaultValue=${boot.apiKey} required autoComplete="off" spellCheck="false" placeholder="Your API key" />
+        </div>
+        <div className="field">
+          <label className="label" htmlFor="api_secret">API secret</label>
+          <div className="secret">
+            <input className="input" id="api_secret" name="api_secret" type=${show ? "text" : "password"} autoComplete="off" spellCheck="false"
+                   required=${!boot.hasSecret} placeholder=${boot.hasSecret ? "Saved. Leave blank to keep it" : "Your API secret"} />
+            <button type="button" onClick=${() => setShow(s => !s)} aria-controls="api_secret">${show ? "Hide" : "Show"}</button>
+          </div>
+        </div>
+        <button className="btn btn-primary btn-block" type="submit" disabled=${busy} style=${{ marginTop: 8 }}>
+          ${busy ? html`<span className="spinner"></span> Opening Zerodha` : "Sign in with Zerodha"}
+        </button>
+        <div className="redirect">
+          <p>Your Kite app's redirect URL must be exactly:</p>
+          <div className="copy"><code>${url}</code>
+            <button type="button" className="btn btn-ghost" onClick=${copy}>${copied || "Copy"}</button></div>
+        </div>
+      </form>
+    </main>`;
+  }
+
+  ReactDOM.createRoot(document.getElementById("root")).render(html`<${Login} />`);
+})();
+{% endraw %}</script>
+{% endblock %}

@@ -1,0 +1,23 @@
+# Secrets: credentials and access token live only in the local .env
+.env
+.env.*
+!.env.example
+*.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Downloaded market data and job state
+data/
+progress.sqlite
+errors.log
+*.parquet
+*.parquet.tmp
+
+# Editors and per-user tool settings
+.vscode/
+.idea/
+.claude/settings.local.json
