@@ -47,6 +47,24 @@ def run_dir(db, data_root, run, kind, interval, start, end):
     return os.path.join(data_root, name)
 
 
+def check_folder(folder):
+    """Normalise a save folder, create it and make sure it is writable.
+    Returns (folder, error message or "")."""
+    folder = os.path.expanduser(folder.strip())
+    if not os.path.isabs(folder):
+        return folder, r"Save folder must be a full path, e.g. D:\market_data"
+    folder = os.path.normpath(folder)
+    try:
+        os.makedirs(folder, exist_ok=True)
+        probe = os.path.join(folder, ".write_test")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+    except OSError as e:
+        return folder, f"Cannot write to folder {folder}: {e.strerror or e}"
+    return folder, ""
+
+
 def log_error(data_root, run, symbol, chunk_from, msg):
     with open(os.path.join(data_root, "errors.log"), "a", encoding="utf-8") as f:
         f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} [{run}] {symbol} {chunk_from}: {msg}\n")
@@ -60,6 +78,10 @@ def open_db(data_root):
         status TEXT, tries INTEGER DEFAULT 0, error TEXT, updated TEXT,
         PRIMARY KEY (run, symbol, chunk_from))""")
     db.execute("CREATE TABLE IF NOT EXISTS runs (run TEXT PRIMARY KEY, dir TEXT, started TEXT)")
+    # reason: why a DONE F&O contract has no file (NO_CANDLES / ZERO_VOLUME); NULL for days saved before it existed
+    if "reason" not in {r[1] for r in db.execute("PRAGMA table_info(chunks)")}:
+        db.execute("ALTER TABLE chunks ADD COLUMN reason TEXT")
+        db.commit()
     return db
 
 

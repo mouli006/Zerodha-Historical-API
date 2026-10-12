@@ -42,3 +42,27 @@ def secret_key():
 def data_dir():
     """Save folder chosen on the form (remembered in .env), or <project>/data."""
     return load_env().get("KITE_DATA_DIR") or DEFAULT_DATA_DIR
+
+
+WEEKDAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+
+
+def weekly_expiry_weekday():
+    """WEEKLY_EXPIRY_WEEKDAY from .env (MON..SUN or Monday..Sunday) as Monday = 0; default Tuesday."""
+    value = load_env().get("WEEKLY_EXPIRY_WEEKDAY", "").strip().upper()[:3]
+    return WEEKDAYS.index(value) if value in WEEKDAYS else 1
+
+
+# "Keep contracts with candles but zero volume" (backfill/fno.py): Kite can report a contract that
+# traded once as candles with volume 0. False = no file for those (the old rule); .env KEEP_ZERO_VOLUME
+# (ON/OFF) overrides this default.
+KEEP_ZERO_VOLUME = False
+
+
+def keep_zero_volume():
+    value = load_env().get("KEEP_ZERO_VOLUME", "").strip().upper()
+    if value in ("1", "ON", "TRUE", "YES", "Y"):
+        return True
+    if value in ("0", "OFF", "FALSE", "NO", "N"):
+        return False
+    return KEEP_ZERO_VOLUME

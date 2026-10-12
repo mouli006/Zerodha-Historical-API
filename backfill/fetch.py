@@ -64,15 +64,15 @@ def make_chunks(start, end, interval):
     return chunks
 
 
-def fetch_chunk(kite, limiter, token, start, end, interval):
+def fetch_chunk(kite, limiter, token, start, end, interval, oi=False, max_tries=MAX_TRIES):
     """One stock + one chunk, with retries. Raises AuthStop, StopJob or ChunkFailed."""
-    for attempt in range(1, MAX_TRIES + 1):
+    for attempt in range(1, max_tries + 1):
         if STOP.is_set():
             raise StopJob()
         limiter.wait()
         job_incr("requests")
         try:
-            candles = kite.historical_data(token, start, end, interval)
+            candles = kite.historical_data(token, start, end, interval, continuous=False, oi=oi)
             limiter.on_success()
             job_update(rate=limiter.rate)
             return candles
@@ -93,6 +93,6 @@ def fetch_chunk(kite, limiter, token, start, end, interval):
         except requests.exceptions.RequestException as e:
             job_incr("net_errors")
             err = e
-        if attempt < MAX_TRIES and STOP.wait(min(2 ** attempt, 60)):
+        if attempt < max_tries and STOP.wait(min(2 ** attempt, 60)):
             raise StopJob()
-    raise ChunkFailed(f"gave up after {MAX_TRIES} tries: {type(err).__name__}: {err}")
+    raise ChunkFailed(f"gave up after {max_tries} tries: {type(err).__name__}: {err}")
