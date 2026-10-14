@@ -300,6 +300,93 @@ def test_summary_gets_bhav_columns_and_keeps_them(tmp_path, fake_kite):
     assert "Bhavcopy check: CHECK (1 missing)" in JOB["message"]
 
 
+# --- bhav_summary.csv, the difference files and the check after every Kite day ------------------
+
+def dict_rows(path):
+    with open(path, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def test_check_writes_only_the_summary_files(tmp_path, fake_kite):
+    data = tmp_path / "data"
+    run(data)
+    bhav.run_bhav(RUN_DATE, str(data), bhav_file=day_bhav(tmp_path / "b.zip"), log=lambda m: None)
+    out = data / "NIFTY_FnO_1min" / DAY / "bhavcopy"
+    summary = dict_rows(out / bhav.SUMMARY_FILE)
+    top = summary[0]
+    assert (top["Expiry"], top["Date"], top["Status"], top["Missing"], top["Bhav_traded"]) == ("ALL", DAY, "CHECK", "1", "6")
+    assert (top["Volume_unit"], top["OI_unit"]) == ("50", "1")
+    w1 = [r for r in summary if (r["Expiry"], r["Type"]) == ("2026-10-13", "OPT")][0]
+    assert (w1["Bucket"], w1["Bhav_contracts"], w1["Bhav_traded"], w1["Missing"]) == ("Current week", "4", "3", "1")
+    assert sum(int(r["Bhav_contracts"]) for r in summary[1:]) == int(top["Bhav_contracts"])
+    assert [r["Contract"] for r in dict_rows(out / "bhav_compare.csv") if r["Status"] == "MISSING_IN_KITE"] == \
+        ["NIFTY2515013OCT26CE"]
+    # no per-difference files: the zip, the NIFTY rows, the comparison, the result and the two summaries only
+    assert sorted(os.listdir(out)) == sorted(["b.zip", "nifty_bhav.csv", "bhav_compare.csv", "bhav_check.json",
+                                              bhav.SUMMARY_FILE, bhav.DAYS_SUMMARY_FILE])
+
+
+@pytest.fixture
+def auto_bhav(monkeypatch, tmp_path):
+    """Kite runs fetch the bhavcopy (tests/conftest.py turns that off); NSE answers from calls["data"]."""
+    monkeypatch.setattr(fno, "AUTO_BHAV", True)
+    calls = {"data": None, "fetched": []}
+
+    def fetch(run_date, log=print, budget=None, **kw):
+        calls["fetched"].append((run_date, budget))
+        if calls["data"] is None:
+            raise bhav.BhavNotAvailable(f"NSE has no F&O bhavcopy for {run_date} yet (404: test).")
+        return calls["data"], bhav.BHAV_URL.format(d=f"{run_date:%Y%m%d}")
+    monkeypatch.setattr(bhav, "fetch_bhav", fetch)
+    return calls
+
+
+def test_kite_run_saves_and_checks_the_bhavcopy(tmp_path, fake_kite, auto_bhav):
+    auto_bhav["data"] = open(day_bhav(tmp_path / "b.zip"), "rb").read()
+    data = tmp_path / "data"
+    assert run(data) == "finished_failures"            # the bhavcopy never changes the download's status
+    out = data / "NIFTY_FnO_1min" / DAY / "bhavcopy"
+    assert auto_bhav["fetched"] == [(RUN_DATE, bhav.CHECK_BUDGET)]
+    assert (out / "BhavCopy_NSE_FO_0_0_0_20261012_F_0000.csv.zip").exists() and (out / "nifty_bhav.csv").exists()
+    for name in ["bhav_compare.csv", bhav.SUMMARY_FILE, bhav.DAYS_SUMMARY_FILE]:
+        assert (out / name).exists(), name
+    assert not (out / "missing_in_kite.csv").exists()
+    check = json.loads((out / "bhav_check.json").read_text())
+    assert check["counts"]["missing"] == 1 and check["source"].endswith("20261012_F_0000.csv.zip")
+    assert summary_by(out.parent / "summary.csv")[("2026-10-13", "Current week")]["Missing_in_kite"] == "1"
+    assert "Bhavcopy check: CHECK (1 missing)" in JOB["message"]
+    assert bhav.list_days(str(data))[0]["status"] == "diffs"
+    # a re-run uses the saved bhavcopy: NSE is not asked again
+    run(data)
+    assert len(auto_bhav["fetched"]) == 1
+
+
+def test_kite_run_bhavcopy_not_published(tmp_path, fake_kite, auto_bhav):
+    data = tmp_path / "data"
+    assert run(data) == "finished_failures"
+    root = data / "NIFTY_FnO_1min"
+    assert not (root / DAY / "bhavcopy" / "bhav_check.json").exists()
+    assert "2026-10-12: NSE has no F&O bhavcopy" in (root / "bhavcopy.log").read_text(encoding="utf-8")
+    assert "Bhavcopy for 2026-10-12 not saved" in (root / DAY / "run.log").read_text(encoding="utf-8")
+    assert "Bhavcopy: pending (NSE has no F&O bhavcopy" in JOB["message"]
+    assert bhav.list_days(str(data))[0]["status"] == "pending"
+
+
+def test_refetch_does_not_fetch_the_bhavcopy(tmp_path, fake_kite, auto_bhav, monkeypatch):
+    data = tmp_path / "data"
+    monkeypatch.setattr(fno, "AUTO_BHAV", False)
+    run(data)
+    monkeypatch.setattr(fno, "AUTO_BHAV", True)
+    assert job_begin_fno(data)
+    fno.refetch_no_trade("key", ACCESS, RUN_DATE, str(data), 1000, log=lambda m: None)
+    assert auto_bhav["fetched"] == []
+
+
+def job_begin_fno(data):
+    from backfill.job import job_begin
+    return job_begin(**fno.job_fields("NIFTY", RUN_DATE, str(data), 1000, keep_zero=True))
+
+
 # --- CLI ----------------------------------------------------------------------------------------
 
 def make_day(root, d, checked=False):
@@ -315,8 +402,8 @@ def make_day(root, d, checked=False):
 def cli_runs(monkeypatch):
     calls = []
 
-    def fake(d, folder, underlying, bhav_file, log=print):
-        calls.append(d)
+    def fake(d, folder, underlying, bhav_file, log=print, source="kite"):
+        calls.append(d if source == "kite" else (d, source))
         return results.get(d, "ok"), "", None
     results = {}
     monkeypatch.setattr(nifty_bhav, "run_bhav", fake)
@@ -487,7 +574,8 @@ def test_route_bhav_diff(client, tmp_path):
 def test_route_check_date_and_missing(client, tmp_path, monkeypatch):
     calls = []
 
-    def fake(d, folder, underlying, bhav_file=None, log=print):
+    def fake(d, folder, underlying, bhav_file=None, log=print, source="kite"):
+        assert source == "kite"
         calls.append(d)
         if d == date(2026, 10, 9):
             return "not_available", bhav.PENDING, None
@@ -847,6 +935,29 @@ def test_export_days_summary(tmp_path, client):
     assert list(rows[0]) == bhav_export.DAY_COLUMNS
     assert [(x["Date"], x["Status"], x["Missing"], x["Zero_volume_in_kite"], x["Bhav_traded"]) for x in rows] == [
         ("2026-10-09", "OK", "0", "", "900"), ("2026-10-08", "CHECK", "2", "3", "")]
+
+
+def test_check_saves_checked_days_summary(tmp_path, fake_kite):
+    data = checked_fake_day(tmp_path)
+    out = data / "NIFTY_FnO_1min" / DAY / "bhavcopy" / bhav.DAYS_SUMMARY_FILE
+    assert out.read_bytes() == bhav_export.export(str(data), "NIFTY", "days")[1]   # only one day checked
+    assert read_csv(out)[0] == bhav_export.DAY_COLUMNS
+    # with another checked day, the day's file still holds only its own row; the download lists both
+    other = checked_day(data, "2026-10-09", "ok", counts={"missing": 0, "bhav_traded": 900})
+    bhav.check_saved(str(data / "NIFTY_FnO_1min" / DAY), RUN_DATE, log=lambda m: None)
+    assert [r["Date"] for r in dict_rows(out)] == [DAY]
+    assert len(bhav_export.days_rows(str(data), "NIFTY")) == 2
+    assert not (other / "bhavcopy" / bhav.DAYS_SUMMARY_FILE).exists()
+
+
+def test_checked_days_summary_needs_a_saved_day(tmp_path):
+    day = tmp_path / "NIFTY_FnO_1min" / DAY      # contract files and a bhavcopy, but no summary.csv
+    kite_file(str(day), "NIFTY27OCT26", [100.0])
+    (day / "bhavcopy").mkdir()
+    fno.write_csv(str(day / "bhavcopy" / "nifty_bhav.csv"), bhav.BHAV_HEADER, [row("IDF", "2026-10-27", vol=1, last=100)])
+    bhav.check_saved(str(day), RUN_DATE, log=lambda m: None)
+    assert (day / "bhavcopy" / "bhav_check.json").exists()
+    assert not (day / "bhavcopy" / bhav.DAYS_SUMMARY_FILE).exists()
 
 
 def test_export_unchecked_day_is_404(tmp_path, client, capsys):

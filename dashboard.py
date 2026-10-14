@@ -10,7 +10,9 @@ from flask import Blueprint, jsonify, redirect, render_template, request, send_f
 from kiteconnect import KiteConnect
 from kiteconnect import exceptions as kex
 
+import dhan
 from backfill import bhav, bhav_export, fno
+from backfill.dhan_api import DhanClient, data_plan_error, token_ok
 from backfill.fetch import INTERVALS, MAX_INDEX_RANGE_DAYS, MAX_RANGE_DAYS
 from backfill.instruments import INDEX_CHOICES
 from backfill.job import DEFAULT_SPEED, JOB, JOB_LOCK, STOP, job_begin
@@ -39,11 +41,18 @@ def success():
             "folder": JOB["folder"] or data_dir(),
             "format": JOB["format"] or "csv",
         }
-    fno_info = {"underlying": "NIFTY", "exchange": fno.UNDERLYINGS["NIFTY"][0],
+    # the F&O and bhavcopy cards switch between these (exchange: Kite's; bhav: whose bhavcopy checks it)
+    underlyings = [{"name": u, "exchange": exch, "bhav": fno.exchange_name(u)} for u, (exch, _) in fno.UNDERLYINGS.items()]
+    fno_info = {"underlying": "NIFTY", "exchange": fno.UNDERLYINGS["NIFTY"][0], "underlyings": underlyings,
                 "ready_at": fno.READY_AT.strftime("%H:%M"), "today": fno.today_ist().isoformat(),
                 "keep_zero_volume": keep_zero_volume()}
-    return render_template("success.html", user=session["user"], form=form, index_choices=INDEX_CHOICES,
-                           today=today.isoformat(), fno=fno_info, error=request.args.get("error"))
+    broker = {"name": "Kite", "maxSpeed": 3, "defaultSpeed": DEFAULT_SPEED,
+              "urls": {"fnoWindow": url_for("dashboard.download_fno_window"), "fno": url_for("dashboard.download_fno_start"),
+                       "page": url_for("dashboard.success")}}
+    return render_template("success.html", mode="kite", broker=broker, kite=True,
+                           user=session["user"], form=form, index_choices=INDEX_CHOICES,
+                           today=today.isoformat(), fno=fno_info, dhan=dhan.status(load_env()),
+                           dhan_connected=request.args.get("dhan") == "1", error=request.args.get("error"))
 
 
 def read_speed():
@@ -125,7 +134,7 @@ def fno_window(folder, underlying):
             LIVE[(today, underlying)] = fno.live_expiries(
                 kite.instruments(fno.UNDERLYINGS[underlying][0]), underlying, today)
         history = set(fno.read_expiries(folder, underlying))
-        return fno.date_window(LIVE[(today, underlying)], history, today, weekly_expiry_weekday()), ""
+        return fno.date_window(LIVE[(today, underlying)], history, today, weekly_expiry_weekday(underlying)), ""
     except (kex.TokenException, kex.PermissionException):
         return None, "Kite session expired. Sign in again."
     except Exception as e:
@@ -155,7 +164,8 @@ def download_fno_window():
 
 @bp.route("/download/fno-start", methods=["POST"])
 def download_fno_start():
-    """F&O run for one picked date, or for every missing date (missing=1), or a re-check of one saved
+    """F&O run for one picked date, a picked range (date_from/date_to: every day in it, saved files
+    skipped), or every missing date (missing=1), or a re-check of one saved
     date's contracts without a file (refetch=1, needs keep_zero=1); the same jobs as nifty_daily.py
     DATE / --missing / --refetch-no-trade DATE. keep_zero=1 keeps contracts with zero-volume candles."""
     if "access_token" not in session:
@@ -176,12 +186,15 @@ def download_fno_start():
     keep_zero = request.form.get("keep_zero") == "1"
     if refetch and not keep_zero:
         return fail("Turn on \"Keep contracts with candles but zero volume\" to re-check no-trade contracts.")
-    run_date = None
+    run_date = dates = None
     if not missing:
         try:
-            run_date = date.fromisoformat(request.form.get("date", ""))
-        except ValueError:
-            return fail("Choose the date to download.")
+            run_date, dates = fno.parse_pick(request.form.get("date", ""), request.form.get("date_from", ""),
+                                             request.form.get("date_to", ""))
+        except ValueError as e:
+            return fail(str(e))
+        if dates and refetch:
+            return fail("Re-check no-trade contracts works on one day; pick a single date.")
     speed = read_speed()
     if not speed:
         return fail("Speed must be between 0 and 3 requests per second.")
@@ -194,6 +207,10 @@ def download_fno_start():
     if missing:
         if not fno.missing_dates(folder, underlying, w):
             return fail(f"Nothing missing: every day from {w.min_date} to {w.max_date} is saved or a holiday.")
+    elif dates:
+        err = fno.window_error(dates[0], w) or fno.window_error(dates[-1], w) or fno.too_early(dates[-1])
+        if err:
+            return fail(err)
     else:
         err = fno.window_error(run_date, w) or fno.too_early(run_date)
         if err:
@@ -205,23 +222,29 @@ def download_fno_start():
         lock = fno.acquire_lock(folder, underlying, "dashboard")
     except fno.LockBusy as e:
         return fail(str(e))
-    if not job_begin(**fno.job_fields(underlying, run_date, folder, speed, keep_zero)):
+    label = f"{dates[0]}_to_{dates[-1]}" if dates else "missing"
+    if not job_begin(**fno.job_fields(underlying, run_date, folder, speed, keep_zero, label=label)):
         lock.release()
         return fail("A download is already running. Stop it or wait for it to finish.")
     save_env({"KITE_DATA_DIR": folder})
     STOP.clear()
 
+    weekday = weekly_expiry_weekday(underlying)
+
     def work():
         try:
             if missing:
-                fno.run_missing(api_key, access_token, folder, speed, underlying, weekday=weekly_expiry_weekday(),
+                fno.run_missing(api_key, access_token, folder, speed, underlying, weekday=weekday,
                                 keep_zero=keep_zero)
+            elif dates:
+                fno.run_missing(api_key, access_token, folder, speed, underlying, weekday=weekday,
+                                keep_zero=keep_zero, dates=dates)
             elif refetch:
                 fno.refetch_no_trade(api_key, access_token, run_date, folder, speed, underlying,
-                                     weekday=weekly_expiry_weekday())
+                                     weekday=weekday)
             else:
                 fno.run_daily(api_key, access_token, run_date, folder, speed, underlying,
-                              weekday=weekly_expiry_weekday(), keep_zero=keep_zero)
+                              weekday=weekday, keep_zero=keep_zero)
         finally:
             lock.release()
 
@@ -247,47 +270,69 @@ def fno_args(need_date=True):
     return folder, run_date, underlying, ""
 
 
-def locked_fno(folder, underlying, owner):
+def fno_source():
+    """(source, error) from ?source= on the bhavcopy routes: "kite" (default) or "dhan" (the Dhan F&O page)."""
+    source = request.values.get("source", "kite") or "kite"
+    if source not in fno.FOLDERS:
+        return None, f"Unknown data source {source}."
+    if source == "dhan" and request.values.get("underlying", "NIFTY") not in dhan.UNDERLYINGS:
+        return None, f"Unknown underlying {request.values.get('underlying')}."
+    return source, ""
+
+
+def signed_in(source):
+    """Kite files need the Kite session; Dhan files a valid Dhan token."""
+    return "access_token" in session if source == "kite" else dhan.status(load_env())["connected"]
+
+
+def locked_fno(folder, underlying, owner, source="kite"):
     """(lock, error): the F&O lock, refused while a download job is running (it owns the rate limit)."""
     with JOB_LOCK:
         if JOB["state"] == "running":
             return None, "A download is running. Try again when it has finished."
     try:
-        return fno.acquire_lock(folder, underlying, owner), ""
+        return fno.acquire_lock(folder, underlying, owner, source), ""
     except fno.LockBusy as e:
         return None, str(e)
 
 
-def refresh_live_summary(folder, run_date, rows):
+def refresh_live_summary(folder, run_date, rows, source="kite"):
     """Show new summary rows on the live card when it is showing this day."""
     if rows is not None:
         with JOB_LOCK:
-            if JOB["kind"] == "fno" and JOB["fno_date"] == run_date.isoformat() and JOB["folder"] == folder:
+            if (JOB["kind"] == "fno" and JOB["fno_date"] == run_date.isoformat() and JOB["folder"] == folder
+                    and (JOB["source"] or "kite") == source):
                 JOB["fno_summary"] = rows
 
 
 @bp.route("/fno/bhav-status")
 def fno_bhav_status():
-    """Every saved Kite day with its bhavcopy check (latest first) and the banner dates."""
-    if "access_token" not in session:
+    """Every saved day (Kite's, or Dhan's with source=dhan) with its bhavcopy check (latest first) and the banner dates."""
+    source, err = fno_source()
+    if err:
+        return jsonify({"error": err})
+    if not signed_in(source):
         return jsonify({"error": "Not logged in."}), 403
     folder, _, underlying, err = fno_args(need_date=False)
     if err:
         return jsonify({"error": err})
-    days = bhav.list_days(folder, underlying)
+    days = bhav.list_days(folder, underlying, source)
     return jsonify({"days": days, "banners": bhav.banners(days, fno.today_ist())})
 
 
 @bp.route("/fno/bhav-diff")
 def fno_bhav_diff():
     """The day's bhav_compare.csv rows whose Status is not OK."""
-    if "access_token" not in session:
+    source, err = fno_source()
+    if err:
+        return jsonify({"error": err})
+    if not signed_in(source):
         return jsonify({"error": "Not logged in."}), 403
     folder, run_date, underlying, err = fno_args()
     if err:
         return jsonify({"error": err})
     try:
-        rows, check = bhav.diff_rows(folder, underlying, run_date)
+        rows, check = bhav.diff_rows(folder, underlying, run_date, source)
     except bhav.BhavError as e:
         return jsonify({"error": str(e)})
     return jsonify({"rows": rows, "units": check.get("units", {}), "line": check["line"]})
@@ -298,7 +343,10 @@ def fno_bhav_export():
     """A download of the bhavcopy check: scope=days (every checked day), or for a date scope=view (the
     difference list for bucket=<name|liquid|all>), all (every contract) or xlsx (full report). Reads the
     saved files only; 404 when the day has no check."""
-    if "access_token" not in session:
+    source, err = fno_source()
+    if err:
+        return jsonify({"error": err}), 400
+    if not signed_in(source):
         return jsonify({"error": "Not logged in."}), 403
     scope = request.args.get("scope", "")
     if scope not in ("days", "view", "all", "xlsx"):
@@ -308,7 +356,7 @@ def fno_bhav_export():
         return jsonify({"error": err}), 400
     try:
         name, data, mimetype = bhav_export.export(folder, underlying, scope, run_date,
-                                                  request.args.get("bucket", "all") or "all")
+                                                  request.args.get("bucket", "all") or "all", source=source)
     except bhav.BhavError as e:
         return jsonify({"error": str(e)}), 404
     return send_file(io.BytesIO(data), mimetype=mimetype, as_attachment=True, download_name=name)
@@ -317,8 +365,12 @@ def fno_bhav_export():
 @bp.route("/fno/bhav-check", methods=["POST"])
 def fno_bhav_check():
     """Bhavcopy check for one date, or every saved day without one (missing=1); nifty_bhav.py DATE /
-    --missing. Runs in the request (about 1 MB per day); no Kite token needed."""
-    if "access_token" not in session:
+    --missing. Runs in the request (about 1 MB per day); no Kite token needed. source=dhan checks the
+    Dhan files (<UNDERLYING>_FnO_1min_Dhan)."""
+    source, err = fno_source()
+    if err:
+        return jsonify({"error": err})
+    if not signed_in(source):
         return jsonify({"error": "Not logged in."}), 403
     missing = bool(request.values.get("missing"))
     folder, run_date, underlying, err = fno_args(need_date=not missing)
@@ -326,18 +378,18 @@ def fno_bhav_check():
         folder, err = check_folder(folder)
     if err:
         return jsonify({"error": err})
-    dates = bhav.unchecked_days(folder, underlying) if missing else [run_date]
+    dates = bhav.unchecked_days(folder, underlying, source) if missing else [run_date]
     if not dates:
         return jsonify({"results": [], "message": "Every saved day has a bhavcopy check."})
-    lock, err = locked_fno(folder, underlying, "dashboard bhavcopy check")
+    lock, err = locked_fno(folder, underlying, "dashboard bhavcopy check", source)
     if err:
         return jsonify({"error": err})
     results = []
     try:
         for d in dates:
             try:
-                status, line, rows = bhav.run_bhav(d, folder, underlying)
-                refresh_live_summary(folder, d, rows)
+                status, line, rows = bhav.run_bhav(d, folder, underlying, source=source)
+                refresh_live_summary(folder, d, rows, source)
             except (bhav.BhavError, OSError) as e:
                 status, line = "error", str(e)
             results.append({"date": d.isoformat(), "status": status, "line": line})
@@ -349,8 +401,12 @@ def fno_bhav_check():
 @bp.route("/fno/redownload", methods=["POST"])
 def fno_redownload():
     """Fetch one missing contract for a day again (still-live contracts only; keep_zero=1 keeps it when
-    its candles all have volume 0), then re-run the day's bhavcopy comparison from the saved file."""
-    if "access_token" not in session:
+    its candles all have volume 0), then re-run the day's bhavcopy comparison from the saved file.
+    source=dhan re-downloads a Dhan file with the Dhan token."""
+    source, err = fno_source()
+    if err:
+        return jsonify({"error": err})
+    if not signed_in(source):
         return jsonify({"error": "Not logged in."}), 403
     folder, run_date, underlying, err = fno_args()
     contract = request.values.get("contract", "").strip()
@@ -358,19 +414,36 @@ def fno_redownload():
         err = "Which contract?"
     if err:
         return jsonify({"error": err})
-    access_token = load_env().get("KITE_ACCESS_TOKEN")
-    if not access_token:
-        return jsonify({"error": "No access token in .env. Please log in again."})
-    lock, err = locked_fno(folder, underlying, "dashboard re-download")
+    env = load_env()
+    client = None
+    if source == "dhan":
+        # the same checks as /dhan/fno-start: token not expired, accepted by Dhan, Data API plan active
+        access_token, err = token_ok(env)
+        if not err:
+            client = DhanClient(access_token)
+            try:
+                err = data_plan_error(client.profile())
+            except (kex.TokenException, kex.PermissionException) as e:
+                err = f"Dhan access token is invalid or expired ({e}). Paste a new one on the Dhan tab."
+            except Exception as e:
+                err = f"Could not reach Dhan to check the token: {type(e).__name__}: {e}"
+        if err:
+            return jsonify({"error": err})
+    else:
+        access_token = env.get("KITE_ACCESS_TOKEN")
+        if not access_token:
+            return jsonify({"error": "No access token in .env. Please log in again."})
+    lock, err = locked_fno(folder, underlying, "dashboard re-download", source)
     if err:
         return jsonify({"error": err})
     try:
-        saved, message = fno.redownload_contract(credentials()[0], access_token, run_date, folder, contract,
-                                                 underlying, read_speed() or DEFAULT_SPEED,
-                                                 keep_zero=request.values.get("keep_zero") == "1")
-        status, line, rows = (bhav.check_saved(os.path.join(fno.fno_root(folder, underlying), run_date.isoformat()),
-                                               run_date, underlying) if saved else ("", "", None))
-        refresh_live_summary(folder, run_date, rows)
+        saved, message = fno.redownload_contract(credentials()[0] if source == "kite" else "", access_token, run_date,
+                                                 folder, contract, underlying, read_speed() or DEFAULT_SPEED,
+                                                 keep_zero=request.values.get("keep_zero") == "1",
+                                                 kite=client, source=source)
+        day_dir = os.path.join(fno.fno_root(folder, underlying, source), run_date.isoformat())
+        status, line, rows = bhav.check_saved(day_dir, run_date, underlying) if saved else ("", "", None)
+        refresh_live_summary(folder, run_date, rows, source)
     except (bhav.BhavError, OSError) as e:
         return jsonify({"error": str(e)})
     finally:
@@ -392,7 +465,7 @@ print(path or "", end="")
 @bp.route("/browse-folder", methods=["POST"])
 def browse_folder():
     """Opens a native folder picker on this machine (the app only runs on 127.0.0.1)."""
-    if "access_token" not in session:
+    if "access_token" not in session and not dhan.status(load_env())["connected"]:
         return jsonify({"path": "", "error": "Not logged in."}), 403
     current = request.form.get("current") or data_dir()
     try:

@@ -12,6 +12,8 @@ JOB = {"state": "idle", "run": "", "interval": "", "from": "", "to": "", "speed"
        "job_no": 0, "completed": [],  # completed: [symbol, time] per stock finished this job
        # kind: "backfill" (planner) or "fno" (daily F&O run, backfill/fno.py)
        "kind": "backfill", "fno_date": "", "fno_underlying": "", "fno_exchange": "",
+       # source of an F&O job: "kite" or "dhan" (backfill/dhan_api.py)
+       "source": "",
        "fno_summary": [], "fno_futures": [],
        # F&O: keep_zero = "keep zero-volume contracts" setting; zero_kept / zero_skipped count contracts
        # whose candles all have volume 0 (empty counts those without candles)
@@ -21,7 +23,7 @@ STOP = threading.Event()
 COUNTERS = {"pass": 0, "stocks_done": 0, "stocks_total": 0, "chunks_done": 0, "chunks_total": 0,
             "eta": "", "requests": 0, "n429": 0, "net_errors": 0, "failed": 0, "empty": 0,
             "zero_kept": 0, "zero_skipped": 0,
-            "symbol": "", "chunk": "", "part": "", "filter_info": "", "out_dirs": []}
+            "symbol": "", "chunk": "", "part": "", "filter_info": "", "out_dirs": [], "source": ""}
 
 
 def job_update(**kw):

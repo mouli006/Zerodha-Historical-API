@@ -44,21 +44,31 @@ def contract_row(r, unit):
             "Bhav_settle": r.get("Bhav_settle", ""), "Status": r["Status"], "Status_note": r.get("Note", "")}
 
 
+def relabel(columns, rows, source="kite"):
+    """Kite files keep the Kite_* names. For Dhan files (source="dhan") the same tables say Dhan:
+    Kite_volume -> Dhan_volume, MISSING_IN_KITE -> MISSING_IN_DHAN, "Kite's last bar" -> "Dhan's last bar"."""
+    if source == "kite":
+        return columns, rows
+    name = fno.BROKER[source]
+    swap = lambda t: t.replace("Kite", name).replace("kite", name.lower()).replace("KITE", name.upper())
+    return [swap(c) for c in columns], [{swap(k): swap(v) if isinstance(v, str) else v for k, v in r.items()} for r in rows]
+
+
 def volume_unit(check):
     return (check.get("units") or {}).get("volume", 1)
 
 
-def all_contracts(data_root, underlying, run_date):
+def all_contracts(data_root, underlying, run_date, source="kite"):
     """(every contract of the day in CONTRACT_COLUMNS, check). Raises BhavError when not checked."""
-    rows, check = bhav.compare_rows(data_root, underlying, run_date)
+    rows, check = bhav.compare_rows(data_root, underlying, run_date, source)
     unit = volume_unit(check)
     return [contract_row(r, unit) for r in rows], check
 
 
-def view_rows(data_root, underlying, run_date, bucket="all"):
+def view_rows(data_root, underlying, run_date, bucket="all", source="kite"):
     """The rows the dashboard's difference list shows for a bucket filter ("all", "liquid" or a bucket
     name), in its order (biggest bhavcopy volume first)."""
-    rows, check = bhav.diff_rows(data_root, underlying, run_date)
+    rows, check = bhav.diff_rows(data_root, underlying, run_date, source)
     if bucket == "liquid":
         rows = [r for r in rows if r["Liquid"]]
     elif bucket != "all":
@@ -73,26 +83,27 @@ def day_status(d):
     return "CHECK (minor)" if d["severity"] == "minor" else "CHECK"
 
 
-def day_row(data_root, underlying, d):
+def day_row(data_root, underlying, d, source="kite"):
     """A list_days() entry in DAY_COLUMNS; counts an older check doesn't have stay blank."""
     counts = d["counts"]
-    day_dir = os.path.join(fno.fno_root(data_root, underlying), d["date"])
+    day_dir = os.path.join(fno.fno_root(data_root, underlying, source), d["date"])
     return {"Date": d["date"], "Status": day_status(d),
             **{col: counts.get(key, "") for col, key in DAY_COUNTS.items()},
             "Toggle_keep_zero_volume": fno.saved_keep_zero(day_dir)}
 
 
-def days_rows(data_root, underlying):
+def days_rows(data_root, underlying, source="kite"):
     """One row per checked day, latest first. Raises BhavError when no day has been checked."""
-    out = [day_row(data_root, underlying, d) for d in bhav.list_days(data_root, underlying) if d["status"] != "pending"]
+    out = [day_row(data_root, underlying, d, source) for d in bhav.list_days(data_root, underlying, source)
+           if d["status"] != "pending"]
     if not out:
         raise bhav.BhavError("No day in this folder has been checked against the bhavcopy yet.")
     return out
 
 
-def expiry_rows(data_root, underlying, run_date, contracts):
+def expiry_rows(data_root, underlying, run_date, contracts, source="kite"):
     """Per-expiry rows from summary.csv; Volume_diffs counted from the day's contract rows."""
-    path = os.path.join(fno.fno_root(data_root, underlying), run_date.isoformat(), "summary.csv")
+    path = os.path.join(fno.fno_root(data_root, underlying, source), run_date.isoformat(), "summary.csv")
     if not os.path.exists(path):
         return []
     volume = {}
@@ -114,7 +125,8 @@ def expiry_rows(data_root, underlying, run_date, contracts):
 
 # --- files ------------------------------------------------------------------------------------
 
-def csv_bytes(columns, rows):
+def csv_bytes(columns, rows, source="kite"):
+    columns, rows = relabel(columns, rows, source)
     buf = io.StringIO()
     w = csv.DictWriter(buf, fieldnames=columns, lineterminator="\n", extrasaction="ignore")
     w.writeheader()
@@ -129,9 +141,10 @@ def cell(v):
     return v
 
 
-def put_table(ws, top, columns, rows):
+def put_table(ws, top, columns, rows, source="kite"):
     """Header row (bold) at row top, then the rows; returns the last row number."""
     from openpyxl.styles import Font
+    columns, rows = relabel(columns, rows, source)
     for c, name in enumerate(columns, 1):
         ws.cell(top, c, name).font = Font(bold=True)
     for i, r in enumerate(rows, top + 1):
@@ -151,34 +164,34 @@ def fit_columns(ws):
         ws.column_dimensions[get_column_letter(col)].width = min(w + 2, 60)
 
 
-def table_sheet(wb, title, columns, rows):
+def table_sheet(wb, title, columns, rows, source="kite"):
     from openpyxl.utils import get_column_letter
     ws = wb.create_sheet(title)
-    last = put_table(ws, 1, columns, rows)
+    last = put_table(ws, 1, columns, rows, source)
     ws.freeze_panes = "A2"
     ws.auto_filter.ref = f"A1:{get_column_letter(len(columns))}{max(last, 1)}"
     fit_columns(ws)
 
 
-def xlsx_bytes(data_root, underlying, run_date):
+def xlsx_bytes(data_root, underlying, run_date, source="kite"):
     """The full report of a day: Summary (the day row, then one row per expiry), Not OK, All contracts
     and Settlement (bhavcopy close, settlement price and OI per contract, for backtest P&L)."""
     from openpyxl import Workbook
     from openpyxl.utils import get_column_letter
-    contracts, check = all_contracts(data_root, underlying, run_date)
-    day = next((d for d in bhav.list_days(data_root, underlying) if d["date"] == run_date.isoformat()), None)
+    contracts, check = all_contracts(data_root, underlying, run_date, source)
+    day = next((d for d in bhav.list_days(data_root, underlying, source) if d["date"] == run_date.isoformat()), None)
     wb = Workbook()
     ws = wb.active
     ws.title = SHEETS[0]
-    put_table(ws, 1, DAY_COLUMNS, [day_row(data_root, underlying, day)] if day else [])
-    expiries = expiry_rows(data_root, underlying, run_date, contracts)
-    last = put_table(ws, 4, EXPIRY_COLUMNS, expiries)
+    put_table(ws, 1, DAY_COLUMNS, [day_row(data_root, underlying, day, source)] if day else [], source)
+    expiries = expiry_rows(data_root, underlying, run_date, contracts, source)
+    last = put_table(ws, 4, EXPIRY_COLUMNS, expiries, source)
     ws.freeze_panes = "A5"   # the day row and the expiry header stay in view
     ws.auto_filter.ref = f"A4:{get_column_letter(len(EXPIRY_COLUMNS))}{max(last, 4)}"
     fit_columns(ws)
-    table_sheet(wb, SHEETS[1], CONTRACT_COLUMNS, [r for r in contracts if r["Status"] != "OK"])
-    table_sheet(wb, SHEETS[2], CONTRACT_COLUMNS, contracts)
-    table_sheet(wb, SHEETS[3], SETTLEMENT_COLUMNS, [r for r in contracts if r["Bhav_settle"] != ""])
+    table_sheet(wb, SHEETS[1], CONTRACT_COLUMNS, [r for r in contracts if r["Status"] != "OK"], source)
+    table_sheet(wb, SHEETS[2], CONTRACT_COLUMNS, contracts, source)
+    table_sheet(wb, SHEETS[3], SETTLEMENT_COLUMNS, [r for r in contracts if r["Bhav_settle"] != ""], source)
     buf = io.BytesIO()
     wb.save(buf)
     return buf.getvalue()
@@ -188,19 +201,21 @@ def slug(text):
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_") or "all"
 
 
-def export(data_root, underlying, scope, run_date=None, bucket="all", today=None):
+def export(data_root, underlying, scope, run_date=None, bucket="all", today=None, source="kite"):
     """(file name, bytes, media type) for scope "days", "view", "all" or "xlsx". Reads only.
-    Raises BhavError when the day (or, for "days", every day) has no check."""
+    Raises BhavError when the day (or, for "days", every day) has no check. Dhan files (source="dhan")
+    get Dhan_* columns and a _dhan file name suffix; underlyings other than NIFTY add theirs (_sensex)."""
+    tag = ("" if underlying == "NIFTY" else f"_{underlying.lower()}") + ("" if source == "kite" else f"_{source}")
     if scope == "days":
         today = today or fno.today_ist()
-        return (f"bhavcopy_check_all_days_{today}.csv", csv_bytes(DAY_COLUMNS, days_rows(data_root, underlying)),
-                "text/csv")
+        return (f"bhavcopy_check_all_days_{today}{tag}.csv",
+                csv_bytes(DAY_COLUMNS, days_rows(data_root, underlying, source), source), "text/csv")
     if scope == "view":
-        return (f"bhavcopy_check_{run_date}_{slug(bucket)}.csv",
-                csv_bytes(CONTRACT_COLUMNS, view_rows(data_root, underlying, run_date, bucket)), "text/csv")
+        return (f"bhavcopy_check_{run_date}_{slug(bucket)}{tag}.csv",
+                csv_bytes(CONTRACT_COLUMNS, view_rows(data_root, underlying, run_date, bucket, source), source), "text/csv")
     if scope == "all":
-        return (f"bhavcopy_check_{run_date}_all_contracts.csv",
-                csv_bytes(CONTRACT_COLUMNS, all_contracts(data_root, underlying, run_date)[0]), "text/csv")
+        return (f"bhavcopy_check_{run_date}_all_contracts{tag}.csv",
+                csv_bytes(CONTRACT_COLUMNS, all_contracts(data_root, underlying, run_date, source)[0], source), "text/csv")
     if scope == "xlsx":
-        return f"bhavcopy_check_{run_date}.xlsx", xlsx_bytes(data_root, underlying, run_date), XLSX
+        return f"bhavcopy_check_{run_date}{tag}.xlsx", xlsx_bytes(data_root, underlying, run_date, source), XLSX
     raise ValueError(f"unknown export scope {scope!r}")

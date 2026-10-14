@@ -28,7 +28,7 @@ def client(monkeypatch, ist_now):
     monkeypatch.setattr(dashboard, "load_env", lambda: {"KITE_ACCESS_TOKEN": "x"})
     monkeypatch.setattr(dashboard, "credentials", lambda: ("key", ""))
     monkeypatch.setattr(dashboard, "save_env", lambda updates: None)
-    monkeypatch.setattr(dashboard, "weekly_expiry_weekday", lambda: 1)
+    monkeypatch.setattr(dashboard, "weekly_expiry_weekday", lambda underlying="NIFTY": 1)
     monkeypatch.setattr(dashboard, "keep_zero_volume", lambda: False)
     monkeypatch.setattr(dashboard, "fno_window", lambda folder, underlying: (WINDOW, ""))
     with JOB_LOCK:
@@ -57,7 +57,7 @@ def wait_for(cond):
 
 def test_success_page_has_fno_card(client):
     html = client.get("/success").get_data(as_text=True)
-    assert "/download/fno-start" in html and "/download/fno-window" in html and "FnoCard" in html
+    assert "/download/fno-start" in html and "/download/fno-window" in html and "FnoCard" in html and "DayRangePicker" in html
 
 
 # --- /download/fno-window ---------------------------------------------------------------------
@@ -108,7 +108,7 @@ def test_fno_window_fetches_instruments_once_a_day(monkeypatch, ist_now, tmp_pat
     monkeypatch.setattr(dashboard, "KiteConnect", Kite)
     monkeypatch.setattr(dashboard, "credentials", lambda: ("key", ""))
     monkeypatch.setattr(dashboard, "load_env", lambda: {"KITE_ACCESS_TOKEN": "x"})
-    monkeypatch.setattr(dashboard, "weekly_expiry_weekday", lambda: 1)
+    monkeypatch.setattr(dashboard, "weekly_expiry_weekday", lambda underlying="NIFTY": 1)
     monkeypatch.setattr(dashboard, "LIVE", {})
     w, err = dashboard.fno_window(str(tmp_path), "NIFTY")
     dashboard.fno_window(str(tmp_path), "NIFTY")
@@ -216,13 +216,69 @@ def test_fno_start_missing_nothing_left(client, tmp_path, monkeypatch):
     assert "Nothing+missing" in post(client, tmp_path, date=None, missing="1")
 
 
+# --- date range (date_from / date_to) ----------------------------------------------------------
+
+def test_parse_pick():
+    assert fno.parse_pick("2026-10-12") == (date(2026, 10, 12), None)
+    assert fno.parse_pick("", "2026-10-12", "2026-10-12") == (date(2026, 10, 12), None)
+    assert fno.parse_pick("2026-10-01", "2026-10-10", "2026-10-12") == \
+        (None, [date(2026, 10, 10), date(2026, 10, 11), date(2026, 10, 12)])
+    for args in [("",), ("", "2026-10-12", ""), ("", "2026-10-12", "2026-10-10")]:
+        with pytest.raises(ValueError):
+            fno.parse_pick(*args)
+
+
+def test_fno_start_runs_range(client, tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_missing(api_key, token, folder, speed, underlying, weekday, keep_zero=False, dates=None):
+        seen.update(folder=folder, dates=dates, keep_zero=keep_zero)
+        with JOB_LOCK:
+            JOB["state"] = "finished"
+
+    monkeypatch.setattr(fno, "run_missing", fake_missing)
+    assert "error" not in post(client, tmp_path, date=None, date_from="2026-10-10", date_to="2026-10-12", keep_zero="1")
+    assert wait_for(lambda: seen)
+    assert seen == {"folder": str(tmp_path), "keep_zero": True,
+                    "dates": [date(2026, 10, 10), date(2026, 10, 11), date(2026, 10, 12)]}
+    assert JOB["fno_date"] == "" and JOB["run"] == "fno:NIFTY:NFO:2026-10-10_to_2026-10-12"
+    assert wait_for(lambda: lock_free(tmp_path)), "lock not released"
+
+
+def test_fno_start_same_day_range_is_one_day(client, tmp_path, monkeypatch):
+    seen = {}
+    monkeypatch.setattr(fno, "run_daily", lambda api_key, token, run_date, *a, **kw: seen.update(run_date=run_date))
+    monkeypatch.setattr(fno, "run_missing", lambda *a, **kw: seen.update(missing=True))
+    post(client, tmp_path, date=None, date_from="2026-10-11", date_to="2026-10-11")
+    assert wait_for(lambda: seen) and seen == {"run_date": date(2026, 10, 11)}
+    with JOB_LOCK:
+        JOB["state"] = "idle"
+
+
+@pytest.mark.parametrize("form,msg", [
+    ({"date_from": "2026-10-12", "date_to": "2026-10-10"}, "before+the+first"),
+    ({"date_from": "2026-10-10", "date_to": ""}, "first+and+last+day"),
+    ({"date_from": "2026-10-09", "date_to": "2026-10-12"}, "Earliest+date+available"),
+    ({"date_from": "2026-10-10", "date_to": "2026-10-13"}, "future"),
+    ({"date_from": "2026-10-10", "date_to": "2026-10-12", "refetch": "1", "keep_zero": "1"}, "single+date"),
+])
+def test_fno_start_range_refused(client, tmp_path, monkeypatch, form, msg):
+    monkeypatch.setattr(fno, "run_missing", lambda *a, **kw: pytest.fail("must not start"))
+    assert msg in post(client, tmp_path, date=None, **form)
+
+
+def test_fno_start_range_ending_today_too_early(client, tmp_path, ist_now):
+    ist_now["t"] = BEFORE
+    assert "Too+early" in post(client, tmp_path, date=None, date_from="2026-10-10", date_to="2026-10-12")
+
+
 # --- CLI --------------------------------------------------------------------------------------
 
 @pytest.fixture
 def cli(monkeypatch, ist_now):
     calls = []
     monkeypatch.setattr(nifty_daily, "load_env", lambda: {"KITE_API_KEY": "k", "KITE_ACCESS_TOKEN": "t"})
-    monkeypatch.setattr(nifty_daily, "weekly_expiry_weekday", lambda: 1)
+    monkeypatch.setattr(nifty_daily, "weekly_expiry_weekday", lambda underlying="NIFTY": 1)
     monkeypatch.setattr(nifty_daily, "keep_zero_volume", lambda: False)
     return calls
 

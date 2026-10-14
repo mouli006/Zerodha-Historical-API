@@ -513,7 +513,7 @@ def test_run_daily_holiday_deletes_day_folder(tmp_path, fake_kite):
     base = tmp_path / "NIFTY_FnO_1min"
     assert not (base / "2026-10-12").exists()
     assert "2026-10-12" in (base / "holidays.log").read_text(encoding="utf-8")
-    assert len(fake_kite.calls) == 1
+    assert [c[0] for c in fake_kite.calls] == [1, fno.SPOT_TOKENS["NIFTY"]]   # nearest future, then the spot
 
 
 def test_run_daily_holiday_keeps_folder_with_files(tmp_path, fake_kite):
@@ -605,6 +605,28 @@ def test_run_missing_nothing_left(tmp_path, fake_kite, monkeypatch):
     assert job_begin(**fno.job_fields("NIFTY", None, str(tmp_path), 1000))
     assert fno.run_missing("key", ACCESS, str(tmp_path), 1000, log=lambda m: None) == "finished"
     assert fake_kite.calls == [] and JOB["message"].startswith("Nothing missing")
+
+
+def test_run_missing_picked_range(tmp_path, fake_kite):
+    # the dashboard's range: every picked day runs, saved or not; logged holidays are skipped
+    days = fno.range_dates(date(2026, 10, 10), RUN_DATE)
+    assert job_begin(**fno.job_fields("NIFTY", None, str(tmp_path), 1000, label="2026-10-10_to_2026-10-12"))
+    assert fno.run_missing("key", ACCESS, str(tmp_path), 1000, log=lambda m: None, dates=days) == "finished_failures"
+    base = tmp_path / "NIFTY_FnO_1min"
+    assert sorted(d for d in os.listdir(base) if d[0].isdigit()) == ["2026-10-12"]
+    assert JOB["message"].startswith("Range days done: 1 saved, 2 holiday/weekend")
+    # again: the weekend is skipped and 12 Oct only requests its failed contract
+    fake_kite.calls.clear()
+    assert job_begin(**fno.job_fields("NIFTY", None, str(tmp_path), 1000))
+    fno.run_missing("key", ACCESS, str(tmp_path), 1000, log=lambda m: None, dates=days)
+    assert {(t, start.date()) for t, start, *_ in fake_kite.calls} == {(31, RUN_DATE)}
+
+
+def test_run_missing_range_outside_window(tmp_path, fake_kite):
+    assert job_begin(**fno.job_fields("NIFTY", None, str(tmp_path), 1000))
+    days = fno.range_dates(date(2026, 10, 8), RUN_DATE)
+    assert fno.run_missing("key", ACCESS, str(tmp_path), 1000, log=lambda m: None, dates=days) == "outside_window"
+    assert fake_kite.calls == [] and not any(d[0].isdigit() for d in os.listdir(tmp_path / "NIFTY_FnO_1min"))
 
 
 
@@ -752,3 +774,68 @@ def test_cli_inspect_writes_nothing(tmp_path, fake_kite, monkeypatch, capsys):
     assert nifty_daily.main(["--inspect", ZERO_CE, "2026-10-12", "--folder", str(folder)]) == 0
     assert "Candles: 2, total volume: 0" in capsys.readouterr().out
     assert not folder.exists()
+
+
+# --- duplicate names: every contract involved fails, nothing is overwritten (feature 26) ---------
+
+def statuses_of(tmp_path, day=RUN_DATE):
+    db = open_db(str(tmp_path))
+    try:
+        return {s: (st, r) for s, st, r in db.execute("SELECT symbol, status, reason FROM chunks WHERE run = ?",
+                                                    (fno.run_key("NIFTY", day),))}
+    finally:
+        db.close()
+
+
+def test_shared_tradingsymbol_fails_all_without_requests(tmp_path, fake_kite, monkeypatch):
+    dump = make_dump() + [inst("DUPSYM", "CE", W2, 25150.0, token=41), inst("DUPSYM", "CE", M1, 25150.0, token=42)]
+    monkeypatch.setattr(sys.modules[__name__], "make_dump", lambda: dump)
+    run(tmp_path)
+    day = tmp_path / "NIFTY_FnO_1min" / "2026-10-12"
+    assert statuses_of(tmp_path)["DUPSYM"] == ("FAILED", fno.DUPLICATE_NAME)
+    assert not any(t in (41, 42) for t, *_ in fake_kite.calls)
+    assert not (day / "options" / "NIFTY2515020OCT26CE.csv").exists()
+    assert not (day / "options" / "NIFTY2515027OCT26CE.csv").exists()
+    assert "FAILED DUPSYM: DUPLICATE_NAME" in (day / "run.log").read_text(encoding="utf-8")
+
+
+def test_same_file_name_fails_both(tmp_path, fake_kite, monkeypatch):
+    # a second listing of the 13 Oct 25100 CE under another tradingsymbol builds the same file name
+    dump = make_dump() + [inst("NIFTY_OTHER_25100CE", "CE", W1, 25100.0, token=43)]
+    monkeypatch.setattr(sys.modules[__name__], "make_dump", lambda: dump)
+    run(tmp_path)
+    st = statuses_of(tmp_path)
+    assert st["NIFTY2610625100CE"] == ("FAILED", fno.DUPLICATE_NAME)
+    assert st["NIFTY_OTHER_25100CE"] == ("FAILED", fno.DUPLICATE_NAME)
+    assert not any(t in (11, 43) for t, *_ in fake_kite.calls)
+    assert not (tmp_path / "NIFTY_FnO_1min" / "2026-10-12" / "options" / "NIFTY2510013OCT26CE.csv").exists()
+
+
+def test_write_never_overwrites_another_contracts_file(tmp_path, fake_kite, monkeypatch):
+    # force the 13 Oct 25100 PE onto the CE's path (different names, so only the write-time check sees it)
+    real = fno.contract_file
+
+    def clash(day_dir, c, underlying):
+        name, path = real(day_dir, c, underlying)
+        if name == "NIFTY2510013OCT26PE":
+            path = path.replace("NIFTY2510013OCT26PE", "NIFTY2510013OCT26CE")
+        return name, path
+    monkeypatch.setattr(fno, "contract_file", clash)
+    run(tmp_path)
+    st = statuses_of(tmp_path)
+    assert st["NIFTY2610625100CE"] == ("FAILED", fno.DUPLICATE_NAME)
+    assert st["NIFTY2610625100PE"] == ("FAILED", fno.DUPLICATE_NAME)
+    assert not (tmp_path / "NIFTY_FnO_1min" / "2026-10-12" / "options" / "NIFTY2510013OCT26CE.csv").exists()
+    log = (tmp_path / "NIFTY_FnO_1min" / "2026-10-12" / "run.log").read_text(encoding="utf-8")
+    assert "DUPLICATE_NAME: file NIFTY2510013OCT26PE was already written by NIFTY2610625100CE" in log
+
+
+
+def test_kite_runs_never_trim(tmp_path, fake_kite, monkeypatch):
+    from backfill import bhav
+
+    def nse(*a, **k):
+        raise AssertionError("NSE called")
+    monkeypatch.setattr(bhav, "fetch_bhav", nse)
+    assert run(tmp_path) == "finished_failures"
+    assert "Trimmed" not in (tmp_path / "NIFTY_FnO_1min" / "2026-10-12" / "run.log").read_text(encoding="utf-8")

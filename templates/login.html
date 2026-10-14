@@ -46,7 +46,7 @@
 </style>
 {% endblock %}
 {% block body %}
-<script id="boot" type="application/json">{{ {"error": error or "", "apiKey": api_key or "", "hasSecret": has_secret, "action": url_for("auth.login")}|tojson }}</script>
+<script id="boot" type="application/json">{{ {"error": error or "", "apiKey": api_key or "", "hasSecret": has_secret, "action": url_for("auth.login"), "tabs": {"zerodha": url_for("auth.index"), "dhan": url_for("dhan.index")}}|tojson }}</script>
 <script>{% raw %}
 (() => {
   const { useState, useMemo } = React;
@@ -116,6 +116,7 @@
       </section>
 
       <form className="card panel" method="post" action=${boot.action} onSubmit=${() => setBusy(true)}>
+        <${BrokerTabs} active="zerodha" urls=${boot.tabs} />
         <h2>Sign in</h2>
         <p className="sub">Use the credentials of your Kite Connect app. They're saved to <b>.env</b> in the project folder.</p>
         ${boot.error && html`<div className="error" role="alert">${boot.error}</div>`}

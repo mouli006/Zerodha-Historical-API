@@ -89,6 +89,13 @@
     .toast .dot { width: 8px; height: 8px; border-radius: 50%; margin-top: 7px; flex: none; }
     @keyframes toast-in { from { opacity: 0; transform: translateY(10px); } }
 
+    .broker-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; padding: 4px; margin-bottom: 26px; border-radius: 12px;
+                   background: rgba(7,11,22,.55); border: 1px solid var(--border); }
+    .broker-tabs a { padding: 9px 12px; border-radius: 9px; text-align: center; font-size: 14px; font-weight: 700;
+                     color: var(--muted); text-decoration: none; transition: color .15s, background .15s; }
+    .broker-tabs a:hover { color: var(--text); background: rgba(148,163,184,.08); }
+    .broker-tabs a[aria-current="page"] { background: var(--grad); color: #071021; }
+
     @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }
   </style>
   {% block head %}{% endblock %}
@@ -118,6 +125,10 @@
       <rect x="7.5" y="12" width="5" height="9" rx="1.2" fill="#071021"/>
       <rect x="14.5" y="10" width="5" height="12" rx="1.2" fill="#071021" opacity=".55"/>
       <rect x="21.5" y="14" width="5" height="7" rx="1.2" fill="#071021"/></svg>`;
+    // Zerodha / Dhan switch at the top of both sign-in cards; each tab is its own page
+    window.BrokerTabs = ({ active, urls }) => html`<nav className="broker-tabs" aria-label="Broker">
+      ${[["zerodha", "Zerodha"], ["dhan", "Dhan"]].map(([k, label]) =>
+        html`<a key=${k} href=${urls[k]} aria-current=${k === active ? "page" : undefined}>${label}</a>`)}</nav>`;
   {% endraw %}</script>
   {% block body %}{% endblock %}
 </body>

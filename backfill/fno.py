@@ -1,5 +1,5 @@
 """Daily F&O download: 1-minute candles with OI for every live futures and options contract
-of one underlying (NIFTY on NFO now), saved in the Accelpix file layout:
+of one underlying (NIFTY on NFO, SENSEX on BFO), saved in the Accelpix file layout:
 
     <save folder>/<UNDERLYING>_FnO_1min/<YYYY-MM-DD>/futures/NIFTY27OCT26.csv
                                                     /options/NIFTY2500013OCT26CE.csv
@@ -21,22 +21,29 @@ from zoneinfo import ZoneInfo
 from kiteconnect import KiteConnect
 from kiteconnect import exceptions as kex
 
+from .dhan_api import SEGMENT_OF as DHAN_SEGMENT_OF
 from .fetch import AuthStop, ChunkFailed, RateLimiter, StopJob, fetch_chunk
 from .job import JOB, JOB_LOCK, STOP, job_incr, job_update
 from .storage import log_error, open_db
 
 IST = ZoneInfo("Asia/Kolkata")
-# Underlying -> exchange and strike step (for the ATM strike). BSE would be "SENSEX": ("BFO", 100).
-UNDERLYINGS = {"NIFTY": ("NFO", 50)}
+# Underlying -> Kite exchange and strike step (for the ATM strike)
+UNDERLYINGS = {"NIFTY": ("NFO", 50), "SENSEX": ("BFO", 100)}
+# Underlying -> the exchange whose F&O bhavcopy lists its contracts (backfill/bhav.py SOURCES)
+EXCHANGE_OF = {"NIFTY": "NSE", "SENSEX": "BSE"}
+# Underlying -> Kite token of its spot index (NSE:NIFTY 50, BSE:SENSEX; Dhan: dhan_api.SPOT_IDS). The holiday check asks it when
+# the nearest future has no candles: a thin future (SENSEX on BSE) can go a whole trading day untraded.
+SPOT_TOKENS = {"NIFTY": 256265, "SENSEX": 265}
 TYPES = {"FUT", "CE", "PE"}
 MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
 WINDOW = (dtime(9, 0), dtime(16, 0))   # every row Kite returns in this window is kept
 READY_AT = dtime(15, 40)               # IST; today's run is refused before this
+AUTO_BHAV = True                       # Kite runs fetch and check the day's NSE/BSE bhavcopy (tests turn it off)
 SESSION = ("09:15:00", "15:30:00")     # bars used for the futures O/H/L/C in the summary
 MAX_TRIES = 3
 HEADER = ["Ticker", "Date", "Time", "Open", "High", "Low", "Close", "Volume", "OI"]
 # Listed_* come from the instrument dump; Traded_strikes and *_files from the files on disk for the day;
-# the Bhav columns from the NSE bhavcopy check (backfill/bhav.py), blank until a check has run
+# the Bhav columns from the NSE/BSE bhavcopy check (backfill/bhav.py), blank until a check has run
 BHAV_SUMMARY_COLUMNS = ["Bhav_traded_contracts", "Kite_files", "Missing_in_kite", "Extra_in_kite", "OI_diffs",
                         "Price_diffs"]
 # Keep_zero_volume (ON/OFF): the setting of the last run that wrote the day (run.log has every run's)
@@ -51,6 +58,12 @@ EXPIRIES_FILE = "expiries_seen.csv"
 ZERO_VOLUME_FILE = "zero_volume_contracts.csv"
 ZERO_VOLUME_COLUMNS = ["Contract", "Candles", "Last_close", "Last_OI", "Kept"]
 NO_CANDLES, ZERO_VOLUME = "NO_CANDLES", "ZERO_VOLUME"
+# Two contracts with the same tradingsymbol or the same file name: all of them FAILED, never overwritten
+DUPLICATE_NAME = "DUPLICATE_NAME"
+# Data source -> folder suffix and name. Dhan (backfill/dhan_api.DhanClient, a Kite-shaped client) writes
+# <UNDERLYING>_FnO_1min_Dhan/ with its own progress keys, so Kite and Dhan days never mix.
+FOLDERS = {"kite": "_FnO_1min", "dhan": "_FnO_1min_Dhan"}
+BROKER = {"kite": "Kite", "dhan": "Dhan"}
 
 
 # --- dates and times (always IST, whatever the machine's time zone) -------------------------
@@ -132,9 +145,9 @@ def window_note(window):
             f"previous expiry; assumed {window.previous_expiry:%a %d %b %Y}, the weekly expiry weekday).")
 
 
-def read_expiries(data_root, underlying):
+def read_expiries(data_root, underlying, source="kite"):
     """Expiry dates seen so far: expiries_seen.csv, or the saved instrument dumps if it doesn't exist yet."""
-    base = fno_root(data_root, underlying)
+    base = fno_root(data_root, underlying, source)
     path = os.path.join(base, EXPIRIES_FILE)
     if os.path.exists(path):
         with open(path, newline="", encoding="utf-8") as f:
@@ -148,29 +161,29 @@ def read_expiries(data_root, underlying):
     return seen
 
 
-def record_expiries(data_root, underlying, instruments, today):
+def record_expiries(data_root, underlying, instruments, today, source="kite"):
     """Add the dump's expiries to expiries_seen.csv (one row per expiry, sorted); returns all of them."""
-    seen = read_expiries(data_root, underlying)
+    seen = read_expiries(data_root, underlying, source)
     for i in instruments:
         if i.get("name") == underlying and i.get("instrument_type") in TYPES and i.get("expiry"):
             seen.setdefault(as_date(i["expiry"]), today.isoformat())
-    base = fno_root(data_root, underlying)
+    base = fno_root(data_root, underlying, source)
     os.makedirs(base, exist_ok=True)
     write_csv(os.path.join(base, EXPIRIES_FILE), ["expiry", "first_seen"],
               [{"expiry": e.isoformat(), "first_seen": seen[e]} for e in sorted(seen)])
     return set(seen)
 
 
-def load_window(kite, data_root, underlying, weekday=WEEKLY_EXPIRY_WEEKDAY):
+def load_window(kite, data_root, underlying, weekday=WEEKLY_EXPIRY_WEEKDAY, source="kite"):
     """Fetch today's instrument list, update the expiry history and work out the date window."""
     instruments = kite.instruments(UNDERLYINGS[underlying][0])
     today = today_ist()
-    history = record_expiries(data_root, underlying, instruments, today)
+    history = record_expiries(data_root, underlying, instruments, today, source)
     return instruments, date_window(live_expiries(instruments, underlying, today), history, today, weekday)
 
 
-def holidays_logged(data_root, underlying):
-    path = os.path.join(fno_root(data_root, underlying), "holidays.log")
+def holidays_logged(data_root, underlying, source="kite"):
+    path = os.path.join(fno_root(data_root, underlying, source), "holidays.log")
     days = set()
     if os.path.exists(path):
         with open(path, encoding="utf-8") as f:
@@ -184,24 +197,46 @@ def holidays_logged(data_root, underlying):
     return days
 
 
-def missing_dates(data_root, underlying, window, now=None):
+def missing_dates(data_root, underlying, window, now=None, source="kite"):
     """Dates in the window without a complete day (summary.csv written and every contract DONE),
     skipping logged holidays and today before READY_AT. Creates nothing on disk."""
-    skip = holidays_logged(data_root, underlying)
+    skip = holidays_logged(data_root, underlying, source)
     out, d = [], window.min_date
     while d <= window.max_date:
         if d not in skip and not too_early(d, now):
             out.append(d)
         d += timedelta(days=1)
-    done = [d for d in out if os.path.exists(os.path.join(fno_root(data_root, underlying), d.isoformat(), "summary.csv"))]
+    done = [d for d in out if os.path.exists(os.path.join(fno_root(data_root, underlying, source), d.isoformat(), "summary.csv"))]
     if done:
         db = open_db(data_root)
         try:
             done = {d for d in done if db.execute("SELECT COUNT(*) FROM chunks WHERE run = ? AND status != 'DONE'",
-                                                  (run_key(underlying, d),)).fetchone()[0] == 0}
+                                                  (run_key(underlying, d, source),)).fetchone()[0] == 0}
         finally:
             db.close()
     return [d for d in out if d not in done]
+
+
+def range_dates(d_from, d_to):
+    """Every date from d_from to d_to, both included."""
+    return [d_from + timedelta(days=n) for n in range((d_to - d_from).days + 1)]
+
+
+def parse_pick(day="", d_from="", d_to=""):
+    """The dashboard's date picker: (run_date, None) for one day, (None, [dates]) for a range
+    (date_from/date_to; the same day twice is one day). Raises ValueError with a message."""
+    if d_from or d_to:
+        try:
+            first, last = date.fromisoformat(d_from), date.fromisoformat(d_to)
+        except ValueError:
+            raise ValueError("Choose the first and last day of the range.") from None
+        if first > last:
+            raise ValueError("The last day of the range is before the first.")
+        return (first, None) if first == last else (None, range_dates(first, last))
+    try:
+        return date.fromisoformat(day), None
+    except ValueError:
+        raise ValueError("Choose the date to download.") from None
 
 
 def to_ist(value):
@@ -538,27 +573,39 @@ class RunLock:
             self.f = None
 
 
-def fno_root(data_root, underlying):
-    return os.path.join(data_root, f"{underlying}_FnO_1min")
+def fno_folder(underlying, source="kite"):
+    return f"{underlying}{FOLDERS[source]}"
 
 
-def acquire_lock(data_root, underlying, owner):
-    """Take the run lock for this underlying or raise LockBusy."""
-    return RunLock(os.path.join(fno_root(data_root, underlying), ".lock")).acquire(owner)
+def fno_root(data_root, underlying, source="kite"):
+    return os.path.join(data_root, fno_folder(underlying, source))
 
 
-def run_key(underlying, run_date):
-    return f"fno:{underlying}:{UNDERLYINGS[underlying][0]}:{run_date}"
+def acquire_lock(data_root, underlying, owner, source="kite"):
+    """Take the run lock for this underlying (and source) or raise LockBusy."""
+    return RunLock(os.path.join(fno_root(data_root, underlying, source), ".lock")).acquire(owner)
 
 
-def job_fields(underlying, run_date, data_root, speed, keep_zero=False):
-    """JOB values for job_begin() when an F&O run starts; run_date None for a missing-days run."""
+def exchange_of(underlying, source="kite"):
+    """Kite's exchange (NFO / BFO), or on Dhan its segment (NSE_FNO / BSE_FNO)."""
+    exch = UNDERLYINGS[underlying][0]
+    return DHAN_SEGMENT_OF[exch] if source == "dhan" else exch
+
+
+def run_key(underlying, run_date, source="kite"):
+    prefix = "fno" if source == "kite" else f"fno-{source}"
+    return f"{prefix}:{underlying}:{exchange_of(underlying, source)}:{run_date}"
+
+
+def job_fields(underlying, run_date, data_root, speed, keep_zero=False, source="kite", label="missing"):
+    """JOB values for job_begin() when an F&O run starts; run_date None for a missing-days run or a
+    date range (label "<from>_to_<to>")."""
     day = run_date.isoformat() if run_date else ""
-    return {"kind": "fno", "run": run_key(underlying, day or "missing"), "folder": data_root, "speed": speed,
-            "keep_zero": keep_zero,
+    return {"kind": "fno", "source": source, "run": run_key(underlying, day or label, source), "folder": data_root,
+            "speed": speed, "keep_zero": keep_zero,
             "fno_date": day, "fno_underlying": underlying,
-            "fno_exchange": UNDERLYINGS[underlying][0], "fno_summary": [], "fno_futures": [],
-            "out_dirs": [os.path.join(f"{underlying}_FnO_1min", day)] if day else []}
+            "fno_exchange": exchange_of(underlying, source), "fno_summary": [], "fno_futures": [],
+            "out_dirs": [os.path.join(fno_folder(underlying, source), day)] if day else []}
 
 
 # --- the run --------------------------------------------------------------------------------
@@ -618,19 +665,100 @@ def stop_with(echo, status, msg):
     return status
 
 
+def exchange_name(underlying):
+    """NSE or BSE: whose bhavcopy lists the underlying's contracts."""
+    return EXCHANGE_OF.get(underlying, "NSE")
+
+
+def trim_contracts(contracts, run_date, day_dir, underlying, source, rlog):
+    """Only the contracts the exchange listed on run_date (every row of its bhavcopy, traded or not). Without a
+    bhavcopy (not published yet, 404, or slower than bhav.TRIM_BUDGET) the list is kept as it is."""
+    from . import bhav   # bhav imports this module
+    exch = exchange_name(underlying)
+    job_update(message=f"Getting {exch}'s contract list for the day...")
+    names, reason = bhav.listed_names(run_date, day_dir, underlying, log=rlog)
+    if names is None:
+        rlog(f"Bhavcopy for {run_date} not available ({reason}): downloading all {len(contracts):,} contracts "
+             f"{BROKER[source]} lists")
+        return contracts
+    kept, ours = [], set()
+    for c in contracts:
+        try:
+            name = contract_name(c["instrument_type"], c["expiry"], c.get("strike"), underlying)
+        except ValueError:
+            kept.append(c)   # fails as a naming error later, as without the trim
+            continue
+        ours.add(name)
+        if name in names:
+            kept.append(c)
+    rlog(f"Trimmed to {len(kept):,} contracts listed in {exch}'s bhavcopy for {run_date} ({BROKER[source]} listed "
+         f"{len(contracts):,}; {len(contracts) - len(kept):,} not listed by {exch} that day were skipped)")
+    if names - ours:
+        rlog(f"{len(names - ours):,} contracts in the bhavcopy are not in {BROKER[source]}'s list")
+    return kept
+
+
+def fetch_day_bhav(run_date, day_dir, base, underlying, rlog):
+    """Make sure <day>/bhavcopy/ has the exchange's (NSE/BSE) bhavcopy for run_date (the saved one, else a
+    download of at most bhav.CHECK_BUDGET seconds). "" when it is there, else why not; that is also logged to
+    bhavcopy.log, and the day stays pending for the dashboard's Check buttons."""
+    from . import bhav   # bhav imports this module
+    job_update(message=f"Getting {exchange_name(underlying)}'s bhavcopy for {run_date}...")
+    try:
+        names, reason = bhav.listed_names(run_date, day_dir, underlying, log=rlog, budget=bhav.CHECK_BUDGET)
+    except Exception as e:   # never fail a finished download over the bhavcopy
+        names, reason = None, f"{type(e).__name__}: {e}"
+    if names is not None:
+        return ""
+    rlog(f"Bhavcopy for {run_date} not saved: {reason}. Check it later from the dashboard or nifty_bhav.py.")
+    bhav.log_line(os.path.join(base, "bhavcopy.log"), f"{run_date}: {reason}")
+    return reason
+
+
+def check_day_bhav(day_dir, run_date, underlying, echo, rows, line):
+    """bhav.check_saved for the day just downloaded: (summary rows, bhavcopy line, True), or the given
+    rows, the line with the error and False when the check fails."""
+    from . import bhav   # bhav imports this module
+    # check_saved's source is where the bhavcopy came from: kept from an earlier check, else the exchange's URL
+    checked = os.path.exists(os.path.join(day_dir, "bhavcopy", "bhav_check.json"))
+    url = "" if checked else bhav.bhav_url(run_date, underlying)
+    try:
+        _, line, summary = bhav.check_saved(day_dir, run_date, underlying, url, log=echo)
+        return summary or rows, line, True
+    except Exception as e:
+        echo(f"Bhavcopy check failed: {type(e).__name__}: {e}")
+        return rows, f"{line} (check failed: {type(e).__name__}: {e})", False
+
+
+class DuplicateWrite(Exception):
+    """save() was asked to write a file another contract already wrote in this run."""
+
+    def __init__(self, owner, name):
+        super().__init__(f"{name} already written by {owner}")
+        self.owner, self.name = owner, name
+
+
 def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIFTY", log=print,
               weekday=WEEKLY_EXPIRY_WEEKDAY, kite=None, user="", instruments=None, window=None,
-              label="", last=True, keep_zero=False, refetch=False):
+              label="", last=True, keep_zero=False, refetch=False, source="kite", trim_to_bhav=None,
+              bhav_check=None):
     """Download day run_date for every contract that was live on it. The caller holds the lock
     (acquire_lock) and has called job_begin(**job_fields(...)). run_missing passes kite, instruments
     and window to share them between days; last=False keeps the job running after this day.
     keep_zero writes a file for contracts whose candles all have volume 0 (otherwise they get none);
     with it on, DONE contracts without a file whose reason is ZERO_VOLUME are requested again.
     refetch requests every DONE contract without a file again, whatever its reason (refetch_no_trade).
+    source "dhan" (kite = a backfill.dhan_api.DhanClient) writes <UNDERLYING>_FnO_1min_Dhan/ under its own run keys.
+    trim_to_bhav (default: on for Dhan) keeps only contracts in the day's bhavcopy (NSE/BSE), traded or not; when the
+    bhavcopy is not available within bhav.TRIM_BUDGET seconds the full list is used.
+    bhav_check (default: on for Kite and Dhan, off with refetch, which checks by itself) gets the day's NSE/BSE bhavcopy
+    into <day>/bhavcopy/ after the download (at most bhav.CHECK_BUDGET seconds) and runs bhav.check_saved;
+    when the exchange has not published it the day stays pending. It never changes the returned status.
     Returns "finished", "finished_failures", "holiday", "too_early", "outside_window",
     "auth_failed", "stopped" or "error". Nothing is written for the last four before the run starts."""
-    exchange, step = UNDERLYINGS[underlying]
-    run = run_key(underlying, run_date)
+    step = UNDERLYINGS[underlying][1]
+    exchange = exchange_of(underlying, source)
+    run = run_key(underlying, run_date, source)
     echo = lambda m: log(f"[{run}] {m}")
     start = datetime.combine(run_date, WINDOW[0])
     end = datetime.combine(run_date, WINDOW[1])
@@ -646,9 +774,9 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
     if instruments is None:
         try:
             job_update(message="Loading instrument list...")
-            instruments, window = load_window(kite, data_root, underlying, weekday)
+            instruments, window = load_window(kite, data_root, underlying, weekday, source)
         except (kex.TokenException, kex.PermissionException) as e:
-            return stop_with(echo, "auth_failed", f"Kite access token is invalid or expired ({e}).")
+            return stop_with(echo, "auth_failed", f"{BROKER[source]} access token is invalid or expired ({e}).")
         except Exception as e:
             return stop_with(echo, "error", f"Could not load the instrument list: {type(e).__name__}: {e}")
     msg = window_error(run_date, window)
@@ -656,9 +784,9 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
         return stop_with(echo, "outside_window", msg)
 
     job_update(run=run, fno_date=run_date.isoformat(), fno_summary=[], fno_futures=[],
-               out_dirs=[os.path.join(f"{underlying}_FnO_1min", run_date.isoformat())])
+               out_dirs=[os.path.join(fno_folder(underlying, source), run_date.isoformat())])
     today = today_ist()
-    base = fno_root(data_root, underlying)
+    base = fno_root(data_root, underlying, source)
     day = os.path.join(base, run_date.isoformat())
     created = not os.path.isdir(day)
     for sub in ("futures", "options"):
@@ -669,7 +797,7 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
     current = ""   # contract being fetched, for errors.log
     try:
         rlog(f"=== {underlying} F&O 1-minute run for {run_date} ({exchange}), started "
-             f"{now_ist():%Y-%m-%d %H:%M:%S} IST, Kite user {user}, speed {speed} req/s"
+             f"{now_ist():%Y-%m-%d %H:%M:%S} IST, {BROKER[source]} user {user}, speed {speed} req/s"
              + (", re-checking contracts without a file" if refetch else ""))
         rlog(f"Keep zero-volume contracts: {on_off(keep_zero)}")
         rlog(f"Date window {window.min_date} to {window.max_date} (previous expiry {window.previous_expiry}, "
@@ -681,21 +809,42 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
                      else f"instruments_{exchange}_fetched_{today}.csv")
         save_instruments(os.path.join(day, dump_name), instruments)
         contracts = select_contracts(instruments, underlying, run_date)
+        if trim_to_bhav is None:
+            trim_to_bhav = source == "dhan"
+        if trim_to_bhav:
+            contracts = trim_contracts(contracts, run_date, day, underlying, source, rlog)
         futures = [c for c in contracts if c["instrument_type"] == "FUT"]
         if not futures:
             raise RuntimeError(f"No live {underlying} futures in the {exchange} instrument list.")
 
-        files, name_errors, used = {}, {}, {}   # tradingsymbol -> (name, path) / error
+        # tradingsymbol -> (name, path) / error. A tradingsymbol or file name shared by two contracts would
+        # send one contract's candles into another's file, so every contract involved fails instead.
+        files, name_errors, by_name, dup_syms = {}, {}, {}, set()
+        sym_count = {}
+        for c in contracts:
+            sym_count[c["tradingsymbol"]] = sym_count.get(c["tradingsymbol"], 0) + 1
         for c in contracts:
             sym = c["tradingsymbol"]
+            if sym_count[sym] > 1:
+                name_errors[sym] = f"{DUPLICATE_NAME}: tradingsymbol {sym} is shared by {sym_count[sym]} contracts"
+                dup_syms.add(sym)
+                continue
             try:
                 name, path = contract_file(day, c, underlying)
-                if name in used:
-                    raise ValueError(f"file name {name} is also used by {used[name]}")
-                used[name] = sym
-                files[sym] = (name, path)
             except ValueError as e:
                 name_errors[sym] = f"naming error: {e}"
+                continue
+            by_name.setdefault(name, []).append(sym)
+            files[sym] = (name, path)
+        for name, syms in by_name.items():
+            if len(syms) > 1:
+                for sym in syms:
+                    name_errors[sym] = f"{DUPLICATE_NAME}: file name {name} is also built for " + \
+                                       ", ".join(s for s in syms if s != sym)
+                    dup_syms.add(sym)
+                    files.pop(sym)
+        for sym in sorted(dup_syms):
+            rlog(f"FAILED {sym}: {name_errors[sym]}")
         n_fut = len(futures)
         rlog(f"{len(contracts):,} live contracts: {n_fut} futures, {len(contracts) - n_fut:,} options "
              f"(window {WINDOW[0]:%H:%M}-{WINDOW[1]:%H:%M} IST, OI on)")
@@ -721,6 +870,9 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
                 status_of[c["tradingsymbol"]] = "PENDING"
             rlog(f"Requesting {len(redo):,} contracts without a file again")
 
+        by_sym = {c["tradingsymbol"]: c for c in contracts}
+        written = {}   # path -> tradingsymbol of every file written by this run
+
         def mark(c, st, error=None, reason=None):
             db.execute("UPDATE chunks SET status = ?, tries = tries + 1, error = ?, reason = ?, updated = ? "
                        "WHERE run = ? AND symbol = ? AND chunk_from = ?",
@@ -739,8 +891,13 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
         def save(c, candles):
             """Write the file; returns why there is none (NO_CANDLES / ZERO_VOLUME), or None."""
             name, path = files[c["tradingsymbol"]]
+            owner = written.get(path)
+            if owner is not None and owner != c["tradingsymbol"]:
+                raise DuplicateWrite(owner, name)
             zero = bool(candles) and candle_volume(candles) == 0
             bars = write_contract(path, name, candles, keep_zero)
+            if bars:
+                written[path] = c["tradingsymbol"]
             if zero:
                 zero_found[name] = {"Contract": name, **zero_volume_info(candles), "Kept": "Y" if bars else "N"}
                 key = "zero_kept" if bars else "zero_skipped"
@@ -767,8 +924,10 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
                 candles = fetch(near)
             except ChunkFailed as e:
                 raise RuntimeError(f"Holiday check failed for {near_sym} (token {near['instrument_token']}): {e}")
-            if not candles:
+            if not candles and not spot_traded(kite, limiter, underlying, source, start, end):
                 return holiday(base, day, created, run, run_date, near, rlog, db, last)
+            if not candles:
+                rlog(f"{files.get(near_sym, (near_sym,))[0]} has no candles but {underlying} spot traded: not a holiday")
             if near_sym in files:
                 mark(near, "DONE", reason=save(near, candles))
 
@@ -804,9 +963,27 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
                 name = files.get(sym, (sym,))[0]
                 job_update(symbol=name, part=part())
                 error, reason = name_errors.get(sym), None
-                if error is None:
+                if sym in dup_syms:
+                    reason = DUPLICATE_NAME
+                elif error is None:
                     try:
                         reason = save(c, fetch(c))
+                    except DuplicateWrite as e:
+                        # never overwrite: the file written earlier this run is removed and both contracts fail
+                        error, reason = f"{DUPLICATE_NAME}: file {e.name} was already written by {e.owner}", DUPLICATE_NAME
+                        other_path = files[e.owner][1]
+                        if os.path.exists(other_path):
+                            os.remove(other_path)
+                        counts["written"] -= 1
+                        other_error = f"{DUPLICATE_NAME}: file {e.name} is also built for {sym}"
+                        mark(by_sym[e.owner], "FAILED", other_error, DUPLICATE_NAME)
+                        log_error(data_root, run, e.owner, str(run_date), other_error)
+                        rlog(f"FAILED {e.owner}: {other_error}")
+                        written.pop(other_path, None)
+                        with JOB_LOCK:
+                            JOB["stocks_done"] -= 1
+                            JOB["chunks_done"] -= 1
+                            JOB["failed"] += 1
                     except ChunkFailed as e:
                         error = str(e)
                     except (AuthStop, StopJob):
@@ -814,8 +991,10 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
                     except Exception as e:
                         error = f"{type(e).__name__}: {e}"
                 if error:
-                    mark(c, "FAILED", error)
+                    mark(c, "FAILED", error, reason if reason == DUPLICATE_NAME else None)
                     log_error(data_root, run, sym, str(run_date), error)
+                    if reason == DUPLICATE_NAME and pass_no == 1 and sym not in dup_syms:
+                        rlog(f"FAILED {sym}: {error}")
                     if prev != "FAILED":
                         job_incr("failed")
                 else:
@@ -834,8 +1013,17 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
                          f"failed {JOB['failed']} | ETA {JOB['eta']}")
 
         write_zero_volume(day, zero_found)
+        if bhav_check is None:
+            bhav_check = AUTO_BHAV and not refetch
+        bhav_note = fetch_day_bhav(run_date, day, base, underlying, rlog) if bhav_check else ""
         rows, fut_rows, bhav_line = summary_rows(day, contracts, files, step, underlying, on_off(keep_zero))
         write_csv(os.path.join(day, "summary.csv"), SUMMARY_COLUMNS, rows)
+        logged = False
+        if bhav_check and not bhav_note:
+            # check_saved adds its line to run.log itself, so its other output goes to the console only
+            rows, bhav_line, logged = check_day_bhav(day, run_date, underlying, echo, rows, bhav_line)
+        elif bhav_note:
+            bhav_line = f"{bhav_line} ({bhav_note})"
         failures = db.execute("SELECT symbol, token, error FROM chunks WHERE run = ? AND status = 'FAILED' "
                               "ORDER BY symbol", (run,)).fetchall()
         rlog(f"Contracts requested: {total:,}")
@@ -848,7 +1036,8 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
             rlog(f"  FAILED {sym} (token {token}): {error}")
         rlog("Summary by option expiry:\n" + table(SUMMARY_COLUMNS, rows))
         rlog("Futures:\n" + table(FUTURE_COLUMNS, fut_rows))
-        rlog(bhav_line)
+        if not logged:   # check_saved adds its line to run.log itself
+            rlog(bhav_line)
         rlog(f"=== Ended {now_ist():%Y-%m-%d %H:%M:%S} IST")
         msg = (f"Saved {underlying} F&O for {run_date}: {counts['written'] + counts['present']:,} contract files, "
                f"{counts['no_candles']:,} without candles, {counts['zero_kept'] + counts['zero_skipped']:,} with "
@@ -878,6 +1067,21 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
         rlog.close()
 
 
+def spot_traded(kite, limiter, underlying, source, start, end):
+    """True if the underlying's spot index has candles in [start, end]: Kite's SPOT_TOKENS, on Dhan
+    DhanClient.spot_token() (IDX_I). Raises RuntimeError like the future's holiday check when the request fails."""
+    if source == "kite":
+        token = SPOT_TOKENS.get(underlying)
+    else:
+        token = kite.spot_token(underlying) if hasattr(kite, "spot_token") else None
+    if token is None:
+        return False
+    try:
+        return bool(fetch_chunk(kite, limiter, token, start, end, "minute", max_tries=MAX_TRIES))
+    except ChunkFailed as e:
+        raise RuntimeError(f"Holiday check failed for {underlying} spot (token {token}): {e}")
+
+
 def holiday(base, day, created, run, run_date, near, rlog, db, last=True):
     """No candles for the nearest future: log the holiday and remove the day folder made by this run."""
     msg = (f"{run_date}: no candles for {near['tradingsymbol']} (token {near['instrument_token']}) "
@@ -901,44 +1105,59 @@ def holiday(base, day, created, run, run_date, near, rlog, db, last=True):
 
 
 def run_missing(api_key, access_token, data_root, speed, underlying="NIFTY", log=print,
-                weekday=WEEKLY_EXPIRY_WEEKDAY, keep_zero=False):
+                weekday=WEEKLY_EXPIRY_WEEKDAY, keep_zero=False, kite=None, user="", source="kite", dates=None):
     """Download every date in the window that has no complete day folder, oldest first, sharing
     one Kite session and instrument list. Weekends and holidays end at the holiday check (and are
-    logged, so the next run skips them). Same statuses as run_daily."""
-    echo = lambda m: log(f"[{run_key(underlying, 'missing')}] {m}")
-    kite, user, status = connect(api_key, access_token, echo)
-    if status:
-        return status
+    logged, so the next run skips them). Same statuses as run_daily.
+
+    dates: run these days instead (a range picked on the dashboard), minus logged holidays and
+    today before READY_AT; saved days run again and skip their saved contracts."""
+    what = f"{min(dates)}_to_{max(dates)}" if dates else "missing"
+    echo = lambda m: log(f"[{run_key(underlying, what, source)}] {m}")
+    if kite is None:
+        kite, user, status = connect(api_key, access_token, echo)
+        if status:
+            return status
     try:
         job_update(message="Loading instrument list...")
-        instruments, window = load_window(kite, data_root, underlying, weekday)
+        instruments, window = load_window(kite, data_root, underlying, weekday, source)
     except (kex.TokenException, kex.PermissionException) as e:
-        return stop_with(echo, "auth_failed", f"Kite access token is invalid or expired ({e}).")
+        return stop_with(echo, "auth_failed", f"{BROKER[source]} access token is invalid or expired ({e}).")
     except Exception as e:
         return stop_with(echo, "error", f"Could not load the instrument list: {type(e).__name__}: {e}")
     if window.estimated:
         echo(window_note(window))
-    dates = missing_dates(data_root, underlying, window)
+    if dates:
+        picked, skip = sorted(dates), holidays_logged(data_root, underlying, source)
+        bad = [d for d in picked if window_error(d, window)]
+        if bad:
+            return stop_with(echo, "outside_window", window_error(bad[0], window))
+        dates = [d for d in picked if d not in skip and not too_early(d)]
+        kind = "Range"
+    else:
+        dates = missing_dates(data_root, underlying, window, source=source)
+        kind = "Missing"
     if not dates:
-        msg = f"Nothing missing: every day from {window.min_date} to {window.max_date} is saved or a holiday."
+        msg = ("Nothing to download: every picked day is a holiday or not ready yet." if kind == "Range"
+               else f"Nothing missing: every day from {window.min_date} to {window.max_date} is saved or a holiday.")
         echo(msg)
         job_update(state="finished", message=msg)
         return "finished"
-    echo(f"Missing days: {', '.join(map(str, dates))}")
+    echo(f"{kind} days: {', '.join(map(str, dates))}")
     results = {}
     for n, d in enumerate(dates, 1):
         if STOP.is_set():
             return stop_with(echo, "stopped", "Stopped. Start again to continue; finished days are skipped.")
         st = run_daily(api_key, access_token, d, data_root, speed, underlying, log, weekday, kite, user,
                        instruments, window, label=f"Day {n} of {len(dates)}, ", last=n == len(dates),
-                       keep_zero=keep_zero)
+                       keep_zero=keep_zero, source=source)
         results[d] = st
         if st in ("auth_failed", "stopped", "error"):
             return st
     saved = sum(1 for st in results.values() if st.startswith("finished"))
     hol = sum(1 for st in results.values() if st == "holiday")
     bad = [str(d) for d, st in results.items() if st == "finished_failures"]
-    msg = (f"Missing days done: {saved} saved, {hol} holiday/weekend"
+    msg = (f"{kind} days done: {saved} saved, {hol} holiday/weekend"
            + (f"; failed contracts on {', '.join(bad)} (run again to retry)." if bad else "."))
     echo(msg)
     job_update(state="finished", message=msg)
@@ -983,17 +1202,19 @@ def missing_in_kite(day_dir):
 
 
 def inspect_contracts(api_key, access_token, run_date, data_root, names, underlying="NIFTY", speed=2.5,
-                      log=print, verbose=True):
+                      log=print, verbose=True, kite=None, source="kite"):
     """Fetch run_date's raw 1-minute candles (with OI) for each contract name and print them, with the
     saved bhavcopy row when there is one. Writes nothing to the data folder. Returns (status, rows in
-    INSPECT_COLUMNS); status "" when Kite was reached, else the connect() status."""
+    INSPECT_COLUMNS); status "" when Kite was reached, else the connect() status. With kite= (a
+    DhanClient, source="dhan") the caller has checked the token and the Dhan day is read."""
     from . import bhav   # bhav imports this module
-    kite, msg, status = connect(api_key, access_token, log, report=False)
-    if status:
-        return status, []
+    if kite is None:
+        kite, msg, status = connect(api_key, access_token, log, report=False)
+        if status:
+            return status, []
     instruments = kite.instruments(UNDERLYINGS[underlying][0])
     found = find_contracts(instruments, names, underlying)
-    day_dir = os.path.join(fno_root(data_root, underlying), run_date.isoformat())
+    day_dir = os.path.join(fno_root(data_root, underlying, source), run_date.isoformat())
     items = bhav.saved_items(day_dir, underlying) if os.path.isdir(day_dir) else None
     bhav_of = {i["name"]: i for i in items or []}
     start, end = datetime.combine(run_date, WINDOW[0]), datetime.combine(run_date, WINDOW[1])
@@ -1005,7 +1226,7 @@ def inspect_contracts(api_key, access_token, run_date, data_root, names, underly
         inst = found.get(name)
         if inst is None:
             out.append({**row, "Result": "NOT_IN_LIVE_LIST"})
-            log(f"{name}: not in today's live {UNDERLYINGS[underlying][0]} instrument list")
+            log(f"{name}: not in today's live {exchange_of(underlying, source)} instrument list")
             continue
         try:
             candles = fetch_chunk(kite, limiter, inst["instrument_token"], start, end, "minute",
@@ -1018,7 +1239,7 @@ def inspect_contracts(api_key, access_token, run_date, data_root, names, underly
                     "Kite_last_close": fmt_num(candles[-1]["close"]) if candles else "",
                     "Result": inspect_result(candles)})
         if verbose:
-            log(f"{name} ({inst['tradingsymbol']}, token {inst['instrument_token']}) on {run_date}, "
+            log(f"{name} ({inst['tradingsymbol']}, {BROKER[source]} token {inst['instrument_token']}) on {run_date}, "
                 f"{WINDOW[0]:%H:%M}-{WINDOW[1]:%H:%M} IST:")
             log(table(["Time", "Open", "High", "Low", "Close", "Volume", "OI"],
                       [{"Time": f"{to_ist(c['date']):%H:%M:%S}", "Open": fmt_num(c["open"]), "High": fmt_num(c["high"]),
@@ -1037,18 +1258,19 @@ def inspect_contracts(api_key, access_token, run_date, data_root, names, underly
 
 
 def refetch_no_trade(api_key, access_token, run_date, data_root, speed, underlying="NIFTY", log=print,
-                     weekday=WEEKLY_EXPIRY_WEEKDAY):
+                     weekday=WEEKLY_EXPIRY_WEEKDAY, kite=None, user="", source="kite"):
     """Request every contract of a saved day that has no file again, with keep zero-volume ON
     (contracts with a file are skipped), then re-run the bhavcopy check if the day's bhavcopy is saved.
-    The caller holds the lock and has called job_begin(**job_fields(..., keep_zero=True)).
+    The caller holds the lock and has called job_begin(**job_fields(..., keep_zero=True)). source "dhan"
+    (kite = a DhanClient) works on the Dhan folder.
     Returns (run_daily status or "not_downloaded", bhavcopy line or "")."""
     from . import bhav   # bhav imports this module
-    day = os.path.join(fno_root(data_root, underlying), run_date.isoformat())
+    day = os.path.join(fno_root(data_root, underlying, source), run_date.isoformat())
     if not os.path.exists(os.path.join(day, "summary.csv")):
-        return stop_with(lambda m: log(f"[{run_key(underlying, run_date)}] {m}"), "not_downloaded",
+        return stop_with(lambda m: log(f"[{run_key(underlying, run_date, source)}] {m}"), "not_downloaded",
                          f"{run_date} has not been downloaded in this folder yet; download the day first."), ""
     status = run_daily(api_key, access_token, run_date, data_root, speed, underlying, log, weekday,
-                       keep_zero=True, refetch=True)
+                       kite=kite, user=user, keep_zero=True, refetch=True, source=source)
     if not status.startswith("finished") or bhav.saved_items(day, underlying) is None:
         return status, ""
     _, line, rows = bhav.check_saved(day, run_date, underlying, log=log)
@@ -1060,16 +1282,18 @@ def refetch_no_trade(api_key, access_token, run_date, data_root, speed, underlyi
 
 
 def redownload_contract(api_key, access_token, run_date, data_root, contract, underlying="NIFTY",
-                        speed=2.5, log=print, keep_zero=False):
+                        speed=2.5, log=print, keep_zero=False, kite=None, source="kite"):
     """Fetch one contract (our file name, e.g. NIFTY2500013OCT26CE) for run_date again, e.g. one the
-    bhavcopy check found missing. Only while Kite still serves it (expiry today or later). The caller
-    holds the lock. Returns (saved, message)."""
-    day_dir = os.path.join(fno_root(data_root, underlying), run_date.isoformat())
+    bhavcopy check found missing. Only while Kite (or Dhan, source="dhan" with kite=DhanClient) still
+    serves it (expiry today or later). The caller holds the lock. Returns (saved, message)."""
+    broker = BROKER[source]
+    day_dir = os.path.join(fno_root(data_root, underlying, source), run_date.isoformat())
     dumps = sorted(glob.glob(os.path.join(day_dir, "instruments_*.csv")))
     if not dumps:
         return False, f"{run_date} has no saved instrument list; download the day first."
     with open(dumps[0], newline="", encoding="utf-8") as f:
-        contracts = select_contracts(list(csv.DictReader(f)), underlying, run_date)
+        saved_list = list(csv.DictReader(f))
+    contracts = select_contracts(saved_list, underlying, run_date)
     found = None
     for c in contracts:
         try:
@@ -1083,14 +1307,18 @@ def redownload_contract(api_key, access_token, run_date, data_root, contract, un
         return False, f"{contract} is not in the instrument list saved for {run_date}."
     c, path = found
     if as_date(c["expiry"]) < today_ist():
-        return False, f"{contract} expired on {as_date(c['expiry'])}; Kite no longer serves it."
-    echo = lambda m: log(f"[{run_key(underlying, run_date)}] {m}")
-    kite, msg, status = connect(api_key, access_token, echo, report=False)
-    if status:
-        return False, msg
+        return False, f"{contract} expired on {as_date(c['expiry'])}; {broker} no longer serves it."
+    echo = lambda m: log(f"[{run_key(underlying, run_date, source)}] {m}")
+    if kite is None:
+        kite, msg, status = connect(api_key, access_token, echo, report=False)
+        if status:
+            return False, msg
+    if hasattr(kite, "learn"):   # DhanClient: instrument type per id from the saved list
+        kite.learn(saved_list)
     start, end = datetime.combine(run_date, WINDOW[0]), datetime.combine(run_date, WINDOW[1])
+    token = c["instrument_token"] if source == "dhan" else int(c["instrument_token"])
     try:
-        candles = fetch_chunk(kite, RateLimiter(speed), int(c["instrument_token"]), start, end, "minute",
+        candles = fetch_chunk(kite, RateLimiter(speed), token, start, end, "minute",
                               oi=True, max_tries=MAX_TRIES)
     except (AuthStop, ChunkFailed, StopJob) as e:
         return False, f"{contract}: {e}"
@@ -1102,7 +1330,7 @@ def redownload_contract(api_key, access_token, run_date, data_root, contract, un
                                                "Kept": "Y" if bars else "N"}})
     db = open_db(data_root)
     try:
-        run = run_key(underlying, run_date)
+        run = run_key(underlying, run_date, source)
         db.execute("INSERT OR IGNORE INTO chunks (run, symbol, token, chunk_from, chunk_to, status) "
                    "VALUES (?, ?, ?, ?, ?, 'PENDING')", (run, c["tradingsymbol"], c["instrument_token"], str(start), str(end)))
         db.execute("UPDATE chunks SET status = 'DONE', tries = tries + 1, error = NULL, reason = ?, updated = ? "
@@ -1114,9 +1342,9 @@ def redownload_contract(api_key, access_token, run_date, data_root, contract, un
     if bars:
         msg = f"{contract}: saved {bars} bars for {run_date}" + (" (all with volume 0)." if zero else ".")
     elif zero:
-        msg = (f"{contract}: Kite returned {len(candles)} candles, all with volume 0, for {run_date}; no file "
+        msg = (f"{contract}: {broker} returned {len(candles)} candles, all with volume 0, for {run_date}; no file "
                f"(keep zero-volume contracts is OFF).")
     else:
-        msg = f"{contract}: Kite returned no candles for {run_date}, so no file was written."
+        msg = f"{contract}: {broker} returned no candles for {run_date}, so no file was written."
     echo(msg)
     return bool(bars), msg

@@ -32,6 +32,12 @@ def credentials():
     return env.get("KITE_API_KEY", ""), env.get("KITE_API_SECRET", "")
 
 
+def dhan_credentials():
+    """Dhan Client ID and access token from .env (read on every request, like credentials())."""
+    env = load_env()
+    return env.get("DHAN_CLIENT_ID", ""), env.get("DHAN_ACCESS_TOKEN", "")
+
+
 def secret_key():
     """Flask session key, generated once and kept in .env so sessions survive restarts."""
     if "FLASK_SECRET_KEY" not in load_env():
@@ -47,10 +53,21 @@ def data_dir():
 WEEKDAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 
 
-def weekly_expiry_weekday():
-    """WEEKLY_EXPIRY_WEEKDAY from .env (MON..SUN or Monday..Sunday) as Monday = 0; default Tuesday."""
-    value = load_env().get("WEEKLY_EXPIRY_WEEKDAY", "").strip().upper()[:3]
-    return WEEKDAYS.index(value) if value in WEEKDAYS else 1
+# Weekly expiry weekday per F&O underlying (only used when the expiry history is too short)
+WEEKLY_EXPIRY_DEFAULTS = {"NIFTY": "TUE", "SENSEX": "THU"}
+
+
+def weekly_expiry_weekday(underlying="NIFTY"):
+    """The underlying's weekly expiry weekday as Monday = 0: .env WEEKLY_EXPIRY_WEEKDAY_<UNDERLYING>
+    (MON..SUN or Monday..Sunday), for NIFTY also the older WEEKLY_EXPIRY_WEEKDAY; default
+    WEEKLY_EXPIRY_DEFAULTS (NIFTY Tuesday, SENSEX Thursday)."""
+    env = load_env()
+    keys = [f"WEEKLY_EXPIRY_WEEKDAY_{underlying}"] + (["WEEKLY_EXPIRY_WEEKDAY"] if underlying == "NIFTY" else [])
+    for key in keys:
+        value = env.get(key, "").strip().upper()[:3]
+        if value in WEEKDAYS:
+            return WEEKDAYS.index(value)
+    return WEEKDAYS.index(WEEKLY_EXPIRY_DEFAULTS.get(underlying, "TUE"))
 
 
 # "Keep contracts with candles but zero volume" (backfill/fno.py): Kite can report a contract that

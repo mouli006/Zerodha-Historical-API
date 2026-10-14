@@ -1,16 +1,18 @@
-"""Check saved NIFTY F&O days against the NSE F&O bhavcopy. Run it by hand, e.g. in the evening after
-NSE publishes the file, or any later day (NSE keeps the archive).
+"""Check saved F&O days against the exchange's F&O bhavcopy: NIFTY against NSE's, SENSEX
+(--underlying SENSEX) against BSE's. Run it by hand, e.g. in the evening after the exchange publishes
+the file, or any later day (both keep an archive).
 
-    python nifty_bhav.py YYYY-MM-DD [--folder PATH] [--bhav-file PATH] [--underlying NIFTY]
-    python nifty_bhav.py --missing  [--folder PATH] [--underlying NIFTY]
-    python nifty_bhav.py --export YYYY-MM-DD [--csv] [--folder PATH]
-    python nifty_bhav.py --export-days [--folder PATH]
+    python nifty_bhav.py YYYY-MM-DD [--folder PATH] [--bhav-file PATH] [--underlying NIFTY|SENSEX]
+    python nifty_bhav.py --missing  [--folder PATH] [--underlying NIFTY|SENSEX]
+    python nifty_bhav.py --export YYYY-MM-DD [--csv] [--folder PATH] [--underlying NIFTY|SENSEX]
+    python nifty_bhav.py --export-days [--folder PATH] [--underlying NIFTY|SENSEX]
+    python nifty_bhav.py ... --source dhan    (the Dhan files in <UNDERLYING>_FnO_1min_Dhan/)
 
---bhav-file takes a zip or CSV downloaded by hand (when NSE blocks the script). --missing checks every
+--bhav-file takes a zip or CSV downloaded by hand (when the exchange blocks the script). --missing checks every
 saved Kite day that has no bhavcopy check yet. --export saves a checked day's full report (Excel; --csv:
 every contract as CSV) into <day>/bhavcopy/exports/, --export-days the all-days summary CSV into
 <UNDERLYING>_FnO_1min/; both read the saved check only and print the path. Exit codes: 0 OK, 1 differences found or not run,
-4 bhavcopy not available yet (404)."""
+4 bhavcopy not available yet (404, or BSE's page instead of the file)."""
 import argparse
 import os
 import sys
@@ -33,7 +35,7 @@ class Parser(argparse.ArgumentParser):
 
 
 def main(argv=None):
-    p = Parser(description="Compare saved NIFTY F&O days with the NSE F&O bhavcopy.")
+    p = Parser(description="Compare saved NIFTY / SENSEX F&O days with the NSE / BSE F&O bhavcopy.")
     which = p.add_mutually_exclusive_group(required=True)
     which.add_argument("date", nargs="?", help="YYYY-MM-DD of a saved F&O day")
     which.add_argument("--missing", action="store_true", help="every saved day without a bhavcopy check")
@@ -42,7 +44,10 @@ def main(argv=None):
     p.add_argument("--csv", action="store_true", help="with --export: every contract as CSV instead of Excel")
     p.add_argument("--folder", help="save folder, default the dashboard's (KITE_DATA_DIR) or ./data")
     p.add_argument("--bhav-file", help="a bhavcopy zip or CSV downloaded by hand (needs a date)")
-    p.add_argument("--underlying", default="NIFTY", choices=sorted(UNDERLYINGS))
+    p.add_argument("--underlying", default="NIFTY", choices=sorted(UNDERLYINGS),
+                   help="NIFTY (NSE bhavcopy, default) or SENSEX (BSE bhavcopy)")
+    p.add_argument("--source", default="kite", choices=["kite", "dhan"],
+                   help="whose saved files to check: kite (default) or dhan (<UNDERLYING>_FnO_1min_Dhan/)")
     args = p.parse_args(argv)
     if args.bhav_file and (args.missing or args.export or args.export_days):
         p.error("--bhav-file needs a date, not --missing or an export")
@@ -59,13 +64,13 @@ def main(argv=None):
         print(f"Not run: {err}", file=sys.stderr)
         return 1
     if dates is None:
-        dates = unchecked_days(folder, args.underlying)
+        dates = unchecked_days(folder, args.underlying, args.source)
         if not dates:
             print("Nothing to check: every saved day has a bhavcopy check.")
             return 0
 
     try:
-        lock = acquire_lock(folder, args.underlying, "nifty_bhav.py")   # the same lock as the Kite job
+        lock = acquire_lock(folder, args.underlying, "nifty_bhav.py", args.source)   # the same lock as the download
     except LockBusy as e:
         print(f"Not run: {e}", file=sys.stderr)
         return 1
@@ -73,7 +78,7 @@ def main(argv=None):
     try:
         for d in dates:
             try:
-                status, _, _ = run_bhav(d, folder, args.underlying, args.bhav_file)
+                status, _, _ = run_bhav(d, folder, args.underlying, args.bhav_file, source=args.source)
                 codes.append(EXIT[status])
             except (BhavError, OSError) as e:
                 print(f"[bhav:{args.underlying}:{d}] Not checked: {e}", file=sys.stderr)
@@ -95,12 +100,12 @@ def export(p, args):
             p.error(f"invalid date {args.export!r}, use YYYY-MM-DD")
     scope = "days" if args.export_days else "all" if args.csv else "xlsx"
     try:
-        name, data, _ = bhav_export.export(folder, args.underlying, scope, run_date)
+        name, data, _ = bhav_export.export(folder, args.underlying, scope, run_date, source=args.source)
     except BhavError as e:
         print(f"Not exported: {e}", file=sys.stderr)
         return 1
-    out = (fno_root(folder, args.underlying) if args.export_days
-           else os.path.join(bhav_dir(folder, args.underlying, run_date), "exports"))
+    out = (fno_root(folder, args.underlying, args.source) if args.export_days
+           else os.path.join(bhav_dir(folder, args.underlying, run_date, args.source), "exports"))
     os.makedirs(out, exist_ok=True)
     path = os.path.join(out, name)
     with open(path, "wb") as f:

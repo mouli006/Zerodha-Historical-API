@@ -1,8 +1,10 @@
-"""NIFTY F&O 1-minute download. Run it by hand; a date for today works after 15:40 IST.
+"""NIFTY (NFO) or SENSEX (BFO, --underlying SENSEX) F&O 1-minute download. Run it by hand; a date for
+today works after 15:40 IST. After each day the NSE (NIFTY) or BSE (SENSEX) bhavcopy is fetched and checked.
 
-    python nifty_daily.py YYYY-MM-DD [--folder PATH] [--speed 2.5] [--underlying NIFTY]
-    python nifty_daily.py --missing  [--folder PATH] [--speed 2.5] [--underlying NIFTY]
-    python nifty_daily.py --refetch-no-trade YYYY-MM-DD [--folder PATH] [--speed 2.5]
+    python nifty_daily.py YYYY-MM-DD [--folder PATH] [--speed 2.5] [--underlying NIFTY|SENSEX]
+    python nifty_daily.py --missing  [--folder PATH] [--speed 2.5] [--underlying NIFTY|SENSEX]
+    python nifty_daily.py --refetch-no-trade YYYY-MM-DD [--folder PATH] [--speed 2.5] [--underlying ...]
+    python nifty_daily.py ... --source dhan    (from Dhan into <UNDERLYING>_FnO_1min_Dhan/, speed up to 5)
     python nifty_daily.py --inspect CONTRACT YYYY-MM-DD    (e.g. NIFTY2415013OCT26PE 2026-10-07)
     python nifty_daily.py --inspect-missing YYYY-MM-DD
 
@@ -15,7 +17,9 @@ is still live on Kite, so the download is complete. --missing downloads every su
 complete folder. --keep-zero-volume / --no-keep-zero-volume (default KEEP_ZERO_VOLUME in .env, else
 config.py) keeps or skips contracts whose Kite candles all have volume 0 (Kite can report a single trade
 that way). --refetch-no-trade requests every contract of a saved day that has no file again with the
-setting ON, then checks the day against its saved bhavcopy again. Reads KITE_API_KEY and KITE_ACCESS_TOKEN from .env (sign in on the dashboard first).
+setting ON, then checks the day against its saved bhavcopy again. Reads KITE_API_KEY and KITE_ACCESS_TOKEN from .env
+(sign in on the dashboard first); --source dhan reads DHAN_ACCESS_TOKEN (connect on the Dhan tab) and needs an
+active Dhan Data API plan. Every mode works on both sources.
 Exit codes: 0 finished or market holiday, 1 failed contracts or not run, 2 token missing or
 invalid, 3 date outside the allowed window."""
 import argparse
@@ -23,7 +27,12 @@ import os
 import sys
 from datetime import date
 
-from backfill.fno import (INSPECT_COLUMNS, UNDERLYINGS, LockBusy, acquire_lock, fno_root, inspect_contracts,
+from kiteconnect import exceptions as kex
+
+from backfill.bhav_export import relabel
+from backfill.dhan_api import MAX_SPEED as DHAN_MAX_SPEED
+from backfill.dhan_api import DhanClient, data_plan_error, token_ok
+from backfill.fno import (BROKER, INSPECT_COLUMNS, UNDERLYINGS, LockBusy, acquire_lock, fno_root, inspect_contracts,
                           job_fields, missing_in_kite, refetch_no_trade, run_daily, run_missing, table)
 from backfill.job import job_begin
 from backfill.storage import check_folder
@@ -40,7 +49,7 @@ class Parser(argparse.ArgumentParser):
 
 
 def main(argv=None):
-    p = Parser(description="Download 1-minute candles with OI for every NIFTY F&O contract of a day.")
+    p = Parser(description="Download 1-minute candles with OI for every NIFTY (NFO) or SENSEX (BFO) F&O contract of a day.")
     which = p.add_mutually_exclusive_group(required=True)
     which.add_argument("date", nargs="?", help="YYYY-MM-DD, from the day after the previous expiry to today")
     which.add_argument("--missing", action="store_true", help="every allowed date without a complete folder")
@@ -52,7 +61,10 @@ def main(argv=None):
                        help="--inspect every MISSING_IN_KITE contract of the day's bhavcopy check; writes nothing")
     p.add_argument("--folder", help="save folder, default the dashboard's (KITE_DATA_DIR) or ./data")
     p.add_argument("--speed", type=float, default=2.5, help="requests per second, at most 3 (default 2.5)")
-    p.add_argument("--underlying", default="NIFTY", choices=sorted(UNDERLYINGS))
+    p.add_argument("--underlying", default="NIFTY", choices=sorted(UNDERLYINGS),
+                   help="NIFTY (NSE, default) or SENSEX (BSE)")
+    p.add_argument("--source", default="kite", choices=["kite", "dhan"],
+                   help="kite (default) or dhan: from your Dhan account into <UNDERLYING>_FnO_1min_Dhan/")
     p.add_argument("--keep-zero-volume", action=argparse.BooleanOptionalAction, default=None,
                    help="keep contracts whose candles all have volume 0 (default from .env KEEP_ZERO_VOLUME / config.py)")
     args = p.parse_args(argv)
@@ -64,8 +76,9 @@ def main(argv=None):
             run_date = date.fromisoformat(day)
         except ValueError:
             p.error(f"invalid date {day!r}, use YYYY-MM-DD")
-    if not 0 < args.speed <= 3:
-        p.error("--speed must be above 0 and at most 3")
+    top = DHAN_MAX_SPEED if args.source == "dhan" else 3
+    if not 0 < args.speed <= top:
+        p.error(f"--speed must be above 0 and at most {top:g}")
     if args.inspect or args.inspect_missing:
         return inspect(args, run_date)
     keep_zero = keep_zero_volume() if args.keep_zero_volume is None else args.keep_zero_volume
@@ -78,28 +91,27 @@ def main(argv=None):
         print(f"Not run: {err}", file=sys.stderr)
         return 1
 
-    env = load_env()
-    api_key, token = env.get("KITE_API_KEY", ""), env.get("KITE_ACCESS_TOKEN", "")
-    if not api_key or not token:
-        print("KITE_API_KEY or KITE_ACCESS_TOKEN is missing from .env. Sign in on the dashboard.", file=sys.stderr)
-        return 2
+    api_key, token, extra, code = sign_in(args.source)
+    if code:
+        return code
 
     try:
-        lock = acquire_lock(folder, args.underlying, "nifty_daily.py")
+        lock = acquire_lock(folder, args.underlying, "nifty_daily.py", args.source)
     except LockBusy as e:
         print(f"Not run: {e}", file=sys.stderr)
         return 1
+    weekday = weekly_expiry_weekday(args.underlying)
     try:
-        job_begin(**job_fields(args.underlying, run_date, folder, args.speed, keep_zero))
+        job_begin(**job_fields(args.underlying, run_date, folder, args.speed, keep_zero, args.source))
         if args.missing:
-            status = run_missing(api_key, token, folder, args.speed, args.underlying, weekday=weekly_expiry_weekday(),
-                                 keep_zero=keep_zero)
+            status = run_missing(api_key, token, folder, args.speed, args.underlying, weekday=weekday,
+                                 keep_zero=keep_zero, **extra)
         elif args.refetch_no_trade:
             status, _ = refetch_no_trade(api_key, token, run_date, folder, args.speed, args.underlying,
-                                         weekday=weekly_expiry_weekday())
+                                         weekday=weekday, **extra)
         else:
             status = run_daily(api_key, token, run_date, folder, args.speed, args.underlying,
-                               weekday=weekly_expiry_weekday(), keep_zero=keep_zero)
+                               weekday=weekday, keep_zero=keep_zero, **extra)
     except KeyboardInterrupt:
         print("Interrupted. Finished contracts are saved; run again to continue.", file=sys.stderr)
         return 1
@@ -108,32 +120,63 @@ def main(argv=None):
     return EXIT.get(status, 1)   # run_daily / run_missing have printed why
 
 
+def sign_in(source):
+    """(api_key, token, run kwargs, 0) from .env, or a non-zero exit code after printing why.
+    Kite: the token is checked by the job itself. Dhan: the token must not have expired, Dhan must
+    accept it and the Data API plan must be active (as on the Dhan page); the kwargs carry the client."""
+    env = load_env()
+    if source == "kite":
+        api_key, token = env.get("KITE_API_KEY", ""), env.get("KITE_ACCESS_TOKEN", "")
+        if not api_key or not token:
+            print("KITE_API_KEY or KITE_ACCESS_TOKEN is missing from .env. Sign in on the dashboard.", file=sys.stderr)
+            return "", "", {}, 2
+        return api_key, token, {}, 0
+    token, err = token_ok(env)
+    if err:
+        print(err, file=sys.stderr)
+        return "", "", {}, 2
+    client = DhanClient(token)
+    try:
+        profile = client.profile()
+    except (kex.TokenException, kex.PermissionException) as e:
+        print(f"Dhan refused the access token ({e}). Paste a new one on the Dhan tab of the sign-in page.", file=sys.stderr)
+        return "", "", {}, 2
+    except Exception as e:
+        print(f"Could not reach Dhan to check the token: {type(e).__name__}: {e}", file=sys.stderr)
+        return "", "", {}, 1
+    err = data_plan_error(profile)
+    if err:
+        print(f"Not run: {err}", file=sys.stderr)
+        return "", "", {}, 1
+    return "", token, {"kite": client, "user": profile.get("user_id", ""), "source": "dhan"}, 0
+
+
 def inspect(args, run_date):
     """--inspect / --inspect-missing: no folder check, no lock, nothing written."""
     folder = os.path.normpath(os.path.expanduser((args.folder or data_dir()).strip()))
     if args.inspect:
         names = [args.inspect[0].strip().upper()]
     else:
-        names = missing_in_kite(os.path.join(fno_root(folder, args.underlying), run_date.isoformat()))
+        names = missing_in_kite(os.path.join(fno_root(folder, args.underlying, args.source), run_date.isoformat()))
         if names is None:
             print(f"Not run: {run_date} has no bhav_compare.csv in {folder}; run the bhavcopy check first.",
                   file=sys.stderr)
             return 1
+        missing = f"MISSING_IN_{BROKER[args.source].upper()}"   # bhav_compare.csv says MISSING_IN_KITE for both
         if not names:
-            print(f"{run_date}: no MISSING_IN_KITE contracts.")
+            print(f"{run_date}: no {missing} contracts.")
             return 0
-        print(f"{run_date}: {len(names)} MISSING_IN_KITE contracts")
-    env = load_env()
-    api_key, token = env.get("KITE_API_KEY", ""), env.get("KITE_ACCESS_TOKEN", "")
-    if not api_key or not token:
-        print("KITE_API_KEY or KITE_ACCESS_TOKEN is missing from .env. Sign in on the dashboard.", file=sys.stderr)
-        return 2
+        print(f"{run_date}: {len(names)} {missing} contracts")
+    api_key, token, extra, code = sign_in(args.source)
+    if code:
+        return code
+    extra.pop("user", None)
     status, rows = inspect_contracts(api_key, token, run_date, folder, names, args.underlying, args.speed,
-                                     verbose=bool(args.inspect))
+                                     verbose=bool(args.inspect), **extra)
     if status:
         return EXIT.get(status, 1)
     if args.inspect_missing:
-        print(table(INSPECT_COLUMNS, rows))
+        print(table(*relabel(INSPECT_COLUMNS, rows, args.source)))
         results = {}
         for r in rows:
             results[r["Result"]] = results.get(r["Result"], 0) + 1
