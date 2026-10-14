@@ -253,6 +253,34 @@ python nifty_bhav.py 2026-10-13 --source dhan --underlying SENSEX
   Exit codes are the same as for Kite (2 = Dhan token missing, expired or refused).
 - **Backtests:** `load_day`, `load_contract` and `load_eod` take `source="dhan"` to read `NIFTY_FnO_1min_Dhan/` (with `underlying="SENSEX"`, `SENSEX_FnO_1min_Dhan/`).
 
+## NSE delisting and merger reference
+`nse_reference.py` collects which NSE stocks were delisted, suspended or merged away since 2015, so backtests can account for stocks that no longer trade. It needs no Kite or Dhan login and is run by hand:
+
+```
+playwright install chromium      # once, for the fallback browser (after pip install -r requirements.txt)
+python nse_reference.py          # options: --folder PATH, --from 2015-01-01, --only voluntary,compulsory,circulars,suspensions, --offline, --no-browser
+```
+
+Files go to `<data folder>/NSE_CM_bhav/reference/` (the data folder is the dashboard's last save folder, or `./data`):
+
+| File | From | Columns |
+|---|---|---|
+| `voluntary_delisting.csv` | the two Excel files on NSE's *Delisting of Companies* page: companies delisted from NSE (every type: voluntary, compulsory, liquidation, ...) since `--from`, and companies proposed to be delisted | `list` (delisted / proposed), `symbol`, `isin`, `company`, `board`, `delisting_date`, `delisting_type`, `initial_notice_date`, `final_notice_date`, `exit_price` |
+| `compulsory_delisting.csv` | the *Orders of delisting* table | `order_date`, `company`, `symbol` (from the delisted list by company name, else from the order PDF), `symbol_source`, `pdf_url` |
+| `delisting_circulars.csv` | Listing circulars with "delist" in the subject (Dissemination Board circulars skipped) | `circular_no`, `circular_date`, `department`, `subject`, `delisting_type`, `symbol`, `company`, `effective_date`, `pdf_url` (one row per company in the circular) |
+| `mergers.csv` | equity suspension circulars whose PDF text names a scheme, amalgamation or merger | `old_symbol`, `old_company`, `scheme_type` (MERGER, DEMERGER, CAPITAL_REDUCTION, several joined with `+`, or OTHER), `exit_expected`, `new_company`, `new_symbol`, `swap_ratio` ("42 for 25"), `new_per_old`, `suspended_from`, `last_trading_date`, `record_date`, `reason_text`, `corrected_by` |
+| `suspensions.csv` | every other equity suspension circular | `status` (SUSPENDED, CANCELLED for "Proposed Suspension not to be carried out", CONTINUED for "Continuation of suspension"), `symbol`, `company`, `effective_date`, `reason` (liquidation, IBC / resolution plan, delisting, non-compliance with listing rules, not responding to the exchange, partly paid call, capital reduction, ...), `exit_expected`, `reason_text` (the sentence it came from), `cancels_circular` (for CANCELLED: the suspension it calls off), `corrected_by` |
+
+Every file also has `source_file` (the saved file the row came from), `needs_review` and `review_note`. Suspension circulars come from all departments; subjects about bonds, NCDs, mutual fund units, revocations and member (broker) suspensions are skipped and counted in the summary, and so is a circular that only points to debt circulars (e.g. Tata Motors Finance, which had no listed shares).
+
+- **exit_expected** (Y/N) is a guess from the circular, not the final answer (that comes later from the bhavcopies: did the stock trade again). Mergers: Y when the scheme has an amalgamation / merger part (the old company stops existing); a demerger or capital reduction alone is N. Suspensions: Y for delisting, liquidation and IBC / resolution plan; N for everything else (non-compliance suspensions are usually revoked), and for CANCELLED rows.
+- **Corrections:** a corrigendum or a "change in effective date" circular is folded into the row of the circular it corrects: the corrected dates win and `corrected_by` names it (e.g. Jubilant Industries: suspended from 2024-10-28, corrected by NSE/CML/64545).
+
+- **Downloads:** NSE's home page is opened first and requests are 2 seconds apart. If NSE blocks the script, headless Chrome (Playwright) takes over for the rest of the run. Every downloaded file is saved in `reference/raw/` and never downloaded again; pages and this year's circular list are saved with the date in the name, so they are fetched at most once a day. The first run reads about a thousand PDFs and takes a while; later runs only fetch what is new. `--offline` rebuilds the CSVs from `raw/` without any request.
+- **When a download fails**, the script prints each page and the file name to save it under in `reference/raw/`; download it in a browser, save it there and run again. Links that NSE itself serves as 404 are listed separately and don't change the exit code (0 done, 1 something to download by hand or not run).
+- **needs_review=Y** marks rows the parser is unsure about: a missing or odd symbol, company or date, a date before the circular, a scanned PDF without text, a reason it doesn't recognise, a symbol found only by a close name match, or a merger without a swap ratio. `review_note` says why.
+- **Swap ratios:** NSE's suspension circulars almost never give the new company or the swap ratio. Add them to `reference/manual_mergers.csv` (`old_symbol,new_company,new_symbol,swap_ratio,scheme_type,exit_expected,note`; created with an HDFC example). Every run fills `mergers.csv` from it and clears `needs_review` on those rows. `scheme_type` (MERGER, DEMERGER, CAPITAL_REDUCTION, OTHER, or parts joined with `+`) and `exit_expected` (Y/N) are optional: when filled they replace the parsed values (a value the script doesn't understand is ignored and the row stays `needs_review=Y`). `note` is for you (why the row is there) and isn't copied into `mergers.csv`; an older file with only the first four columns still works. The CSVs are rebuilt on every run, so put corrections there, not in the CSVs.
+
 ## Credentials
 Your API keys, secrets and access tokens (Kite and Dhan) are stored only in a local `.env` file, which the app creates when you sign in. It is gitignored and never committed. `.env.example` shows the format.
 

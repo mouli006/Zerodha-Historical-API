@@ -6,3 +6,5 @@ pyarrow
 openpyxl
 tzdata
 pytest
+pdfplumber
+playwright
