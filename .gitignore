@@ -19,6 +19,8 @@ errors.log
 *.parquet.tmp
 *.csv
 *.csv.tmp
+# ...except the backup of the hand-made merger overrides (nse_reference.py)
+!reference/manual_mergers.csv
 
 # Editors and per-user tool settings
 .vscode/

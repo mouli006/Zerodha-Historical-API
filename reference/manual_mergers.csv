@@ -1,0 +1,11 @@
+old_symbol,new_company,new_symbol,swap_ratio,scheme_type,exit_expected,note
+HDFC,HDFC Bank Limited,HDFCBANK,42 for 25,,,
+GUJRATGAS,Gujarat Gas Limited,GUJGASLTD,,MERGER,Y,Reason cell of NSE/CML/29762: 'Scheme of arrangement with Gujarat Gas Limited'; NSE/CML/30732 lists Gujarat Gas Limited shares pursuant to the scheme (Sep 2015)
+CAIRN,Vedanta Limited,VEDL,,MERGER,Y,Cairn India amalgamated into Vedanta (Apr 2017); NSE/CML/35555 lists the Vedanta preference shares issued under the merger
+ABIRLANUVO,Grasim Industries Limited,GRASIM,,MERGER+DEMERGER,Y,"Aditya Birla Nuvo merged into Grasim, financial services demerged to Aditya Birla Capital; NSE/CMTR/35240 (Grasim pre-open for the scheme), NSE/CML/35680 (ABCAPITAL listed under the composite scheme)"
+ISEC,ICICI Bank Limited,ICICIBANK,,OTHER,Y,Delisting by scheme: shareholders got ICICI Bank shares and ICICI Securities became a wholly owned subsidiary (not merged); the listing ends (Mar 2025)
+TATAMTRDVR,Tata Motors Limited,TATAMOTORS,,CAPITAL_REDUCTION,Y,Reason cell of NSE/CML/63585: scheme between Tata Motors (TATAMTRDVR) and Tata Motors (TATAMOTORS); the 'A' ordinary (DVR) shares were cancelled for ordinary shares (Aug 2024)
+DISHMAN,Dishman Carbogen Amcis Limited,DCAL,,MERGER,Y,NSE/CML/35845 lists Dishman Carbogen Amcis shares 'pursuant to the Scheme of Arrangement and Amalgamation' (Sep 2017)
+HBSTOCK,,,,CAPITAL_REDUCTION,N,NSE/CML/38372: recommencement of trading in HB Stockholdings shares pursuant to the Scheme of Arrangement including Capital Reduction (Jul 2018); same company keeps trading
+HINDUJAFO,Ashok Leyland Limited,ASHOKLEY,,MERGER,Y,Hinduja Foundries amalgamated into Ashok Leyland (2017). Public record; no NSE circular in raw/ shows it
+ISMTLTD,Kirloskar Ferrous Industries Limited,KIRLFER,,MERGER,Y,ISMT amalgamated into Kirloskar Ferrous Industries (2024). Public record; no NSE circular in raw/ shows it
