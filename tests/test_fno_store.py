@@ -669,3 +669,19 @@ def test_load_eod_days(published):
     assert set(eod["date"].dt.strftime("%Y-%m-%d")) == {D1}
     days = fno_backtest.load_days("NIFTY", root=published)
     assert list(days["date"]) == [D1, D3] and days["eod_available"].tolist() == [True, True]
+
+
+def test_move_holidays_ignore_the_logged_at_time(tmp_path, logs):
+    a, b, to = tmp_path / "a", tmp_path / "b", tmp_path / "raw"
+    make_day(str(a), D1, source="dhan")
+    make_day(str(b), D2, source="dhan")
+    msg = "2026-10-10: no candles for NIFTY-Oct2026-FUT#48704 (token 48704) between 09:00 and 16:00 IST, so the market was closed."
+    for folder, at, extra in ((a, "2026-10-13 20:11:36", []), (b, "2026-10-13 21:50:03", ["2026-10-13 21:50:04 2026-10-11: closed."])):
+        with open(os.path.join(fno.fno_root(str(folder), "NIFTY", "dhan"), "holidays.log"), "w", encoding="utf-8") as f:
+            f.write("\n".join([f"{at} {msg}"] + extra) + "\n")
+    lines, log = logs
+    assert store.move_raw([str(a), str(b)], "dhan", str(to), apply=True, log=log) == 0
+    with open(os.path.join(fno.fno_root(str(to), "NIFTY", "dhan"), "holidays.log"), encoding="utf-8") as f:
+        assert f.read().splitlines() == [f"2026-10-13 20:11:36 {msg}", "2026-10-13 21:50:04 2026-10-11: closed."]
+    assert sum("+1 holidays.log lines" in line for line in lines) == 2
+    assert fno.holidays_logged(str(to), "NIFTY", "dhan") == {date(2026, 10, 10), date(2026, 10, 11)}

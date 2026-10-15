@@ -6,7 +6,7 @@ Day folders keep their names and contents byte for byte: os.rename on the same d
 file sizes are checked before the source is deleted. A day the target already has (any name form) is never
 moved, replaced or deleted; it is listed ("incoming has more data" when the target is noZeroVol and the
 incoming folder withZeroVol). Per root, expiries_seen.csv (union, earliest first_seen) and holidays.log
-(new lines) are merged, and the progress.sqlite rows of every moved day (run key fno:/fno-dhan:) are copied
+(lines for holidays it doesn't list yet; the leading "logged at" time is ignored) are merged, and the progress.sqlite rows of every moved day (run key fno:/fno-dhan:) are copied
 into <to>/progress.sqlite, so a resume skips contracts that were DONE without a file. Dry run by default."""
 import csv
 import os
@@ -46,6 +46,13 @@ def merge_expiries(target, incoming):
             target[e] = seen
             changed.append(e)
     return changed
+
+
+def holiday_key(line):
+    """A holidays.log line without its leading "YYYY-MM-DD HH:MM:SS" (when it was logged), so the same holiday
+    logged by two runs counts once."""
+    parts = line.split(" ", 2)
+    return parts[2] if len(parts) == 3 and parts[0][:2] == "20" and ":" in parts[1] else line
 
 
 def read_lines(path):
@@ -123,7 +130,7 @@ def plan(froms, source, to):
             if dst_root not in targets:
                 have = fno.day_folders(dst_root) if os.path.isdir(dst_root) else {}
                 targets[dst_root] = {"days": dict(have), "expiries": read_expiries_file(dst_root),
-                                     "holidays": set(read_lines(os.path.join(dst_root, "holidays.log")))}
+                                     "holidays": {holiday_key(x) for x in read_lines(os.path.join(dst_root, "holidays.log"))}}
             t = targets[dst_root]
             r = {"from": frm, "underlying": u, "src": src_root, "dst": dst_root, "moves": [], "dups": [],
                  "expiries": [], "holidays": [], "progress": 0}
@@ -143,8 +150,11 @@ def plan(froms, source, to):
                     r["progress"] += len(rows)
                 r["moves"].append((name, run, cols, rows))
             r["expiries"] = merge_expiries(t["expiries"], read_expiries_file(src_root))
-            new = [line for line in read_lines(os.path.join(src_root, "holidays.log")) if line not in t["holidays"]]
-            t["holidays"].update(new)
+            new = []
+            for line in read_lines(os.path.join(src_root, "holidays.log")):
+                if holiday_key(line) not in t["holidays"]:
+                    t["holidays"].add(holiday_key(line))
+                    new.append(line)
             r["holidays"] = new
             r["empty_after"] = len(r["moves"]) == len(fno.day_folders(src_root))
             roots.append(r)
@@ -231,9 +241,9 @@ def report_and_apply(roots, to, apply, log):
                 fno.write_csv(os.path.join(r["dst"], fno.EXPIRIES_FILE), ["expiry", "first_seen"],
                               [{"expiry": e, "first_seen": seen[e]} for e in sorted(seen)])
             if r["holidays"]:
-                have = set(read_lines(os.path.join(r["dst"], "holidays.log")))
+                have = {holiday_key(x) for x in read_lines(os.path.join(r["dst"], "holidays.log"))}
                 with open(os.path.join(r["dst"], "holidays.log"), "a", encoding="utf-8") as f:
-                    f.writelines(line + "\n" for line in r["holidays"] if line not in have)
+                    f.writelines(line + "\n" for line in r["holidays"] if holiday_key(line) not in have)
             for name, run, cols, rows in r["moves"]:
                 src, dst = os.path.join(r["src"], name), os.path.join(r["dst"], name)
                 move_day(src, dst)
