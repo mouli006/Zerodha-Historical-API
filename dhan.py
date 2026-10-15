@@ -17,8 +17,8 @@ from backfill import fno, fno_days
 from backfill.dhan_api import MAX_SPEED, DhanClient, DhanError, data_plan_error, fetch_profile, token_connected
 from backfill.job import JOB, JOB_LOCK, STOP, job_begin
 from backfill.storage import check_folder
-from config import (DEFAULT_DATA_DIR, data_dir, dhan_credentials, keep_zero_volume, load_env, save_env, trim_to_bhav,
-                    weekly_expiry_weekday)
+from config import (DEFAULT_DATA_DIR, FNO_RAW_KEYS, data_dir, dhan_credentials, keep_zero_volume, load_env, save_env,
+                    trim_to_bhav, weekly_expiry_weekday)
 
 bp = Blueprint("dhan", __name__)
 
@@ -118,8 +118,12 @@ def dashboard():
         return redirect(url_for("dhan.index", error="Connect Dhan first: paste a valid access token."))
     st = status()
     with JOB_LOCK:
-        speed = JOB["speed"] if JOB["kind"] == "fno" and JOB["source"] == SOURCE else DEFAULT_SPEED
-        folder = JOB["folder"] or data_dir()
+        mine = JOB["kind"] == "fno" and JOB["source"] == SOURCE
+        speed = JOB["speed"] if mine else DEFAULT_SPEED
+        last = JOB["folder"]
+    # the last Dhan F&O job's folder, else .env FNO_RAW_DHAN, else the last folder used / KITE_DATA_DIR
+    raw = load_env().get(FNO_RAW_KEYS[SOURCE])
+    folder = (last if mine and last else "") or raw or last or data_dir()
     form = {"folder": folder, "speed": speed}
     underlyings = [{"name": u, "exchange": fno.exchange_of(u, SOURCE), "bhav": fno.exchange_name(u)}
                    for u in fno.UNDERLYINGS if u in UNDERLYINGS]
@@ -251,7 +255,8 @@ def fno_start():
     if not job_begin(**fno.job_fields(underlying, run_date, folder, speed, keep_zero, SOURCE, label, trim)):
         lock.release()
         return fail("A download is already running. Stop it or wait for it to finish.")
-    save_env({"KITE_DATA_DIR": folder})
+    if not load_env().get(FNO_RAW_KEYS[SOURCE]):   # with FNO_RAW_DHAN set, KITE_DATA_DIR stays the planner's
+        save_env({"KITE_DATA_DIR": folder})
     STOP.clear()
     user = profile.get("user_id", "")
 

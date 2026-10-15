@@ -300,6 +300,93 @@ python nifty_bhav.py 2026-10-13 --source dhan --underlying SENSEX
   Exit codes are the same as for Kite (2 = Dhan token missing, expired or refused).
 - **Backtests:** `load_day`, `load_contract` and `load_eod` take `source="dhan"` to read `NIFTY_FnO_1min_Dhan/` (with `underlying="SENSEX"`, `SENSEX_FnO_1min_Dhan/`).
 
+## F&O backtest store
+F&O data lives in two places: **raw**, the folders the app downloads into (format unchanged), and **backtest**, Parquet files built from raw by `publish` that backtests read. Equity is not part of this.
+
+```
+D:\Data\fno\
+├── raw\
+│   ├── kite\                      Kite F&O save folder: NIFTY_FnO_1min\, SENSEX_FnO_1min\ (day folders as always)
+│   └── dhan\                      Dhan F&O save folder: NIFTY_FnO_1min_Dhan\, SENSEX_FnO_1min_Dhan\
+└── backtest\                      built from raw\ by publish; can be deleted and rebuilt at any time
+    ├── NIFTY\
+    │   ├── minute\kite\<YYYY>\<YYYY-MM-DD>.parquet
+    │   ├── minute\dhan\<YYYY>\<YYYY-MM-DD>.parquet
+    │   ├── eod\<YYYY>.parquet
+    │   ├── contracts.parquet, expiries.csv, days.csv, publish_manifest.json
+    └── SENSEX\                    (the same layout)
+```
+
+### Settings
+Optional keys in `.env`:
+
+| Key | Used for |
+|---|---|
+| `FNO_RAW_KITE` | Start folder of the Kite F&O card, default `--folder` of `nifty_daily.py` / `nifty_bhav.py`, default `--to` of `move-raw --source kite` and `--raw-kite` of `publish` |
+| `FNO_RAW_DHAN` | The same for Dhan (`--source dhan`, the Dhan F&O card, `--raw-dhan`) |
+| `FNO_BACKTEST_DIR` | Default `--out` of `publish` and `root` of the backtest loader |
+
+When `FNO_RAW_KITE` / `FNO_RAW_DHAN` are not set, everything uses `KITE_DATA_DIR` as before. When they are set, starting an F&O download no longer changes `KITE_DATA_DIR`, which stays the **New download** folder.
+
+### Moving existing downloads (once)
+```
+python fno_store.py move-raw --from "D:\Data\Kite API data\with zero volume v2" --source kite --to "D:\Data\fno\raw\kite"
+python fno_store.py move-raw --from "D:\Data\Dhan API data\with zero volume" --from "D:\Data\Dhan API data\Without zero volume" --source dhan --to "D:\Data\fno\raw\dhan"
+```
+- It is a **dry run** until you add `--apply`: it prints every `old -> new`, the duplicates, the merges and totals, then "Dry run: nothing moved".
+- Every day folder of each `<UNDERLYING>_FnO_1min[_Dhan]` root in `--from` goes into the same root under `--to` (default `FNO_RAW_KITE` / `FNO_RAW_DHAN`), with its name and contents unchanged. On the same drive it is renamed; across drives it is copied, every file size is checked, and only then is the source deleted.
+- **Duplicates are never moved or replaced.** A day the target already has (any folder name) stays where it is and is listed. If the target is `noZeroVol` and the incoming folder `withZeroVol`, it is listed as "incoming has more data"; decide yourself what to keep.
+- Several `--from` are handled in order, so the second folder's days that the first one already brings are listed as duplicates.
+- Each root's `expiries_seen.csv` (union, earliest first seen) and `holidays.log` (new lines) are merged. The `progress.sqlite` rows of every moved day are copied to `<to>\progress.sqlite`, so a later run of that day doesn't request contracts again that were done without a file. The day counts of both roots are rewritten.
+- It takes the `.lock` of both roots. A root that is busy stops it ("Not run", exit 1); an error stops it and lists what was already moved. Old roots are left in place even when empty. Other content of the old folder (equity data, zip files) is not touched.
+
+### Publishing
+```
+python fno_store.py publish                       # every underlying, from FNO_RAW_KITE / FNO_RAW_DHAN into FNO_BACKTEST_DIR
+python fno_store.py publish --underlying NIFTY --from 2026-10-01 --to 2026-10-31 --prefer dhan
+python fno_store.py publish --raw-kite D:\Data\fno\raw\kite --raw-dhan D:\Data\fno\raw\dhan --out D:\Data\fno\backtest
+```
+- Only new days and days whose raw folder changed (file count, total size or newest file time; a bhavcopy check counts) are rebuilt; `--force` rebuilds all. `publish_manifest.json` remembers what was published.
+- A day without `summary.csv` (not finished) is skipped and listed.
+- Raw is never written: publish only takes each raw root's `.lock` while reading it, so it never reads a day that is being downloaded. A busy root is skipped (exit 1).
+- A published day whose raw folder is gone stays and is marked in `days.csv` (`raw_missing`); `--prune` removes it.
+- At the end it prints, per index and broker, the days published, unchanged, incomplete and failed, with rows and sizes.
+
+`minute\<kite|dhan>\<YYYY>\<YYYY-MM-DD>.parquet`: every contract of the day, sorted by contract then time.
+
+| Column | Meaning |
+|---|---|
+| `contract` | Our file name, e.g. `NIFTY2500020OCT26CE` |
+| `type` | `CE`, `PE` or `FUT` |
+| `expiry` | Date |
+| `strike` | Float, empty (NaN) for futures |
+| `dte` | Calendar days from the trading day to expiry |
+| `datetime` | Bar start, IST, without time zone |
+| `open`, `high`, `low`, `close` | As saved |
+| `volume` | Integer |
+| `oi` | OI with the gaps filled as `fno_loader` does (a 0 inside a day with OI is taken from the previous minute) |
+| `oi_filled` | True where `oi` was filled |
+| `zero_volume` | True on every row of a contract whose day volume is 0 |
+
+Other files per index:
+- `eod\<YYYY>.parquet`: the exchange bhavcopy (NSE for NIFTY, BSE for SENSEX) of each day, from Kite's saved copy, else Dhan's: `date, contract, type, expiry, strike` and `Contract, Expiry, Type, Strike, Close, Last, Settle, OI, Volume_contracts, Lot`.
+- `contracts.parquet`: `contract, type, expiry, strike, lot, first_date, last_date, days_with_data`.
+- `expiries.csv`: `expiry, weekday, kind` (`monthly` = the last expiry of its month, else `weekly`).
+- `days.csv`: one row per trading day in either broker: `date, expiry, dte, kite_available, dhan_available, kite_check, dhan_check` (OK / minor / major / unchecked), `kite_zero_volume, dhan_zero_volume` (with / no), `kite_trim, dhan_trim` (ON / OFF / FALLBACK), `kite_contracts, dhan_contracts, eod_available, best_source, published_at, raw_missing`.
+  - **best_source** is the broker whose bhavcopy check is best: OK, then minor, then unchecked, then major. On a tie it is `--prefer` (default kite).
+
+### Reading it in a backtest
+```python
+from backfill.fno_backtest import load_fno_day, load_fno_range, load_eod, load_days, load_contracts, load_expiries
+
+day = load_fno_day("NIFTY", "2026-10-12")                     # the day's best source (days.csv)
+ce = load_fno_day("NIFTY", "2026-10-12", source="kite", expiry="2026-10-13", types=["CE"],
+                  strikes=[25000, 25100], drop_zero_volume=True, columns=["contract", "datetime", "close", "oi"])
+df, skipped = load_fno_range("SENSEX", "2026-10-07", "2026-10-15")   # days without data are listed in skipped
+eod = load_eod("NIFTY", "2026-10-01", "2026-10-31")           # official close, settlement price, final OI
+```
+Filters are applied while reading, so only the needed rows and columns are loaded. `root=` defaults to `FNO_BACKTEST_DIR`. A day or broker that is not published raises `FileNotFoundError`. `backfill/fno_loader.py` still reads the raw folders.
+
 ## NSE delisting and merger reference
 `nse_reference.py` collects which NSE stocks were delisted, suspended or merged away since 2015, so backtests can account for stocks that no longer trade. It needs no Kite or Dhan login and is run by hand:
 

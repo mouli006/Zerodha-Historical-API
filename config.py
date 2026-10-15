@@ -50,6 +50,24 @@ def data_dir():
     return load_env().get("KITE_DATA_DIR") or DEFAULT_DATA_DIR
 
 
+# F&O folders (backfill/fno_store.py): the raw download folder per source and the backtest store. Optional;
+# without FNO_RAW_<SOURCE> the F&O cards and CLIs use KITE_DATA_DIR as before.
+FNO_RAW_KEYS = {"kite": "FNO_RAW_KITE", "dhan": "FNO_RAW_DHAN"}
+
+
+def fno_raw_dir(source="kite", env=None):
+    """The F&O save folder of a source: .env FNO_RAW_KITE / FNO_RAW_DHAN, else KITE_DATA_DIR, else <project>/data.
+    env: an already loaded .env (callers pass their own load_env() so tests' stubs apply)."""
+    env = load_env() if env is None else env
+    return env.get(FNO_RAW_KEYS[source]) or env.get("KITE_DATA_DIR") or DEFAULT_DATA_DIR
+
+
+def fno_backtest_dir(env=None):
+    """.env FNO_BACKTEST_DIR (the backtest store, built by fno_store.py publish), or ""."""
+    env = load_env() if env is None else env
+    return env.get("FNO_BACKTEST_DIR", "")
+
+
 WEEKDAYS = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
 
 

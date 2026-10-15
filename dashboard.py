@@ -18,8 +18,8 @@ from backfill.instruments import INDEX_CHOICES
 from backfill.job import DEFAULT_SPEED, JOB, JOB_LOCK, STOP, job_begin
 from backfill.runner import bulk_download
 from backfill.storage import FILE_FORMATS, check_folder, job_run_key
-from config import (DEFAULT_DATA_DIR, credentials, data_dir, keep_zero_volume, load_env, save_env, trim_to_bhav,
-                    weekly_expiry_weekday)
+from config import (DEFAULT_DATA_DIR, FNO_RAW_KEYS, credentials, data_dir, keep_zero_volume, load_env, save_env,
+                    trim_to_bhav, weekly_expiry_weekday)
 
 bp = Blueprint("dashboard", __name__)
 
@@ -52,7 +52,9 @@ def success():
     underlyings = [{"name": u, "exchange": exch, "bhav": fno.exchange_name(u)} for u, (exch, _) in fno.UNDERLYINGS.items()]
     fno_info = {"underlying": "NIFTY", "exchange": fno.UNDERLYINGS["NIFTY"][0], "underlyings": underlyings,
                 "ready_at": fno.READY_AT.strftime("%H:%M"), "today": fno.today_ist().isoformat(),
-                "keep_zero_volume": keep_zero_volume(), "trim_to_bhav": trim_to_bhav()}
+                "keep_zero_volume": keep_zero_volume(), "trim_to_bhav": trim_to_bhav(),
+                # the F&O card's start folder: .env FNO_RAW_KITE, else the planner's folder
+                "folder": load_env().get(FNO_RAW_KEYS["kite"]) or form["folder"]}
     broker = {"name": "Kite", "maxSpeed": 3, "defaultSpeed": DEFAULT_SPEED,
               "urls": {"fnoWindow": url_for("dashboard.download_fno_window"), "fno": url_for("dashboard.download_fno_start"),
                        "page": url_for("dashboard.success")}}
@@ -242,7 +244,8 @@ def download_fno_start():
     if not job_begin(**fno.job_fields(underlying, run_date, folder, speed, keep_zero, label=label, trim_to_bhav=trim)):
         lock.release()
         return fail("A download is already running. Stop it or wait for it to finish.")
-    save_env({"KITE_DATA_DIR": folder})
+    if not load_env().get(FNO_RAW_KEYS["kite"]):   # with FNO_RAW_KITE set, KITE_DATA_DIR stays the planner's
+        save_env({"KITE_DATA_DIR": folder})
     STOP.clear()
 
     weekday = weekly_expiry_weekday(underlying)

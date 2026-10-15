@@ -47,7 +47,7 @@ from backfill.fno import (BROKER, FOLDERS, INSPECT_COLUMNS, UNDERLYINGS, DayFold
 from backfill.fno_rename import rename_day_folders, update_day_counts
 from backfill.job import job_begin
 from backfill.storage import check_folder
-from config import data_dir, keep_zero_volume, load_env, trim_to_bhav, weekly_expiry_weekday
+from config import fno_raw_dir, keep_zero_volume, load_env, trim_to_bhav, weekly_expiry_weekday
 
 EXIT = {"finished": 0, "holiday": 0, "auth_failed": 2, "outside_window": 3}
 
@@ -116,7 +116,7 @@ def main(argv=None):
             p.error("--refetch-no-trade keeps zero-volume contracts; drop --no-keep-zero-volume")
         keep_zero = True
     trim = trim_to_bhav() if args.trim_to_bhav is None else args.trim_to_bhav
-    folder, err = check_folder(args.folder or data_dir())
+    folder, err = check_folder(args.folder or default_folder(args.source))
     if err:
         print(f"Not run: {err}", file=sys.stderr)
         return 1
@@ -184,7 +184,7 @@ def sign_in(source):
 
 def inspect(args, run_date):
     """--inspect / --inspect-missing: no folder check, no lock, nothing written."""
-    folder = os.path.normpath(os.path.expanduser((args.folder or data_dir()).strip()))
+    folder = os.path.normpath(os.path.expanduser((args.folder or default_folder(args.source)).strip()))
     if args.inspect:
         names = [args.inspect[0].strip().upper()]
     else:
@@ -220,18 +220,30 @@ def inspect(args, run_date):
     return 0
 
 
+def default_folder(source):
+    """The default --folder of a source: .env FNO_RAW_KITE / FNO_RAW_DHAN, else KITE_DATA_DIR, else ./data."""
+    return fno_raw_dir(source, load_env())
+
+
 def rename(args):
     """--rename-folders (old -> new for every old-style day folder; renames only with --apply) and
-    --update-day-count."""
-    folder = os.path.normpath(os.path.expanduser((args.folder or data_dir()).strip()))
-    if not os.path.isdir(folder):
-        print(f"Not run: {folder} is not a folder.", file=sys.stderr)
-        return 1
+    --update-day-count. Without --folder each source uses its own default folder."""
     underlyings = sorted(UNDERLYINGS) if args.underlying in (None, "all") else [args.underlying]
     sources = sorted(FOLDERS) if args.source in (None, "all") else [args.source]
-    if args.update_day_count:
-        return update_day_counts(folder, underlyings, sources)
-    return rename_day_folders(folder, underlyings, sources, apply=args.apply)
+    groups = {}   # folder -> sources in it
+    for s in sources:
+        folder = os.path.normpath(os.path.expanduser((args.folder or default_folder(s)).strip()))
+        groups.setdefault(folder, []).append(s)
+    code = 0
+    for folder, srcs in groups.items():
+        if not os.path.isdir(folder):
+            print(f"Not run: {folder} is not a folder.", file=sys.stderr)
+            code = 1
+        elif args.update_day_count:
+            code = max(code, update_day_counts(folder, underlyings, srcs))
+        else:
+            code = max(code, rename_day_folders(folder, underlyings, srcs, apply=args.apply))
+    return code
 
 
 if __name__ == "__main__":

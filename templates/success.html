@@ -1141,7 +1141,7 @@
     const [rates, setRates] = useState([]);
     const [feed, setFeed] = useState([]);
     const [folder, setFolder] = useState(boot.form.folder);
-    const [fnoFolder, setFnoFolder] = useState(boot.form.folder);   // F&O and bhavcopy cards, separate from New download
+    const [fnoFolder, setFnoFolder] = useState(boot.fno.folder || boot.form.folder);   // F&O and bhavcopy cards (.env FNO_RAW_*), separate from New download
     const [keepZero, setKeepZero] = useState(!!boot.fno.keep_zero_volume);   // default from config.keep_zero_volume()
     const [trimBhav, setTrimBhav] = useState(!!boot.fno.trim_to_bhav);       // default from config.trim_to_bhav()
     // NIFTY | SENSEX on the F&O and bhavcopy cards; remembered in this browser

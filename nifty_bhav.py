@@ -22,7 +22,7 @@ from backfill import bhav_export
 from backfill.bhav import BhavError, bhav_dir, run_bhav, unchecked_days
 from backfill.fno import UNDERLYINGS, DayFolderError, LockBusy, acquire_lock, fno_root
 from backfill.storage import check_folder
-from config import data_dir
+from config import fno_raw_dir, load_env
 
 EXIT = {"ok": 0, "diffs": 1, "not_available": 4}
 
@@ -59,7 +59,7 @@ def main(argv=None):
         dates = [date.fromisoformat(args.date)] if args.date else None
     except ValueError:
         p.error(f"invalid date {args.date!r}, use YYYY-MM-DD")
-    folder, err = check_folder(args.folder or data_dir())
+    folder, err = check_folder(args.folder or fno_raw_dir(args.source, load_env()))
     if err:
         print(f"Not run: {err}", file=sys.stderr)
         return 1
@@ -95,7 +95,7 @@ def main(argv=None):
 
 def export(p, args):
     """--export / --export-days: read the saved check, write the file, print its path. No lock needed."""
-    folder = os.path.normpath(os.path.expanduser((args.folder or data_dir()).strip()))
+    folder = os.path.normpath(os.path.expanduser((args.folder or fno_raw_dir(args.source, load_env())).strip()))
     run_date = None
     if args.export:
         try:
