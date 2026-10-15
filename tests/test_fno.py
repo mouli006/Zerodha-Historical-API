@@ -432,7 +432,7 @@ def fake_kite(monkeypatch):
 
 
 ACCESS = "SECRET-ACCESS-TOKEN"
-PENDING_COLS = [""] * len(fno.BHAV_SUMMARY_COLUMNS) + ["OFF"]   # bhavcopy columns blank; Keep_zero_volume
+PENDING_COLS = [""] * len(fno.BHAV_SUMMARY_COLUMNS) + ["OFF", "OFF"]   # bhavcopy columns blank; Keep_zero_volume, Trim_to_bhav
 
 
 def run(tmp_path, day=RUN_DATE, log=lambda m: None):
@@ -693,7 +693,7 @@ def test_zero_volume_off_skips_and_lists(tmp_path, fake_kite):
     assert JOB["zero_skipped"] == 1 and JOB["zero_kept"] == 0 and JOB["empty"] == 1
     assert reasons(tmp_path)["NIFTY2610625150CE"] == fno.ZERO_VOLUME
     assert reasons(tmp_path)["NIFTY2610625150PE"] == fno.NO_CANDLES
-    assert read_csv(day / "summary.csv")[1][-1] == "OFF"
+    assert read_csv(day / "summary.csv")[1][-2:] == ["OFF", "OFF"]
 
 
 def test_zero_volume_on_keeps_rows_unchanged(tmp_path, fake_kite):
@@ -706,7 +706,7 @@ def test_zero_volume_on_keeps_rows_unchanged(tmp_path, fake_kite):
     assert reasons(tmp_path)["NIFTY2610625150CE"] is None
     log = (day / "run.log").read_text(encoding="utf-8")
     assert "Keep zero-volume contracts: ON" in log and "Zero-volume candles: kept 1 / skipped 0" in log
-    assert read_csv(day / "summary.csv")[1][-1] == "ON"
+    assert read_csv(day / "summary.csv")[1][-2:] == ["ON", "OFF"]
 
 
 @pytest.mark.parametrize("keep_zero", [False, True])
@@ -832,11 +832,12 @@ def test_write_never_overwrites_another_contracts_file(tmp_path, fake_kite, monk
 
 
 
-def test_kite_runs_never_trim(tmp_path, fake_kite, monkeypatch):
+def test_kite_trim_off_uses_the_full_list(tmp_path, fake_kite, monkeypatch):
     from backfill import bhav
 
     def nse(*a, **k):
         raise AssertionError("NSE called")
     monkeypatch.setattr(bhav, "fetch_bhav", nse)
-    assert run(tmp_path) == "finished_failures"
-    assert "Trimmed" not in (day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-12") / "run.log").read_text(encoding="utf-8")
+    assert run(tmp_path) == "finished_failures"   # the trim setting is OFF in tests (conftest)
+    log = (day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-12") / "run.log").read_text(encoding="utf-8")
+    assert "Trimmed" not in log and "Contracts: full list (trim OFF)" in log

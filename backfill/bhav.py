@@ -78,7 +78,7 @@ class BhavTimeout(BhavError):
     """fetch_bhav(budget=...) ran out of time."""
 
 
-TRIM_BUDGET = 30   # seconds: a Dhan run waits at most this long on NSE/BSE before using Dhan's full list
+TRIM_BUDGET = 30   # seconds: a run with the bhavcopy trim waits at most this long on NSE/BSE before using the full list
 
 
 # --- getting the file ---------------------------------------------------------------------------
@@ -454,7 +454,7 @@ def run_bhav(run_date, data_root, underlying="NIFTY", bhav_file=None, log=print,
 def listed_names(run_date, day_dir, underlying="NIFTY", log=print, budget=TRIM_BUDGET):
     """(our names of EVERY contract of the underlying in the day's bhavcopy, traded or not, "") or
     (None, reason). Uses the day's saved <underlying>_bhav.csv, else downloads the bhavcopy (at most
-    budget seconds) and saves it into <day>/bhavcopy/ as run_bhav does. Used to trim Dhan's list,
+    budget seconds) and saves it into <day>/bhavcopy/ as run_bhav does. Used to trim the Kite or Dhan list,
     which also has strikes NSE did not list that day, and to fetch the bhavcopy after a Kite day."""
     saved = saved_items(day_dir, underlying)
     if saved is None:

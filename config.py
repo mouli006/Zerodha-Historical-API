@@ -83,3 +83,18 @@ def keep_zero_volume():
     if value in ("0", "OFF", "FALSE", "NO", "N"):
         return False
     return KEEP_ZERO_VOLUME
+
+
+# "Download only contracts in the bhavcopy" (backfill/fno.py trim_contracts), for Kite and Dhan: a day's run
+# requests only the contracts in that day's NSE/BSE bhavcopy (traded or not); without a bhavcopy the full
+# list is used. .env TRIM_TO_BHAV (ON/OFF) overrides this default.
+TRIM_TO_BHAV = True
+
+
+def trim_to_bhav():
+    value = load_env().get("TRIM_TO_BHAV", "").strip().upper()
+    if value in ("1", "ON", "TRUE", "YES", "Y"):
+        return True
+    if value in ("0", "OFF", "FALSE", "NO", "N"):
+        return False
+    return TRIM_TO_BHAV

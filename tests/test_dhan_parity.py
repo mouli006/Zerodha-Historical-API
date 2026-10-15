@@ -19,6 +19,11 @@ from conftest import day_of
 DAY = RUN_DATE.isoformat()
 
 
+@pytest.fixture(autouse=True)
+def dhan_trim(trim_on):
+    """These Dhan runs keep the trim setting ON (its default; conftest turns it OFF for other tests)."""
+
+
 def dhan_day(root):
     return day_of(root / "NIFTY_FnO_1min_Dhan", DAY)
 
@@ -248,3 +253,14 @@ def test_loaders_read_the_dhan_folder(tmp_path, monkeypatch):
     fno.write_csv(str(day / "bhavcopy" / "nifty_bhav.csv"), bhav.BHAV_HEADER, bhav_rows())
     eod = fno_loader.load_eod(str(tmp_path), DAY, source="dhan").set_index("Contract")
     assert eod.loc["NIFTY27OCT26", "Last"] == 25120 and eod.loc["NIFTY27OCT26", "Volume_contracts"] == 3
+
+
+@pytest.mark.parametrize("argv,name", [([DAY], "daily"), (["--missing"], "missing"), (["--refetch-no-trade", DAY], "refetch")])
+@pytest.mark.parametrize("flag,setting,expected", [([], True, True), ([], False, False),
+                                                   (["--no-trim-to-bhav"], True, False), (["--trim-to-bhav"], False, True)])
+def test_cli_dhan_trim_flags(dcli, tmp_path, monkeypatch, argv, name, flag, setting, expected):
+    env, calls = dcli
+    monkeypatch.setattr(nifty_daily, "trim_to_bhav", lambda: setting)
+    assert nifty_daily.main(argv + ["--folder", str(tmp_path), "--source", "dhan"] + flag) == 0
+    kind, _, kw = calls[0]
+    assert kind == name and kw["trim_to_bhav"] is expected and JOB["trim_to_bhav"] is expected

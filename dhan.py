@@ -17,7 +17,8 @@ from backfill import fno, fno_days
 from backfill.dhan_api import MAX_SPEED, DhanClient, DhanError, data_plan_error, fetch_profile, token_connected
 from backfill.job import JOB, JOB_LOCK, STOP, job_begin
 from backfill.storage import check_folder
-from config import DEFAULT_DATA_DIR, data_dir, dhan_credentials, keep_zero_volume, load_env, save_env, weekly_expiry_weekday
+from config import (DEFAULT_DATA_DIR, data_dir, dhan_credentials, keep_zero_volume, load_env, save_env, trim_to_bhav,
+                    weekly_expiry_weekday)
 
 bp = Blueprint("dhan", __name__)
 
@@ -124,7 +125,8 @@ def dashboard():
                    for u in fno.UNDERLYINGS if u in UNDERLYINGS]
     fno_info = {"underlying": "NIFTY", "exchange": fno.exchange_of("NIFTY", SOURCE),
                 "underlyings": underlyings, "ready_at": fno.READY_AT.strftime("%H:%M"),
-                "today": fno.today_ist().isoformat(), "keep_zero_volume": keep_zero_volume()}
+                "today": fno.today_ist().isoformat(), "keep_zero_volume": keep_zero_volume(),
+                "trim_to_bhav": trim_to_bhav()}
     user = {"user_id": st["client_id"], "user_name": "", "email": "", "broker": "DHAN", "login_time": ""}
     return render_template("success.html", mode="dhan", broker=broker_info(), user=user, form=form, index_choices=[],
                            today=date.today().isoformat(), fno=fno_info, dhan=st, kite=("access_token" in session),
@@ -179,7 +181,7 @@ def fno_start():
     """Dhan F&O run for one picked date, a picked range (date_from/date_to), or for every missing
     date (missing=1), or a re-request of every contract of a saved date without a file (refetch=1,
     needs keep_zero=1): the same jobs as the Kite card. keep_zero=1 keeps contracts whose candles all
-    have volume 0."""
+    have volume 0; trim_bhav=1|0 downloads only the contracts in the day's bhavcopy (absent: the setting)."""
     token = dhan_token()
     if not token:
         return redirect(url_for("dhan.index", error="Dhan access token is missing or expired. Paste a new one."))
@@ -192,6 +194,9 @@ def fno_start():
         return fail(f"Unknown underlying {underlying}.")
     missing = bool(request.form.get("missing"))
     keep_zero = request.form.get("keep_zero") == "1"
+    trim = {"1": True, "0": False}.get(request.form.get("trim_bhav", ""))
+    if trim is None:
+        trim = trim_to_bhav()
     refetch = bool(request.form.get("refetch")) and not missing
     if refetch and not keep_zero:
         return fail("Turn on \"Keep contracts with candles but zero volume\" to re-check no-trade contracts.")
@@ -243,7 +248,7 @@ def fno_start():
     except fno.LockBusy as e:
         return fail(str(e))
     label = f"{dates[0]}_to_{dates[-1]}" if dates else "missing"
-    if not job_begin(**fno.job_fields(underlying, run_date, folder, speed, keep_zero, SOURCE, label)):
+    if not job_begin(**fno.job_fields(underlying, run_date, folder, speed, keep_zero, SOURCE, label, trim)):
         lock.release()
         return fail("A download is already running. Stop it or wait for it to finish.")
     save_env({"KITE_DATA_DIR": folder})
@@ -254,13 +259,14 @@ def fno_start():
         try:
             if missing or dates:
                 fno.run_missing("", token, folder, speed, underlying, weekday=weekly_expiry_weekday(underlying),
-                                keep_zero=keep_zero, kite=client, user=user, source=SOURCE, dates=dates)
+                                keep_zero=keep_zero, kite=client, user=user, source=SOURCE, dates=dates,
+                                trim_to_bhav=trim)
             elif refetch:
                 fno.refetch_no_trade("", token, run_date, folder, speed, underlying, weekday=weekly_expiry_weekday(underlying),
-                                     kite=client, user=user, source=SOURCE)
+                                     kite=client, user=user, source=SOURCE, trim_to_bhav=trim)
             else:
                 fno.run_daily("", token, run_date, folder, speed, underlying, weekday=weekly_expiry_weekday(underlying),
-                              kite=client, user=user, keep_zero=keep_zero, source=SOURCE)
+                              kite=client, user=user, keep_zero=keep_zero, source=SOURCE, trim_to_bhav=trim)
         finally:
             lock.release()
 

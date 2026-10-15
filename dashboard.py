@@ -18,7 +18,8 @@ from backfill.instruments import INDEX_CHOICES
 from backfill.job import DEFAULT_SPEED, JOB, JOB_LOCK, STOP, job_begin
 from backfill.runner import bulk_download
 from backfill.storage import FILE_FORMATS, check_folder, job_run_key
-from config import DEFAULT_DATA_DIR, credentials, data_dir, keep_zero_volume, load_env, save_env, weekly_expiry_weekday
+from config import (DEFAULT_DATA_DIR, credentials, data_dir, keep_zero_volume, load_env, save_env, trim_to_bhav,
+                    weekly_expiry_weekday)
 
 bp = Blueprint("dashboard", __name__)
 
@@ -51,7 +52,7 @@ def success():
     underlyings = [{"name": u, "exchange": exch, "bhav": fno.exchange_name(u)} for u, (exch, _) in fno.UNDERLYINGS.items()]
     fno_info = {"underlying": "NIFTY", "exchange": fno.UNDERLYINGS["NIFTY"][0], "underlyings": underlyings,
                 "ready_at": fno.READY_AT.strftime("%H:%M"), "today": fno.today_ist().isoformat(),
-                "keep_zero_volume": keep_zero_volume()}
+                "keep_zero_volume": keep_zero_volume(), "trim_to_bhav": trim_to_bhav()}
     broker = {"name": "Kite", "maxSpeed": 3, "defaultSpeed": DEFAULT_SPEED,
               "urls": {"fnoWindow": url_for("dashboard.download_fno_window"), "fno": url_for("dashboard.download_fno_start"),
                        "page": url_for("dashboard.success")}}
@@ -67,6 +68,12 @@ def read_speed():
     except ValueError:
         return 0
     return speed if 0 < speed <= 3 else 0
+
+
+def read_trim():
+    """trim_bhav=1|0 of an F&O start; absent: the "download only contracts in the bhavcopy" setting."""
+    trim = {"1": True, "0": False}.get(request.form.get("trim_bhav", ""))
+    return trim_to_bhav() if trim is None else trim
 
 
 @bp.route("/download/start", methods=["POST"])
@@ -174,7 +181,8 @@ def download_fno_start():
     """F&O run for one picked date, a picked range (date_from/date_to: every day in it, saved files
     skipped), or every missing date (missing=1), or a re-check of one saved
     date's contracts without a file (refetch=1, needs keep_zero=1); the same jobs as nifty_daily.py
-    DATE / --missing / --refetch-no-trade DATE. keep_zero=1 keeps contracts with zero-volume candles."""
+    DATE / --missing / --refetch-no-trade DATE. keep_zero=1 keeps contracts with zero-volume candles;
+    trim_bhav=1|0 downloads only the contracts in the day's bhavcopy (absent: the setting, config.trim_to_bhav)."""
     if "access_token" not in session:
         return redirect(url_for("auth.index"))
     api_key = credentials()[0]
@@ -191,6 +199,7 @@ def download_fno_start():
     missing = bool(request.form.get("missing"))
     refetch = bool(request.form.get("refetch")) and not missing
     keep_zero = request.form.get("keep_zero") == "1"
+    trim = read_trim()
     if refetch and not keep_zero:
         return fail("Turn on \"Keep contracts with candles but zero volume\" to re-check no-trade contracts.")
     run_date = dates = None
@@ -230,7 +239,7 @@ def download_fno_start():
     except fno.LockBusy as e:
         return fail(str(e))
     label = f"{dates[0]}_to_{dates[-1]}" if dates else "missing"
-    if not job_begin(**fno.job_fields(underlying, run_date, folder, speed, keep_zero, label=label)):
+    if not job_begin(**fno.job_fields(underlying, run_date, folder, speed, keep_zero, label=label, trim_to_bhav=trim)):
         lock.release()
         return fail("A download is already running. Stop it or wait for it to finish.")
     save_env({"KITE_DATA_DIR": folder})
@@ -242,16 +251,16 @@ def download_fno_start():
         try:
             if missing:
                 fno.run_missing(api_key, access_token, folder, speed, underlying, weekday=weekday,
-                                keep_zero=keep_zero)
+                                keep_zero=keep_zero, trim_to_bhav=trim)
             elif dates:
                 fno.run_missing(api_key, access_token, folder, speed, underlying, weekday=weekday,
-                                keep_zero=keep_zero, dates=dates)
+                                keep_zero=keep_zero, dates=dates, trim_to_bhav=trim)
             elif refetch:
                 fno.refetch_no_trade(api_key, access_token, run_date, folder, speed, underlying,
-                                     weekday=weekday)
+                                     weekday=weekday, trim_to_bhav=trim)
             else:
                 fno.run_daily(api_key, access_token, run_date, folder, speed, underlying,
-                              weekday=weekday, keep_zero=keep_zero)
+                              weekday=weekday, keep_zero=keep_zero, trim_to_bhav=trim)
         finally:
             lock.release()
 

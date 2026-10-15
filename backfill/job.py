@@ -17,7 +17,9 @@ JOB = {"state": "idle", "run": "", "interval": "", "from": "", "to": "", "speed"
        "fno_summary": [], "fno_futures": [],
        # F&O: keep_zero = "keep zero-volume contracts" setting; zero_kept / zero_skipped count contracts
        # whose candles all have volume 0 (empty counts those without candles)
-       "keep_zero": False, "zero_kept": 0, "zero_skipped": 0}
+       "keep_zero": False, "zero_kept": 0, "zero_skipped": 0,
+       # F&O: trim_to_bhav = "download only contracts in the bhavcopy" setting of the job
+       "trim_to_bhav": False}
 STOP = threading.Event()
 # Per-job counters, reset by job_begin()
 COUNTERS = {"pass": 0, "stocks_done": 0, "stocks_total": 0, "chunks_done": 0, "chunks_total": 0,

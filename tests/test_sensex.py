@@ -190,7 +190,7 @@ def test_sensex_exports_and_eod(tmp_path, sensex_kite, bse):
 def test_fno_start_sensex(client, tmp_path, monkeypatch):
     seen = {}
 
-    def fake_run(api_key, token, run_date, folder, speed, underlying, weekday, keep_zero=False):
+    def fake_run(api_key, token, run_date, folder, speed, underlying, weekday, keep_zero=False, trim_to_bhav=None):
         seen.update(underlying=underlying, weekday=weekday)
         with JOB_LOCK:
             JOB["state"] = "finished"
@@ -221,7 +221,7 @@ def test_cli_sensex(tmp_path, monkeypatch):
     monkeypatch.setattr(nifty_daily, "keep_zero_volume", lambda: False)
     monkeypatch.setattr(nifty_daily, "weekly_expiry_weekday", lambda underlying="NIFTY": {"SENSEX": 3}.get(underlying, 1))
 
-    def fake_run(api_key, token, run_date, folder, speed, underlying, weekday, keep_zero=False):
+    def fake_run(api_key, token, run_date, folder, speed, underlying, weekday, keep_zero=False, trim_to_bhav=None):
         seen.update(underlying=underlying, weekday=weekday)
         with JOB_LOCK:
             JOB["state"] = "finished"

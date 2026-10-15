@@ -5,8 +5,8 @@ of one underlying (NIFTY on NFO, SENSEX on BFO), saved in the Accelpix file layo
                                                     /options/NIFTY2500013OCT26CE.csv
                                                     /instruments_NFO.csv, summary.csv, run.log
 
-The day folder is <YYYY-MM-DD>_exp-<nearest option expiry>_dl-<YYYY-MM-DD>_<HHMM> (when it was first created,
-IST), e.g. 2026-10-12_exp-2026-10-13_dl-2026-10-13_2319; older days are plain <YYYY-MM-DD> (see day_folders).
+The day folder is <YYYY-MM-DD>_exp-<nearest option expiry>_<withZeroVol|noZeroVol>_dl-<YYYY-MM-DD>_<HHMM> (when it was
+first created, IST), e.g. 2026-10-12_exp-2026-10-13_withZeroVol_dl-2026-10-13_2319; older days are plain <YYYY-MM-DD> (see day_folders).
 
 Kite only serves live contracts. A day D can be downloaded completely only while every contract
 that existed on D is still live, i.e. for D after the most recent expiry (see date_window)."""
@@ -50,9 +50,11 @@ HEADER = ["Ticker", "Date", "Time", "Open", "High", "Low", "Close", "Volume", "O
 # the Bhav columns from the NSE/BSE bhavcopy check (backfill/bhav.py), blank until a check has run
 BHAV_SUMMARY_COLUMNS = ["Bhav_traded_contracts", "Kite_files", "Missing_in_kite", "Extra_in_kite", "OI_diffs",
                         "Price_diffs"]
-# Keep_zero_volume (ON/OFF): the setting of the last run that wrote the day (run.log has every run's)
+# Keep_zero_volume (ON/OFF) and Trim_to_bhav (ON / OFF / FALLBACK = ON but no bhavcopy, full list used): the settings
+# of the last run that wrote the day (run.log has every run's). Listed_* count the contracts the run requested
+# (the trimmed list when Trim_to_bhav is ON).
 SUMMARY_COLUMNS = ["Expiry", "Bucket", "Listed_strikes", "Traded_strikes", "Listed_contracts", "CE_files", "PE_files", "ATM_strike",
-                   "ATM_CE_bars", "ATM_PE_bars", *BHAV_SUMMARY_COLUMNS, "Keep_zero_volume"]
+                   "ATM_CE_bars", "ATM_PE_bars", *BHAV_SUMMARY_COLUMNS, "Keep_zero_volume", "Trim_to_bhav"]
 FUTURE_COLUMNS = ["Future", "Expiry", "Bars", "Open", "High", "Low", "Close", "Volume", "Last_OI"]
 WEEKLY_EXPIRY_WEEKDAY = 1   # Tuesday (Monday = 0); .env WEEKLY_EXPIRY_WEEKDAY overrides it, see config.py
 EXPIRIES_FILE = "expiries_seen.csv"
@@ -449,14 +451,31 @@ def on_off(flag):
     return "ON" if flag else "OFF"
 
 
-def saved_keep_zero(day_dir):
-    """Keep_zero_volume of the day's summary.csv ("ON", "OFF", or "" for days saved before it existed)."""
+def saved_setting(day_dir, column):
+    """column of the first row of the day's summary.csv, or "" (no summary.csv, or saved before it existed)."""
     path = os.path.join(day_dir, "summary.csv")
     if not os.path.exists(path):
         return ""
     with open(path, newline="", encoding="utf-8") as f:
         first = next(csv.DictReader(f), None)
-    return (first or {}).get("Keep_zero_volume") or ""
+    return (first or {}).get(column) or ""
+
+
+def saved_keep_zero(day_dir):
+    """Keep_zero_volume of the day's summary.csv ("ON", "OFF", or "" for days saved before it existed)."""
+    return saved_setting(day_dir, "Keep_zero_volume")
+
+
+def saved_trim(day_dir):
+    """Trim_to_bhav of the day's summary.csv ("ON", "OFF", "FALLBACK", or "" for days saved before it existed)."""
+    return saved_setting(day_dir, "Trim_to_bhav")
+
+
+def trim_default():
+    """The "download only contracts in the bhavcopy" setting (config.trim_to_bhav: .env TRIM_TO_BHAV, else
+    config.TRIM_TO_BHAV), read when a run starts."""
+    import config
+    return config.trim_to_bhav()
 
 
 def zero_volume_info(candles):
@@ -477,14 +496,15 @@ def write_zero_volume(day_dir, found):
     return rows
 
 
-def summary_rows(day_dir, contracts, files, step, underlying, keep_zero=""):
+def summary_rows(day_dir, contracts, files, step, underlying, keep_zero="", trim=""):
     """build_summary plus the bhavcopy columns when the day has been checked (its <underlying>_bhav.csv
-    is compared again with the files on disk, so a Kite re-run keeps the check), and Keep_zero_volume
-    (keep_zero: "ON", "OFF" or ""). Returns (rows, futures rows, bhavcopy status line)."""
+    is compared again with the files on disk, so a Kite re-run keeps the check), Keep_zero_volume
+    (keep_zero: "ON", "OFF" or "") and Trim_to_bhav (trim: "ON", "OFF", "FALLBACK" or "").
+    Returns (rows, futures rows, bhavcopy status line)."""
     from . import bhav   # bhav imports this module
     rows, fut_rows = build_summary(contracts, files, step)
     for r in rows:
-        r["Keep_zero_volume"] = keep_zero
+        r["Keep_zero_volume"], r["Trim_to_bhav"] = keep_zero, trim
     items = bhav.saved_items(day_dir, underlying)
     if items is None:
         return rows, fut_rows, bhav.PENDING
@@ -499,19 +519,27 @@ def summary_rows(day_dir, contracts, files, step, underlying, keep_zero=""):
         seen.add(key)
         r.update(groups.get(key, zero))
     for key in sorted(set(groups) - seen):   # expiries in the bhavcopy that Kite's list doesn't have
-        rows.append({**blank_row(), "Expiry": key[0], "Keep_zero_volume": keep_zero,
+        rows.append({**blank_row(), "Expiry": key[0], "Keep_zero_volume": keep_zero, "Trim_to_bhav": trim,
                      "Bucket": ("Futures" if key[1] == "FUT" else "Options") + " (not in Kite list)", **groups[key]})
     return rows, fut_rows, bhav.check_status(counts)
 
 
 def rewrite_summary(day_dir, run_date, underlying):
     """Rebuild summary.csv from the day's saved instrument list and files (after a bhavcopy check).
+    When the last run trimmed to the bhavcopy (Trim_to_bhav ON) the list is trimmed the same way from the
+    saved bhavcopy, so Listed_* keep counting the contracts the run requested.
     Returns the rows, or None when the day has no saved instrument list."""
+    from . import bhav   # bhav imports this module
     dumps = sorted(glob.glob(os.path.join(day_dir, "instruments_*.csv")))
     if not dumps:
         return None
     with open(dumps[0], newline="", encoding="utf-8") as f:
         contracts = select_contracts(list(csv.DictReader(f)), underlying, run_date)
+    trim = saved_trim(day_dir)
+    if trim == "ON":
+        items = bhav.saved_items(day_dir, underlying)
+        if items is not None:
+            contracts = keep_listed(contracts, {i["name"] for i in items if not i["error"]}, underlying)[0]
     files = {}
     for c in contracts:
         try:
@@ -519,7 +547,7 @@ def rewrite_summary(day_dir, run_date, underlying):
         except ValueError:
             pass
     rows, _, _ = summary_rows(day_dir, contracts, files, UNDERLYINGS[underlying][1], underlying,
-                              saved_keep_zero(day_dir))
+                              saved_keep_zero(day_dir), trim)
     write_csv(os.path.join(day_dir, "summary.csv"), SUMMARY_COLUMNS, rows)
     return rows
 
@@ -688,12 +716,13 @@ def run_key(underlying, run_date, source="kite"):
     return f"{prefix}:{underlying}:{exchange_of(underlying, source)}:{run_date}"
 
 
-def job_fields(underlying, run_date, data_root, speed, keep_zero=False, source="kite", label="missing"):
+def job_fields(underlying, run_date, data_root, speed, keep_zero=False, source="kite", label="missing",
+               trim_to_bhav=False):
     """JOB values for job_begin() when an F&O run starts; run_date None for a missing-days run or a
     date range (label "<from>_to_<to>")."""
     day = run_date.isoformat() if run_date else ""
     return {"kind": "fno", "source": source, "run": run_key(underlying, day or label, source), "folder": data_root,
-            "speed": speed, "keep_zero": keep_zero,
+            "speed": speed, "keep_zero": keep_zero, "trim_to_bhav": bool(trim_to_bhav),
             "fno_date": day, "fno_underlying": underlying,
             "fno_exchange": exchange_of(underlying, source), "fno_summary": [], "fno_futures": [],
             "out_dirs": [os.path.join(fno_folder(underlying, source), day)] if day else []}
@@ -761,32 +790,47 @@ def exchange_name(underlying):
     return EXCHANGE_OF.get(underlying, "NSE")
 
 
-def trim_contracts(contracts, run_date, day_dir, underlying, source, rlog):
-    """Only the contracts the exchange listed on run_date (every row of its bhavcopy, traded or not). Without a
-    bhavcopy (not published yet, 404, or slower than bhav.TRIM_BUDGET) the list is kept as it is."""
-    from . import bhav   # bhav imports this module
-    exch = exchange_name(underlying)
-    job_update(message=f"Getting {exch}'s contract list for the day...")
-    names, reason = bhav.listed_names(run_date, day_dir, underlying, log=rlog)
-    if names is None:
-        rlog(f"Bhavcopy for {run_date} not available ({reason}): downloading all {len(contracts):,} contracts "
-             f"{BROKER[source]} lists")
-        return contracts
+def keep_listed(contracts, names, underlying):
+    """(the contracts whose name is in names, the names of all contracts). A contract whose name can't be
+    built is kept: it fails as a naming error later, as without the trim."""
     kept, ours = [], set()
     for c in contracts:
         try:
             name = contract_name(c["instrument_type"], c["expiry"], c.get("strike"), underlying)
         except ValueError:
-            kept.append(c)   # fails as a naming error later, as without the trim
+            kept.append(c)
             continue
         ours.add(name)
         if name in names:
             kept.append(c)
+    return kept, ours
+
+
+def trim_contracts(contracts, run_date, day_dir, underlying, source, rlog):
+    """(contracts, "ON", "") with only the contracts the exchange listed on run_date (every row of its bhavcopy,
+    traded or not), or (contracts unchanged, "FALLBACK", reason) without a bhavcopy (not published yet, 404,
+    an error, or slower than bhav.TRIM_BUDGET). Never refuses the run."""
+    from . import bhav   # bhav imports this module
+    exch = exchange_name(underlying)
+    job_update(message=f"Getting {exch}'s contract list for the day...")
+    try:
+        names, reason = bhav.listed_names(run_date, day_dir, underlying, log=rlog)
+    except Exception as e:   # never fail a run over the bhavcopy
+        names, reason = None, f"{type(e).__name__}: {e}"
+    if names is None:
+        rlog(f"Bhavcopy for {run_date} not available ({reason}): downloading all {len(contracts):,} contracts "
+             f"{BROKER[source]} lists")
+        return contracts, "FALLBACK", reason
+    kept, ours = keep_listed(contracts, names, underlying)
     rlog(f"Trimmed to {len(kept):,} contracts listed in {exch}'s bhavcopy for {run_date} ({BROKER[source]} listed "
          f"{len(contracts):,}; {len(contracts) - len(kept):,} not listed by {exch} that day were skipped)")
     if names - ours:
         rlog(f"{len(names - ours):,} contracts in the bhavcopy are not in {BROKER[source]}'s list")
-    return kept
+    return kept, "ON", ""
+
+
+def fallback_note(reason):
+    return f"Bhavcopy not available ({reason}): full contract list used"
 
 
 def fetch_day_bhav(run_date, day_dir, base, underlying, rlog):
@@ -840,8 +884,9 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
     with it on, DONE contracts without a file whose reason is ZERO_VOLUME are requested again.
     refetch requests every DONE contract without a file again, whatever its reason (refetch_no_trade).
     source "dhan" (kite = a backfill.dhan_api.DhanClient) writes <UNDERLYING>_FnO_1min_Dhan/ under its own run keys.
-    trim_to_bhav (default: on for Dhan) keeps only contracts in the day's bhavcopy (NSE/BSE), traded or not; when the
-    bhavcopy is not available within bhav.TRIM_BUDGET seconds the full list is used.
+    trim_to_bhav (Kite and Dhan; None = the setting, trim_default()) keeps only contracts in the day's bhavcopy
+    (NSE/BSE), traded or not; when the bhavcopy is not available within bhav.TRIM_BUDGET seconds the full list is
+    used (Trim_to_bhav FALLBACK in summary.csv, and the job message says so).
     bhav_check (default: on for Kite and Dhan, off with refetch, which checks by itself) gets the day's NSE/BSE bhavcopy
     into <day>/bhavcopy/ after the download (at most bhav.CHECK_BUDGET seconds) and runs bhav.check_saved;
     when the exchange has not published it the day stays pending. It never changes the returned status.
@@ -875,7 +920,7 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
         return stop_with(echo, "outside_window", msg)
 
     # The day's folder: the existing one (any name), else a new one named with the nearest option expiry
-    # in this run's full instrument list (before the Dhan trim), the zero-volume setting and the time
+    # in this run's full instrument list (before the bhavcopy trim), the zero-volume setting and the time
     today = today_ist()
     base = fno_root(data_root, underlying, source)
     try:
@@ -912,9 +957,21 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
         save_instruments(os.path.join(day, dump_name), instruments)
         contracts = select_contracts(instruments, underlying, run_date)
         if trim_to_bhav is None:
-            trim_to_bhav = source == "dhan"
+            trim_to_bhav = trim_default()
+        trim_note = ""
         if trim_to_bhav:
-            contracts = trim_contracts(contracts, run_date, day, underlying, source, rlog)
+            listed = len(contracts)
+            contracts, trim_mode, trim_reason = trim_contracts(contracts, run_date, day, underlying, source, rlog)
+            if trim_mode == "ON":
+                rlog(f"Contracts: trimmed to bhavcopy (kept {len(contracts):,} of {listed:,})")
+            else:
+                rlog(f"Contracts: full list (bhavcopy not available: {trim_reason})")
+                trim_note = fallback_note(trim_reason)
+                rlog(trim_note)
+                job_update(message=trim_note)
+        else:
+            trim_mode = "OFF"
+            rlog("Contracts: full list (trim OFF)")
         futures = [c for c in contracts if c["instrument_type"] == "FUT"]
         if not futures:
             raise RuntimeError(f"No live {underlying} futures in the {exchange} instrument list.")
@@ -1118,7 +1175,7 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
         if bhav_check is None:
             bhav_check = AUTO_BHAV and not refetch
         bhav_note = fetch_day_bhav(run_date, day, base, underlying, rlog) if bhav_check else ""
-        rows, fut_rows, bhav_line = summary_rows(day, contracts, files, step, underlying, on_off(keep_zero))
+        rows, fut_rows, bhav_line = summary_rows(day, contracts, files, step, underlying, on_off(keep_zero), trim_mode)
         write_csv(os.path.join(day, "summary.csv"), SUMMARY_COLUMNS, rows)
         logged = False
         if bhav_check and not bhav_note:
@@ -1147,6 +1204,8 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
         if failures:
             msg += f" {len(failures)} contracts failed (see run.log); run again to retry them."
         msg += f" {bhav_line}."
+        if trim_note:
+            msg += f" {trim_note}."
         job_update(state="finished" if last else "running", symbol="", chunk="", part="", eta="", message=msg,
                    fno_summary=rows, fno_futures=fut_rows)
         return "finished_failures" if failures else "finished"
@@ -1239,13 +1298,17 @@ def holiday(base, day, created, run, run_date, near, rlog, db, last=True):
 
 
 def run_missing(api_key, access_token, data_root, speed, underlying="NIFTY", log=print,
-                weekday=WEEKLY_EXPIRY_WEEKDAY, keep_zero=False, kite=None, user="", source="kite", dates=None):
+                weekday=WEEKLY_EXPIRY_WEEKDAY, keep_zero=False, kite=None, user="", source="kite", dates=None,
+                trim_to_bhav=None):
     """Download every date in the window that has no complete day folder, oldest first, sharing
     one Kite session and instrument list. Weekends and holidays end at the holiday check (and are
     logged, so the next run skips them). Same statuses as run_daily.
 
     dates: run these days instead (a range picked on the dashboard), minus logged holidays and
-    today before READY_AT; saved days run again and skip their saved contracts."""
+    today before READY_AT; saved days run again and skip their saved contracts.
+    trim_to_bhav (None = the setting) is used for every day."""
+    if trim_to_bhav is None:
+        trim_to_bhav = trim_default()
     what = f"{min(dates)}_to_{max(dates)}" if dates else "missing"
     echo = lambda m: log(f"[{run_key(underlying, what, source)}] {m}")
     if kite is None:
@@ -1284,7 +1347,7 @@ def run_missing(api_key, access_token, data_root, speed, underlying="NIFTY", log
             return stop_with(echo, "stopped", "Stopped. Start again to continue; finished days are skipped.")
         st = run_daily(api_key, access_token, d, data_root, speed, underlying, log, weekday, kite, user,
                        instruments, window, label=f"Day {n} of {len(dates)}, ", last=n == len(dates),
-                       keep_zero=keep_zero, source=source)
+                       keep_zero=keep_zero, source=source, trim_to_bhav=trim_to_bhav)
         results[d] = st
         if st in ("auth_failed", "stopped", "error"):
             return st
@@ -1392,7 +1455,7 @@ def inspect_contracts(api_key, access_token, run_date, data_root, names, underly
 
 
 def refetch_no_trade(api_key, access_token, run_date, data_root, speed, underlying="NIFTY", log=print,
-                     weekday=WEEKLY_EXPIRY_WEEKDAY, kite=None, user="", source="kite"):
+                     weekday=WEEKLY_EXPIRY_WEEKDAY, kite=None, user="", source="kite", trim_to_bhav=None):
     """Request every contract of a saved day that has no file again, with keep zero-volume ON
     (contracts with a file are skipped), then re-run the bhavcopy check if the day's bhavcopy is saved.
     The caller holds the lock and has called job_begin(**job_fields(..., keep_zero=True)). source "dhan"
@@ -1404,7 +1467,7 @@ def refetch_no_trade(api_key, access_token, run_date, data_root, speed, underlyi
         return stop_with(lambda m: log(f"[{run_key(underlying, run_date, source)}] {m}"), "not_downloaded",
                          f"{run_date} has not been downloaded in this folder yet; download the day first."), ""
     status = run_daily(api_key, access_token, run_date, data_root, speed, underlying, log, weekday,
-                       kite=kite, user=user, keep_zero=True, refetch=True, source=source)
+                       kite=kite, user=user, keep_zero=True, refetch=True, source=source, trim_to_bhav=trim_to_bhav)
     day = day_dir(data_root, underlying, run_date, source)   # the run may have renamed it to withZeroVol
     if not status.startswith("finished") or bhav.saved_items(day, underlying) is None:
         return status, ""

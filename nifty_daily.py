@@ -23,7 +23,9 @@ Allowed dates run from the day after the previous expiry to today: on those days
 is still live on Kite, so the download is complete. --missing downloads every such date without a
 complete folder. --keep-zero-volume / --no-keep-zero-volume (default KEEP_ZERO_VOLUME in .env, else
 config.py) keeps or skips contracts whose Kite candles all have volume 0 (Kite can report a single trade
-that way). --refetch-no-trade requests every contract of a saved day that has no file again with the
+that way). --trim-to-bhav / --no-trim-to-bhav (default TRIM_TO_BHAV in .env, else config.py, ON) downloads only
+the contracts in the day's NSE/BSE bhavcopy, traded or not; while it is not published (or can't be fetched in 30 s)
+the full list is used and the run says why. --refetch-no-trade requests every contract of a saved day that has no file again with the
 setting ON, then checks the day against its saved bhavcopy again. Reads KITE_API_KEY and KITE_ACCESS_TOKEN from .env
 (sign in on the dashboard first); --source dhan reads DHAN_ACCESS_TOKEN (connect on the Dhan tab) and needs an
 active Dhan Data API plan. Every mode works on both sources.
@@ -45,7 +47,7 @@ from backfill.fno import (BROKER, FOLDERS, INSPECT_COLUMNS, UNDERLYINGS, DayFold
 from backfill.fno_rename import rename_day_folders, update_day_counts
 from backfill.job import job_begin
 from backfill.storage import check_folder
-from config import data_dir, keep_zero_volume, load_env, weekly_expiry_weekday
+from config import data_dir, keep_zero_volume, load_env, trim_to_bhav, weekly_expiry_weekday
 
 EXIT = {"finished": 0, "holiday": 0, "auth_failed": 2, "outside_window": 3}
 
@@ -82,6 +84,9 @@ def main(argv=None):
                         "all only with --rename-folders / --update-day-count (their default)")
     p.add_argument("--keep-zero-volume", action=argparse.BooleanOptionalAction, default=None,
                    help="keep contracts whose candles all have volume 0 (default from .env KEEP_ZERO_VOLUME / config.py)")
+    p.add_argument("--trim-to-bhav", action=argparse.BooleanOptionalAction, default=None,
+                   help="download only the contracts in the day's NSE/BSE bhavcopy, full list while it is not published "
+                        "(default from .env TRIM_TO_BHAV / config.py)")
     args = p.parse_args(argv)
     if args.rename_folders or args.update_day_count:
         if args.apply and not args.rename_folders:
@@ -110,6 +115,7 @@ def main(argv=None):
         if args.keep_zero_volume is False:
             p.error("--refetch-no-trade keeps zero-volume contracts; drop --no-keep-zero-volume")
         keep_zero = True
+    trim = trim_to_bhav() if args.trim_to_bhav is None else args.trim_to_bhav
     folder, err = check_folder(args.folder or data_dir())
     if err:
         print(f"Not run: {err}", file=sys.stderr)
@@ -126,16 +132,17 @@ def main(argv=None):
         return 1
     weekday = weekly_expiry_weekday(args.underlying)
     try:
-        job_begin(**job_fields(args.underlying, run_date, folder, args.speed, keep_zero, args.source))
+        job_begin(**job_fields(args.underlying, run_date, folder, args.speed, keep_zero, args.source,
+                               trim_to_bhav=trim))
         if args.missing:
             status = run_missing(api_key, token, folder, args.speed, args.underlying, weekday=weekday,
-                                 keep_zero=keep_zero, **extra)
+                                 keep_zero=keep_zero, trim_to_bhav=trim, **extra)
         elif args.refetch_no_trade:
             status, _ = refetch_no_trade(api_key, token, run_date, folder, args.speed, args.underlying,
-                                         weekday=weekday, **extra)
+                                         weekday=weekday, trim_to_bhav=trim, **extra)
         else:
             status = run_daily(api_key, token, run_date, folder, args.speed, args.underlying,
-                               weekday=weekday, keep_zero=keep_zero, **extra)
+                               weekday=weekday, keep_zero=keep_zero, trim_to_bhav=trim, **extra)
     except KeyboardInterrupt:
         print("Interrupted. Finished contracts are saved; run again to continue.", file=sys.stderr)
         return 1

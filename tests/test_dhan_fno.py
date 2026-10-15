@@ -32,6 +32,11 @@ def arrays(n, close, vol=100):
 
 
 @pytest.fixture(autouse=True)
+def dhan_trim(trim_on):
+    """These Dhan runs keep the trim setting ON (its default; conftest turns it OFF for other tests)."""
+
+
+@pytest.fixture(autouse=True)
 def no_nse(monkeypatch):
     """No NSE calls here: by default the bhavcopy is "not published", so Dhan runs keep the full list."""
     calls = []
@@ -357,3 +362,30 @@ def test_dhan_underlyings(client, tmp_path):
     assert "Unknown underlying BANKEX" in j["error"]
     j = c.get("/fno/bhav-status", query_string={"folder": str(tmp_path), "underlying": "SENSEX", "source": "dhan"}).get_json()
     assert j["days"] == []
+
+
+# --- "Download only contracts in the bhavcopy" on the Dhan page -----------------------------------
+
+@pytest.mark.parametrize("form,expected", [({"trim_bhav": "1"}, True), ({"trim_bhav": "0"}, False), ({}, True)])
+@pytest.mark.parametrize("mode", ["date", "range", "missing", "refetch"])
+def test_dhan_start_passes_trim(client, tmp_path, monkeypatch, form, expected, mode):
+    c, calls = client   # the trim setting is ON here (dhan_trim)
+    monkeypatch.setattr(fno, "refetch_no_trade", lambda *a, **k: calls["run"].append(("refetch", a, k)) or ("finished", ""))
+    extra = {"date": {"date": "2026-10-12"}, "range": {"date_from": "2026-10-11", "date_to": "2026-10-12"},
+             "missing": {"missing": "1"}, "refetch": {"date": "2026-10-12", "refetch": "1", "keep_zero": "1"}}[mode]
+    if mode == "refetch":
+        d = tmp_path / "NIFTY_FnO_1min_Dhan" / "2026-10-12"
+        d.mkdir(parents=True)
+        (d / "summary.csv").write_text("Expiry\n")
+    assert error_of(c.post("/dhan/fno-start", data={"folder": str(tmp_path), **extra, **form})) == ""
+    assert wait_for(lambda: calls["run"])
+    _, _, kw = calls["run"][0]
+    assert kw["trim_to_bhav"] is expected and JOB["trim_to_bhav"] is expected
+
+
+def test_dhan_page_has_trim_switch(client, monkeypatch):
+    c, _ = client
+    html = c.get("/dhan/dashboard").get_data(as_text=True)
+    assert "Download only contracts in the bhavcopy" in html and '"trim_to_bhav": true' in html
+    monkeypatch.setattr(dhan, "trim_to_bhav", lambda: False)
+    assert '"trim_to_bhav": false' in c.get("/dhan/dashboard").get_data(as_text=True)

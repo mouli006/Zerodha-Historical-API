@@ -185,7 +185,7 @@ def lock_free(folder):
 def test_fno_start_runs_picked_date(client, tmp_path, monkeypatch, picked):
     seen = {}
 
-    def fake_run(api_key, token, run_date, folder, speed, underlying, weekday, keep_zero=False):
+    def fake_run(api_key, token, run_date, folder, speed, underlying, weekday, keep_zero=False, trim_to_bhav=None):
         seen.update(run_date=run_date, folder=folder, speed=speed, underlying=underlying, weekday=weekday)
         with JOB_LOCK:
             JOB["state"] = "finished"
@@ -201,7 +201,7 @@ def test_fno_start_runs_picked_date(client, tmp_path, monkeypatch, picked):
 def test_fno_start_missing(client, tmp_path, monkeypatch):
     seen = {}
 
-    def fake_missing(api_key, token, folder, speed, underlying, weekday, keep_zero=False):
+    def fake_missing(api_key, token, folder, speed, underlying, weekday, keep_zero=False, trim_to_bhav=None):
         seen.update(folder=folder, weekday=weekday)
         with JOB_LOCK:
             JOB["state"] = "finished"
@@ -233,7 +233,7 @@ def test_parse_pick():
 def test_fno_start_runs_range(client, tmp_path, monkeypatch):
     seen = {}
 
-    def fake_missing(api_key, token, folder, speed, underlying, weekday, keep_zero=False, dates=None):
+    def fake_missing(api_key, token, folder, speed, underlying, weekday, keep_zero=False, dates=None, trim_to_bhav=None):
         seen.update(folder=folder, dates=dates, keep_zero=keep_zero)
         with JOB_LOCK:
             JOB["state"] = "finished"
@@ -371,7 +371,7 @@ def test_fno_refetch_runs(client, tmp_path, monkeypatch):
     (day / "summary.csv").write_text("Expiry\n")
     seen = {}
 
-    def fake_refetch(api_key, token, run_date, folder, speed, underlying, weekday):
+    def fake_refetch(api_key, token, run_date, folder, speed, underlying, weekday, trim_to_bhav=None):
         seen.update(run_date=run_date, folder=folder)
         with JOB_LOCK:
             JOB["state"] = "finished"
@@ -403,7 +403,7 @@ def test_cli_keep_zero_flags(cli, monkeypatch, tmp_path):
 def test_cli_refetch_no_trade(cli, monkeypatch, tmp_path):
     seen = []
 
-    def fake_refetch(api_key, token, run_date, folder, speed, underlying, weekday):
+    def fake_refetch(api_key, token, run_date, folder, speed, underlying, weekday, trim_to_bhav=None):
         seen.append((run_date, JOB["keep_zero"]))
         with JOB_LOCK:
             JOB["state"] = "finished"

@@ -34,6 +34,11 @@ def dhan_day(root):
     return day_of(root / "SENSEX_FnO_1min_Dhan", DAY)
 
 
+@pytest.fixture(autouse=True)
+def dhan_trim(trim_on):
+    """These Dhan runs keep the trim setting ON (its default; conftest turns it OFF for other tests)."""
+
+
 @pytest.fixture
 def bse_http(monkeypatch):
     """Dhan's BSE_FNO list and candles; replies[id] answers /charts/intraday. Records the URLs and bodies."""

@@ -566,7 +566,7 @@
     </div>`;
   }
 
-  function FnoCard({ job, toast, onPoll, folder, setFolder, days, onBhav, keepZero, setKeepZero, und, setUnd }) {
+  function FnoCard({ job, toast, onPoll, folder, setFolder, days, onBhav, keepZero, setKeepZero, trimBhav, setTrimBhav, und, setUnd }) {
     const F = { ...boot.fno, underlying: und };
     const X = exchOf(und);                                  // NSE or BSE: the bhavcopy this underlying is checked with
     const ex = EXAMPLE[und] || EXAMPLE.NIFTY;
@@ -625,7 +625,8 @@
     // which: "date", "missing" or "refetch" (every contract of the saved day without a file, keep zero-volume ON)
     const start = async which => {
       setBusy(which);
-      const body = new URLSearchParams({ underlying: F.underlying, speed, folder, keep_zero: keepZero ? "1" : "0" });
+      const body = new URLSearchParams({ underlying: F.underlying, speed, folder, keep_zero: keepZero ? "1" : "0",
+                                         trim_bhav: trimBhav ? "1" : "0" });
       if (which === "missing") body.append("missing", "1");
       else if (isRange) { body.append("date_from", sel.from); body.append("date_to", sel.to); }
       else body.append("date", runDate);
@@ -670,9 +671,11 @@
 
       <dl className="details">
         <div><dt>Candles</dt><dd>09:00 to 16:00 IST, every row ${B.name} returns. Contracts without candles get no file; see the switch below for zero-volume ones.</dd></div>
-        ${DHAN && html`<div><dt>Folder</dt><dd><code>${`${F.underlying}_FnO_1min_Dhan/<date>_exp-<expiry>_<withZeroVol|noZeroVol>_dl-<date>_<HHMM>/`}</code>, separate from the Kite files</dd></div>
-          <div><dt>Contracts</dt><dd>Only those in ${X}'s bhavcopy for the day (traded or not) once it is published, usually in the evening; before that, all of Dhan's list.</dd></div>`}
+        ${DHAN && html`<div><dt>Folder</dt><dd><code>${`${F.underlying}_FnO_1min_Dhan/<date>_exp-<expiry>_<withZeroVol|noZeroVol>_dl-<date>_<HHMM>/`}</code>, separate from the Kite files</dd></div>`}
         ${!DHAN && html`<div><dt>Folder</dt><dd><code>${`${F.underlying}_FnO_1min/<date>_exp-<expiry>_<withZeroVol|noZeroVol>_dl-<date>_<HHMM>/`}</code></dd></div>`}
+        <div><dt>Contracts</dt><dd>${trimBhav
+          ? `Only those in ${X}'s bhavcopy for the day (traded or not) once it is published, usually in the evening; before that, all of ${B.name}'s list.`
+          : `All of ${B.name}'s list, including strikes and expiries added after the day.`}</dd></div>
         <div><dt>Files</dt><dd><code>futures/${F.underlying}${ex[0]}.csv</code>, <code>options/${F.underlying}${ex[1]}.csv</code>, plus summary.csv and run.log</dd></div>
         <div><dt>Bhavcopy</dt><dd>After each day, ${X}'s F&O bhavcopy and the check go into <code>${"<day folder>/bhavcopy/"}</code>: bhav_compare.csv,
           bhav_summary.csv and checked_days_summary.csv.${" "}
@@ -718,6 +721,11 @@
           <span><b>Keep contracts with candles but zero volume</b>
             <small>${`${B.name} can report a single trade as volume 0. ON keeps these files; the bhavcopy check marks any that ${X} says did not trade as EXTRA.`}</small></span>
           <span className="switch"><input type="checkbox" checked=${keepZero} disabled=${running} onChange=${e => setKeepZero(e.target.checked)} /><span></span></span>
+        </label>
+        <label className="toggle">
+          <span><b>Download only contracts in the bhavcopy</b>
+            <small>${`ON requests only the contracts in ${X}'s bhavcopy for the day, traded or not, so strikes listed later are not requested. Until ${X} publishes it (usually in the evening) the full list is used and run.log says why.`}</small></span>
+          <span className="switch"><input type="checkbox" checked=${trimBhav} disabled=${running} onChange=${e => setTrimBhav(e.target.checked)} /><span></span></span>
         </label>
       </div>
 
@@ -990,7 +998,8 @@
         : [...(job.indices || []), ...(job.equity ? ["NSE equity stocks"] : [])].join(", ")],
       ["Saving to", (job.out_dirs || []).length ? html`${job.folder}${job.out_dirs.map(d => html`<br key=${d} />↳ ${d}`)}` : job.folder],
       ["File format", isFno ? "CSV, Accelpix layout" : { csv: "CSV", parquet: "Parquet" }[job.format] || "Parquet"],
-      ...(isFno ? [["Zero-volume contracts", job.keep_zero ? "Kept (ON)" : "Skipped (OFF)"]] : []),
+      ...(isFno ? [["Zero-volume contracts", job.keep_zero ? "Kept (ON)" : "Skipped (OFF)"],
+                   ["Contracts", job.trim_to_bhav ? "Bhavcopy only (ON)" : "Full list (OFF)"]] : []),
       ["Pass", job.pass ? (job.pass > 1 ? `${job.pass} (retrying failed ${isFno ? "contracts" : "chunks"})` : "1") : "Not started"],
     ] : [];
     const current = rates.length ? rates[rates.length - 1] : 0;
@@ -1134,6 +1143,7 @@
     const [folder, setFolder] = useState(boot.form.folder);
     const [fnoFolder, setFnoFolder] = useState(boot.form.folder);   // F&O and bhavcopy cards, separate from New download
     const [keepZero, setKeepZero] = useState(!!boot.fno.keep_zero_volume);   // default from config.keep_zero_volume()
+    const [trimBhav, setTrimBhav] = useState(!!boot.fno.trim_to_bhav);       // default from config.trim_to_bhav()
     // NIFTY | SENSEX on the F&O and bhavcopy cards; remembered in this browser
     const [und, setUndState] = useState(() => {
       let v = "";
@@ -1229,7 +1239,8 @@
         <div>
           ${!DHAN && html`<${Planner} job=${job} toast=${toast} onPoll=${poll} folder=${folder} setFolder=${setFolder} />`}
           <${FnoCard} job=${job} toast=${toast} onPoll=${poll} folder=${fnoFolder} setFolder=${setFnoFolder} days=${bhav.days} onBhav=${loadBhav}
-                     keepZero=${keepZero} setKeepZero=${setKeepZero} und=${und} setUnd=${setUnd} />
+                     keepZero=${keepZero} setKeepZero=${setKeepZero} trimBhav=${trimBhav} setTrimBhav=${setTrimBhav}
+                     und=${und} setUnd=${setUnd} />
         </div>
         <div>
           <${Live} job=${job} rates=${rates} toast=${toast} onPoll=${poll} />

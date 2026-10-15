@@ -4,7 +4,7 @@
     NIFTY_FnO_1min/days_index.csv
 
 Both list every day folder (old-style <YYYY-MM-DD> names included) with its expiry, zero-volume setting,
-download time and file counts. They are rewritten after a run that creates, removes or renames a day folder,
+download time, file counts and Trim_to_bhav (from the day's summary.csv: ON / OFF / FALLBACK, blank before it existed). They are rewritten after a run that creates, removes or renames a day folder,
 after nifty_daily.py --rename-folders --apply and by --update-day-count; readers never write them."""
 import csv
 import os
@@ -13,7 +13,7 @@ import re
 from . import fno
 
 INDEX_FILE = "days_index.csv"
-INDEX_COLUMNS = ["Day", "Folder", "Expiry", "Zero_volume", "Downloaded", "Futures_files", "Option_files"]
+INDEX_COLUMNS = ["Day", "Folder", "Expiry", "Zero_volume", "Downloaded", "Futures_files", "Option_files", "Trim_to_bhav"]
 MARKER_RE = re.compile(r"_DAYS-\d+(_\d{4}-\d{2}-\d{2}_to_\d{4}-\d{2}-\d{2})?\.txt")
 ZERO_LABEL = {True: "With", False: "No", None: ""}
 
@@ -31,7 +31,8 @@ def day_rows(root):
         rows.append({"Day": day.isoformat(), "Folder": name, "Expiry": expiry.isoformat() if expiry else "",
                      "Zero_volume": ZERO_LABEL[zero], "Downloaded": f"{created:%Y-%m-%d %H:%M}" if created else "",
                      "Futures_files": csv_count(os.path.join(path, "futures")),
-                     "Option_files": csv_count(os.path.join(path, "options"))})
+                     "Option_files": csv_count(os.path.join(path, "options")),
+                     "Trim_to_bhav": fno.saved_trim(path)})
     return rows
 
 
