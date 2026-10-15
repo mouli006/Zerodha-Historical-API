@@ -372,8 +372,9 @@ Other files per index:
 - `eod\<YYYY>.parquet`: the exchange bhavcopy (NSE for NIFTY, BSE for SENSEX) of each day, from Kite's saved copy, else Dhan's: `date, contract, type, expiry, strike` and `Contract, Expiry, Type, Strike, Close, Last, Settle, OI, Volume_contracts, Lot`.
 - `contracts.parquet`: `contract, type, expiry, strike, lot, first_date, last_date, days_with_data`.
 - `expiries.csv`: `expiry, weekday, kind` (`monthly` = the last expiry of its month, else `weekly`).
-- `days.csv`: one row per trading day in either broker: `date, expiry, dte, kite_available, dhan_available, kite_check, dhan_check` (OK / minor / major / unchecked), `kite_zero_volume, dhan_zero_volume` (with / no), `kite_trim, dhan_trim` (ON / OFF / FALLBACK), `kite_contracts, dhan_contracts, eod_available, best_source, published_at, raw_missing`.
-  - **best_source** is the broker whose bhavcopy check is best: OK, then minor, then unchecked, then major. On a tie it is `--prefer` (default kite).
+- `days.csv`: one row per trading day in either broker: `date, expiry, dte, kite_available, dhan_available, kite_check, dhan_check` (OK / minor / major / unchecked), `kite_zero_volume, dhan_zero_volume` (with / no), `kite_trim, dhan_trim` (ON / OFF / FALLBACK), `kite_contracts, dhan_contracts, eod_available, best_source, best_reason, published_at, raw_missing`.
+  - **best_source** is the broker whose bhavcopy check is best: OK, then minor, then unchecked, then major. When both have the same label, the counts in each day's `bhav_check.json` decide, fewer is better: missing contracts, then volume differences over the limits, then all differences. Only when all three are equal (or the day is unchecked) is it `--prefer` (default kite).
+  - **best_reason** says why, e.g. `both major; dhan fewer volume diffs 32 vs 99`, `dhan major, kite minor`, `only kite (OK)` or `both OK, same counts; --prefer kite`.
 
 ### Reading it in a backtest
 ```python

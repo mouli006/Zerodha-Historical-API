@@ -33,7 +33,7 @@ EOD_KEYS = ["date", "contract", "type", "expiry", "strike"]
 CONTRACT_COLUMNS = ["contract", "type", "expiry", "strike", "lot", "first_date", "last_date", "days_with_data"]
 DAYS_COLUMNS = ["date", "expiry", "dte", "kite_available", "dhan_available", "kite_check", "dhan_check",
                 "kite_zero_volume", "dhan_zero_volume", "kite_trim", "dhan_trim", "kite_contracts", "dhan_contracts",
-                "eod_available", "best_source", "published_at", "raw_missing"]
+                "eod_available", "best_source", "best_reason", "published_at", "raw_missing"]
 EXPIRY_COLUMNS = ["expiry", "weekday", "kind"]
 CHECK_RANK = {"OK": 0, "minor": 1, "unchecked": 2, "major": 3}
 MANIFEST = "publish_manifest.json"
@@ -89,12 +89,48 @@ def check_label(entry):
     return "OK" if entry["status"] == "ok" else ("minor" if entry["severity"] == "minor" else "major")
 
 
-def best_source(checks, prefer="kite"):
-    """checks: {source: label} of the available sources. OK > minor > unchecked > major; a tie goes to prefer."""
+# Tie-break between sources with the same check label: bhav_check.json counts, fewer is better, in this order
+TIE_COUNTS = [("missing", "missing contracts"), ("volume", "volume diffs"), ("total", "total diffs")]
+
+
+def check_counts(check):
+    """{missing, volume, total} of a bhav_check.json: missing contracts, volume differences over the limits
+    (red_volume_diffs, else volume_diffs for older checks) and all differences (bhav.COUNT_NAMES); {} unchecked."""
+    if not check:
+        return {}
+    c = check.get("counts", {}) or {}
+    return {"missing": int(c.get("missing", 0)),
+            "volume": int(c["red_volume_diffs"] if "red_volume_diffs" in c else c.get("volume_diffs", 0)),
+            "total": int(sum(c.get(k, 0) for k, _ in bhav.COUNT_NAMES))}
+
+
+def best_source(checks, prefer="kite", counts=None):
+    """(source, reason). checks: {source: label} of the available sources; OK > minor > unchecked > major.
+    Sources with the same label are compared on counts ({source: check_counts}) in TIE_COUNTS order;
+    only when all are equal (or unknown) does prefer decide. ("", "") without a source."""
     if not checks:
-        return ""
-    order = sorted(checks, key=lambda s: (CHECK_RANK.get(checks[s], 2), s != prefer))
-    return order[0]
+        return "", ""
+    if len(checks) == 1:
+        (s, label), = checks.items()
+        return s, f"only {s} ({label})"
+    counts = counts or {}
+    rank = lambda s: CHECK_RANK.get(checks[s], 2)
+    best = min(rank(s) for s in checks)
+    tied = sorted((s for s in checks if rank(s) == best), key=lambda s: s != prefer)
+    others = ", ".join(f"{s} {checks[s]}" for s in sorted(checks))
+    if len(tied) == 1:
+        return tied[0], others
+    label = checks[tied[0]]
+    for key, words in TIE_COUNTS:
+        vals = {s: counts.get(s, {}).get(key) for s in tied}
+        if None in vals.values() or len(set(vals.values())) == 1:
+            continue
+        win = min(tied, key=lambda s: vals[s])
+        lose = [s for s in tied if s != win]
+        return win, (f"both {label}; {win} fewer {words} {vals[win]} vs "
+                     + ", ".join(str(vals[s]) for s in lose))
+    same = "same counts" if all(counts.get(s) for s in tied) else "no counts"
+    return tied[0], f"both {label}, {same}; --prefer {tied[0]}"
 
 
 def day_frame(day_dir, day, underlying):
@@ -246,7 +282,9 @@ def publish_underlying(raw, out, underlying, date_from, date_to, prefer, force, 
                     days.setdefault(day, {})[source] = {
                         "folder": name, **fp, "published_at": f"{fno.now_ist():%Y-%m-%d %H:%M:%S}",
                         "contracts": int(frame["contract"].nunique()) if len(frame) else 0, "rows": int(len(frame)),
-                        "check": check_label(checks.get(day)), "zero_volume": {True: "with", False: "no"}.get(zero, ""),
+                        "check": check_label(checks.get(day)), "counts": check_counts(
+                            checks[day] if checks.get(day, {}).get("status") != "pending" else None),
+                        "zero_volume": {True: "with", False: "no"}.get(zero, ""),
                         "trim": fno.saved_trim(path), "expiry": expiry.isoformat() if expiry else "",
                         "has_eod": eod is not None, "raw_missing": False}
                     if eod is not None:
@@ -379,11 +417,12 @@ def write_days(out_u, days, prefer):
         v = days[day]
         avail = {s: v[s] for s in SOURCES if s in v}
         expiry = next((e["expiry"] for e in avail.values() if e.get("expiry")), "")
-        best = best_source({s: e["check"] for s, e in avail.items() if not e.get("raw_missing")}
-                           or {s: e["check"] for s, e in avail.items()}, prefer)
+        live = {s: e for s, e in avail.items() if not e.get("raw_missing")} or avail
+        best, reason = best_source({s: e["check"] for s, e in live.items()}, prefer,
+                                   {s: e.get("counts") or {} for s, e in live.items()})
         row = {"date": day, "expiry": expiry,
                "dte": (date.fromisoformat(expiry) - date.fromisoformat(day)).days if expiry else "",
-               "eod_available": bool(v.get("eod_source")), "best_source": best,
+               "eod_available": bool(v.get("eod_source")), "best_source": best, "best_reason": reason,
                "published_at": max((e["published_at"] for e in avail.values()), default=""),
                "raw_missing": "+".join(s for s in SOURCES if s in avail and avail[s].get("raw_missing"))}
         for s in SOURCES:

@@ -37,7 +37,7 @@ def bars(day, closes, vol=10, oi=None):
 
 
 def make_day(raw, day, underlying="NIFTY", source="kite", form="new", keep_zero=True, check="ok", bhav_copy=True,
-             summary=True, trim="ON", step=50):
+             summary=True, trim="ON", step=50, counts=None):
     """A saved day: one future, a traded CE (OI with a gap), a zero-volume PE, summary.csv, the instrument list,
     the bhavcopy and bhav_check.json. form: "new" (exp/zero/dl name) or "old" (<YYYY-MM-DD>)."""
     root = fno.fno_root(raw, underlying, source)
@@ -70,7 +70,7 @@ def make_day(raw, day, underlying="NIFTY", source="kite", form="new", keep_zero=
         if check:
             with open(os.path.join(out, "bhav_check.json"), "w", encoding="utf-8") as f:
                 json.dump({"status": "ok" if check == "ok" else "diffs", "severity": "" if check == "ok" else check,
-                           "line": "", "counts": {}}, f)
+                           "line": "", "counts": counts or {}}, f)
     os.makedirs(root, exist_ok=True)
     return d
 
@@ -531,9 +531,50 @@ def test_best_source(tmp_path, kite, dhan, prefer, best):
 
 
 def test_best_source_rule():
-    assert fno_publish.best_source({}) == ""
-    assert fno_publish.best_source({"kite": "unchecked", "dhan": "minor"}) == "dhan"
-    assert fno_publish.best_source({"kite": "unchecked", "dhan": "major"}) == "kite"
+    assert fno_publish.best_source({}) == ("", "")
+    assert fno_publish.best_source({"kite": "unchecked", "dhan": "minor"}) == ("dhan", "dhan minor, kite unchecked")
+    assert fno_publish.best_source({"kite": "unchecked", "dhan": "major"}) == ("kite", "dhan major, kite unchecked")
+    assert fno_publish.best_source({"dhan": "major"}) == ("dhan", "only dhan (major)")
+
+
+def counts(missing=0, red=0, **other):
+    return {"missing": missing, "red_volume_diffs": red, "volume_diffs": red, **other}
+
+
+@pytest.mark.parametrize("kite,dhan,prefer,best,reason", [
+    (counts(missing=2, red=1), counts(missing=1, red=50), "kite", "dhan", "both major; dhan fewer missing contracts 1 vs 2"),
+    (counts(red=99, oi_diffs=1), counts(red=32, oi_diffs=500), "kite", "dhan", "both major; dhan fewer volume diffs 32 vs 99"),
+    (counts(red=5, oi_diffs=10), counts(red=5, oi_diffs=3), "kite", "dhan", "both major; dhan fewer total diffs 8 vs 15"),
+    (counts(red=5, oi_diffs=3), counts(red=5, oi_diffs=3), "dhan", "dhan", "both major, same counts; --prefer dhan"),
+    (counts(red=5), counts(red=7), "dhan", "kite", "both major; kite fewer volume diffs 5 vs 7"),
+])
+def test_best_source_tie_break_on_counts(tmp_path, kite, dhan, prefer, best, reason):
+    make_day(str(tmp_path / "kite"), D1, check="major", counts=kite)
+    make_day(str(tmp_path / "dhan"), D1, source="dhan", check="major", counts=dhan)
+    assert pub(tmp_path, prefer=prefer)[0] == 0
+    r = days_csv(tmp_path)[D1]
+    assert (r["best_source"], r["best_reason"]) == (best, reason)
+
+
+def test_best_source_tie_break_old_counts_and_unchecked(tmp_path):
+    # a check saved before red_volume_diffs existed uses volume_diffs
+    make_day(str(tmp_path / "kite"), D1, check="major", counts={"missing": 0, "volume_diffs": 9})
+    make_day(str(tmp_path / "dhan"), D1, source="dhan", check="major", counts={"missing": 0, "volume_diffs": 4})
+    make_day(str(tmp_path / "kite"), D2, check=None)
+    make_day(str(tmp_path / "dhan"), D2, source="dhan", check=None)
+    assert pub(tmp_path)[0] == 0
+    rows = days_csv(tmp_path)
+    assert (rows[D1]["best_source"], rows[D1]["best_reason"]) == ("dhan", "both major; dhan fewer volume diffs 4 vs 9")
+    assert (rows[D2]["best_source"], rows[D2]["best_reason"]) == ("kite", "both unchecked, no counts; --prefer kite")
+
+
+def test_best_reason_column_and_different_labels(tmp_path):
+    make_day(str(tmp_path / "kite"), D1, check="minor")
+    make_day(str(tmp_path / "dhan"), D1, source="dhan", check="major", counts=counts(red=1))
+    assert pub(tmp_path)[0] == 0
+    r = days_csv(tmp_path)[D1]
+    assert list(r)[fno_publish.DAYS_COLUMNS.index("best_reason")] == "best_reason"
+    assert (r["best_source"], r["best_reason"]) == ("kite", "dhan major, kite minor")
 
 
 def test_publish_incremental_force_and_changed(tmp_path):
