@@ -15,6 +15,7 @@ from backfill.storage import open_db
 from test_bhav import FakeResponse, FakeSession, csv_bytes, row
 from test_fno import ACCESS, RUN_DATE, FakeKite, bars, inst, read_csv
 from test_fno_entrypoints import client, ist_now, post, wait_for  # noqa: F401  (fixtures)
+from conftest import day_of
 
 DAY = RUN_DATE.isoformat()
 W1, M1 = date(2026, 10, 15), date(2026, 10, 29)   # SENSEX expires on Thursdays
@@ -133,7 +134,7 @@ def test_sensex_run_daily_with_bse_bhavcopy(tmp_path, sensex_kite, bse):
     bse["data"] = bse_csv()
     data = tmp_path / "data"
     assert run_sensex(data) == "finished"
-    day = data / "SENSEX_FnO_1min" / DAY
+    day = day_of(data / "SENSEX_FnO_1min", DAY)
     assert os.listdir(day / "futures") == ["SENSEX29OCT26.csv"]
     assert os.listdir(day / "options") == ["SENSEX7470015OCT26CE.csv"]          # PE: no candles, no file
     assert (day / "instruments_BFO.csv").exists() and (day / "summary.csv").exists()
@@ -237,7 +238,7 @@ def test_sensex_untraded_future_is_not_a_holiday(tmp_path, sensex_kite, monkeypa
     monkeypatch.setattr(SensexKite, "candles", {11: bars(3, 20.0, vol=20), 265: bars(5, 74710.0)})
     data = tmp_path / "data"
     assert run_sensex(data) == "finished"
-    day = data / "SENSEX_FnO_1min" / DAY
+    day = day_of(data / "SENSEX_FnO_1min", DAY)
     assert not os.listdir(day / "futures") and os.listdir(day / "options") == ["SENSEX7470015OCT26CE.csv"]
     assert not (data / "SENSEX_FnO_1min" / "holidays.log").exists()
     assert "SENSEX29OCT26 has no candles but SENSEX spot traded" in (day / "run.log").read_text(encoding="utf-8")
@@ -251,7 +252,7 @@ def test_sensex_holiday_when_spot_is_empty_too(tmp_path, sensex_kite, monkeypatc
     data = tmp_path / "data"
     assert run_sensex(data) == "holiday"
     root = data / "SENSEX_FnO_1min"
-    assert not (root / DAY).exists() and DAY in (root / "holidays.log").read_text(encoding="utf-8")
+    assert fno.day_folders(str(root)) == {} and DAY in (root / "holidays.log").read_text(encoding="utf-8")
     assert [t for t, *_ in sensex_kite.calls] == [1, 265]
 
 

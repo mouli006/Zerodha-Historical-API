@@ -20,7 +20,7 @@ from datetime import date
 
 from backfill import bhav_export
 from backfill.bhav import BhavError, bhav_dir, run_bhav, unchecked_days
-from backfill.fno import UNDERLYINGS, LockBusy, acquire_lock, fno_root
+from backfill.fno import UNDERLYINGS, DayFolderError, LockBusy, acquire_lock, fno_root
 from backfill.storage import check_folder
 from config import data_dir
 
@@ -64,7 +64,11 @@ def main(argv=None):
         print(f"Not run: {err}", file=sys.stderr)
         return 1
     if dates is None:
-        dates = unchecked_days(folder, args.underlying, args.source)
+        try:
+            dates = unchecked_days(folder, args.underlying, args.source)
+        except DayFolderError as e:
+            print(f"Not run: {e}", file=sys.stderr)
+            return 1
         if not dates:
             print("Nothing to check: every saved day has a bhavcopy check.")
             return 0
@@ -80,7 +84,7 @@ def main(argv=None):
             try:
                 status, _, _ = run_bhav(d, folder, args.underlying, args.bhav_file, source=args.source)
                 codes.append(EXIT[status])
-            except (BhavError, OSError) as e:
+            except (BhavError, DayFolderError, OSError) as e:
                 print(f"[bhav:{args.underlying}:{d}] Not checked: {e}", file=sys.stderr)
                 codes.append(1)
     finally:
@@ -101,7 +105,7 @@ def export(p, args):
     scope = "days" if args.export_days else "all" if args.csv else "xlsx"
     try:
         name, data, _ = bhav_export.export(folder, args.underlying, scope, run_date, source=args.source)
-    except BhavError as e:
+    except (BhavError, DayFolderError) as e:
         print(f"Not exported: {e}", file=sys.stderr)
         return 1
     out = (fno_root(folder, args.underlying, args.source) if args.export_days

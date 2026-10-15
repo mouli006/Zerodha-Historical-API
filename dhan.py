@@ -13,13 +13,19 @@ from zoneinfo import ZoneInfo
 from flask import Blueprint, jsonify, redirect, render_template, request, session, url_for
 from kiteconnect import exceptions as kex
 
-from backfill import fno
+from backfill import fno, fno_days
 from backfill.dhan_api import MAX_SPEED, DhanClient, DhanError, data_plan_error, fetch_profile, token_connected
 from backfill.job import JOB, JOB_LOCK, STOP, job_begin
 from backfill.storage import check_folder
 from config import DEFAULT_DATA_DIR, data_dir, dhan_credentials, keep_zero_volume, load_env, save_env, weekly_expiry_weekday
 
 bp = Blueprint("dhan", __name__)
+
+
+@bp.errorhandler(fno.DayFolderError)
+def day_folder_error(e):
+    """Two folders for one trading day: the F&O routes answer with the folders to fix."""
+    return jsonify({"error": str(e)})
 
 IST = ZoneInfo("Asia/Kolkata")
 SOURCE = "dhan"
@@ -164,7 +170,8 @@ def fno_window_route():
     return jsonify({"min_date": w.min_date.isoformat(), "max_date": w.max_date.isoformat(),
                     "current_expiry": w.current_expiry.isoformat(), "previous_expiry": w.previous_expiry.isoformat(),
                     "estimated": w.estimated, "today_is_expiry": w.current_expiry == w.max_date,
-                    "missing": [d.isoformat() for d in fno.missing_dates(folder, underlying, w, source=SOURCE)]})
+                    "missing": [d.isoformat() for d in fno.missing_dates(folder, underlying, w, source=SOURCE)],
+                    "days": fno_days.day_summary(fno.fno_root(folder, underlying, SOURCE))})
 
 
 @bp.route("/dhan/fno-start", methods=["POST"])
@@ -228,8 +235,8 @@ def fno_start():
         err = window_error(run_date, w) or fno.too_early(run_date)
         if err:
             return fail(err)
-        if refetch and not os.path.exists(os.path.join(fno.fno_root(folder, underlying, SOURCE), run_date.isoformat(),
-                                                       "summary.csv")):
+        saved = fno.day_dir(folder, underlying, run_date, SOURCE)
+        if refetch and not (saved and os.path.exists(os.path.join(saved, "summary.csv"))):
             return fail(f"{run_date} has not been downloaded in this folder yet; download the day first.")
     try:
         lock = fno.acquire_lock(folder, underlying, "dhan dashboard", SOURCE)

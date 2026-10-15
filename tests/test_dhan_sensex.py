@@ -14,6 +14,7 @@ from backfill.job import JOB, JOB_LOCK, STOP, job_begin
 from test_dhan_fno import TOKEN, Resp, arrays, client, error_of, wait_for  # noqa: F401  (fixtures)
 from test_dhan_parity import FakeDhan, dcli  # noqa: F401  (fixtures)
 from test_sensex import bse_csv
+from conftest import day_of
 
 IST = fno.IST
 RUN_DATE = date(2026, 10, 12)
@@ -30,7 +31,7 @@ NO_DATA = Resp(400, {"errorCode": "DH-907", "errorMessage": "No data present"})
 
 
 def dhan_day(root):
-    return root / "SENSEX_FnO_1min_Dhan" / DAY
+    return day_of(root / "SENSEX_FnO_1min_Dhan", DAY)
 
 
 @pytest.fixture

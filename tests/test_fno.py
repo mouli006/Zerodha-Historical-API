@@ -10,6 +10,7 @@ from kiteconnect import exceptions as kex
 from backfill import fno
 from backfill.job import JOB, STOP, job_begin
 from backfill.storage import open_db
+from conftest import day_of
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -249,7 +250,7 @@ def test_expiries_seen_appended_and_deduplicated(tmp_path):
 
 
 def test_expiries_seeded_from_saved_dumps(tmp_path):
-    day = tmp_path / "NIFTY_FnO_1min" / "2026-10-05"
+    day = day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-05")
     day.mkdir(parents=True)
     fno.save_instruments(str(day / "instruments_NFO.csv"), expiry_rows(6, 13))
     assert set(fno.read_expiries(str(tmp_path), "NIFTY")) == {D(6), D(13)}
@@ -446,7 +447,7 @@ def read_csv(path):
 
 def test_run_daily_full(tmp_path, fake_kite):
     assert run(tmp_path) == "finished_failures"
-    day = tmp_path / "NIFTY_FnO_1min" / "2026-10-12"
+    day = day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-12")
 
     assert sorted(os.listdir(day / "futures")) == ["NIFTY24NOV26.csv", "NIFTY27OCT26.csv"]
     assert sorted(os.listdir(day / "options")) == ["NIFTY2510013OCT26CE.csv", "NIFTY2510013OCT26PE.csv",
@@ -511,13 +512,13 @@ def test_run_daily_holiday_deletes_day_folder(tmp_path, fake_kite):
     fake_kite.holiday = True
     assert run(tmp_path) == "holiday"
     base = tmp_path / "NIFTY_FnO_1min"
-    assert not (base / "2026-10-12").exists()
+    assert fno.day_folders(str(base)) == {}                     # no day folder of any name
     assert "2026-10-12" in (base / "holidays.log").read_text(encoding="utf-8")
     assert [c[0] for c in fake_kite.calls] == [1, fno.SPOT_TOKENS["NIFTY"]]   # nearest future, then the spot
 
 
 def test_run_daily_holiday_keeps_folder_with_files(tmp_path, fake_kite):
-    day = tmp_path / "NIFTY_FnO_1min" / "2026-10-12" / "options"
+    day = day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-12") / "options"
     day.mkdir(parents=True)
     (day / "NIFTY2510013OCT26CE.csv").write_text("x")
     fake_kite.holiday = True
@@ -543,7 +544,7 @@ def test_run_daily_past_date_inside_window(tmp_path, fake_kite, monkeypatch):
     # run on 13 Oct for 12 Oct: complete, the dump is named after the day it was fetched
     set_now(monkeypatch, D(13))
     assert run(tmp_path) == "finished_failures"
-    day = tmp_path / "NIFTY_FnO_1min" / "2026-10-12"
+    day = day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-12")
     assert (day / "instruments_NFO_fetched_2026-10-13.csv").exists()
     assert not (day / "instruments_NFO.csv").exists()
     assert "NIFTY2510013OCT26CE.csv" in os.listdir(day / "options")
@@ -554,7 +555,7 @@ def test_run_daily_outside_window(tmp_path, fake_kite):
     # the dump's history has the 9 Oct expiry, so 9 Oct and earlier are refused
     assert run(tmp_path, day=D(9)) == "outside_window"
     assert "Earliest date available is 2026-10-10" in JOB["message"] and JOB["state"] == "stopped"
-    assert not (tmp_path / "NIFTY_FnO_1min" / "2026-10-09").exists()
+    assert not (day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-09")).exists()
     assert fake_kite.calls == []
 
 
@@ -574,7 +575,7 @@ def test_run_daily_estimated_window_logs_warning(tmp_path, fake_kite, monkeypatc
     lines = []
     assert run(tmp_path, log=lines.append) == "finished_failures"
     assert any("WARNING" in l and "2026-10-07" in l for l in lines)
-    assert "WARNING" in (tmp_path / "NIFTY_FnO_1min" / "2026-10-12" / "run.log").read_text(encoding="utf-8")
+    assert "WARNING" in (day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-12") / "run.log").read_text(encoding="utf-8")
     seen = read_rows(tmp_path / "NIFTY_FnO_1min" / fno.EXPIRIES_FILE)
     assert [r[0] for r in seen] == ["2026-10-13", "2026-10-20", "2026-10-27", "2026-11-24"]
 
@@ -584,7 +585,7 @@ def test_run_missing(tmp_path, fake_kite):
     assert job_begin(**fno.job_fields("NIFTY", None, str(tmp_path), 1000))
     assert fno.run_missing("key", ACCESS, str(tmp_path), 1000, log=lambda m: None) == "finished_failures"
     base = tmp_path / "NIFTY_FnO_1min"
-    assert sorted(d for d in os.listdir(base) if d[0].isdigit()) == ["2026-10-12"]
+    assert list(fno.day_folders(str(base))) == [RUN_DATE]       # one folder; holidays made none
     assert {"2026-10-10", "2026-10-11"} <= {l.split()[2].rstrip(":") for l in open(base / "holidays.log")}
     assert JOB["state"] == "finished" and "2026-10-12" in JOB["message"]
     # again: weekend days are known holidays and 12 Oct only retries its failed contract
@@ -613,7 +614,7 @@ def test_run_missing_picked_range(tmp_path, fake_kite):
     assert job_begin(**fno.job_fields("NIFTY", None, str(tmp_path), 1000, label="2026-10-10_to_2026-10-12"))
     assert fno.run_missing("key", ACCESS, str(tmp_path), 1000, log=lambda m: None, dates=days) == "finished_failures"
     base = tmp_path / "NIFTY_FnO_1min"
-    assert sorted(d for d in os.listdir(base) if d[0].isdigit()) == ["2026-10-12"]
+    assert list(fno.day_folders(str(base))) == [RUN_DATE]       # one folder; holidays made none
     assert JOB["message"].startswith("Range days done: 1 saved, 2 holiday/weekend")
     # again: the weekend is skipped and 12 Oct only requests its failed contract
     fake_kite.calls.clear()
@@ -650,14 +651,14 @@ def test_summary_listed_vs_traded(tmp_path):
 
 def test_summary_counts_files_from_earlier_run(tmp_path, fake_kite):
     # a previous partial run already saved the 27 Oct put (which fails in this run): it is counted
-    path = tmp_path / "NIFTY_FnO_1min" / "2026-10-12" / "options" / "NIFTY2510027OCT26PE.csv"
+    path = day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-12") / "options" / "NIFTY2510027OCT26PE.csv"
     fno.write_contract(str(path), "NIFTY2510027OCT26PE", bars(4, 90.0))
     assert run(tmp_path) == "finished_failures", JOB["message"]
     assert 31 not in [t for t, *_ in fake_kite.calls]          # skipped: its file already exists
-    summary = read_csv(tmp_path / "NIFTY_FnO_1min" / "2026-10-12" / "summary.csv")
+    summary = read_csv(day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-12") / "summary.csv")
     assert summary[3] == ["2026-10-27", "Current month", "1", "1", "1", "0", "1", "25100", "", "4"] + PENDING_COLS
     assert JOB["fno_summary"][2]["Traded_strikes"] == 1
-    log = (tmp_path / "NIFTY_FnO_1min" / "2026-10-12" / "run.log").read_text(encoding="utf-8")
+    log = (day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-12") / "run.log").read_text(encoding="utf-8")
     assert "Listed_strikes  Traded_strikes  Listed_contracts" in log
 
 
@@ -668,7 +669,7 @@ NO_CANDLES_PE = "NIFTY2515013OCT26PE"  # token 14: no candles
 
 
 def day_dir(tmp_path):
-    return tmp_path / "NIFTY_FnO_1min" / "2026-10-12"
+    return day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-12")
 
 
 def reasons(tmp_path):
@@ -791,7 +792,7 @@ def test_shared_tradingsymbol_fails_all_without_requests(tmp_path, fake_kite, mo
     dump = make_dump() + [inst("DUPSYM", "CE", W2, 25150.0, token=41), inst("DUPSYM", "CE", M1, 25150.0, token=42)]
     monkeypatch.setattr(sys.modules[__name__], "make_dump", lambda: dump)
     run(tmp_path)
-    day = tmp_path / "NIFTY_FnO_1min" / "2026-10-12"
+    day = day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-12")
     assert statuses_of(tmp_path)["DUPSYM"] == ("FAILED", fno.DUPLICATE_NAME)
     assert not any(t in (41, 42) for t, *_ in fake_kite.calls)
     assert not (day / "options" / "NIFTY2515020OCT26CE.csv").exists()
@@ -808,7 +809,7 @@ def test_same_file_name_fails_both(tmp_path, fake_kite, monkeypatch):
     assert st["NIFTY2610625100CE"] == ("FAILED", fno.DUPLICATE_NAME)
     assert st["NIFTY_OTHER_25100CE"] == ("FAILED", fno.DUPLICATE_NAME)
     assert not any(t in (11, 43) for t, *_ in fake_kite.calls)
-    assert not (tmp_path / "NIFTY_FnO_1min" / "2026-10-12" / "options" / "NIFTY2510013OCT26CE.csv").exists()
+    assert not (day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-12") / "options" / "NIFTY2510013OCT26CE.csv").exists()
 
 
 def test_write_never_overwrites_another_contracts_file(tmp_path, fake_kite, monkeypatch):
@@ -825,8 +826,8 @@ def test_write_never_overwrites_another_contracts_file(tmp_path, fake_kite, monk
     st = statuses_of(tmp_path)
     assert st["NIFTY2610625100CE"] == ("FAILED", fno.DUPLICATE_NAME)
     assert st["NIFTY2610625100PE"] == ("FAILED", fno.DUPLICATE_NAME)
-    assert not (tmp_path / "NIFTY_FnO_1min" / "2026-10-12" / "options" / "NIFTY2510013OCT26CE.csv").exists()
-    log = (tmp_path / "NIFTY_FnO_1min" / "2026-10-12" / "run.log").read_text(encoding="utf-8")
+    assert not (day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-12") / "options" / "NIFTY2510013OCT26CE.csv").exists()
+    log = (day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-12") / "run.log").read_text(encoding="utf-8")
     assert "DUPLICATE_NAME: file NIFTY2510013OCT26PE was already written by NIFTY2610625100CE" in log
 
 
@@ -838,4 +839,4 @@ def test_kite_runs_never_trim(tmp_path, fake_kite, monkeypatch):
         raise AssertionError("NSE called")
     monkeypatch.setattr(bhav, "fetch_bhav", nse)
     assert run(tmp_path) == "finished_failures"
-    assert "Trimmed" not in (tmp_path / "NIFTY_FnO_1min" / "2026-10-12" / "run.log").read_text(encoding="utf-8")
+    assert "Trimmed" not in (day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-12") / "run.log").read_text(encoding="utf-8")

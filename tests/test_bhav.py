@@ -17,6 +17,7 @@ from backfill import bhav, bhav_export, fno
 from backfill.job import JOB, JOB_LOCK
 from backfill.storage import open_db
 from test_fno import RUN_DATE, ACCESS, FakeKite, bars, fake_kite, read_csv, run, set_now  # noqa: F401
+from conftest import day_of
 
 IST = fno.IST
 DAY = "2026-10-12"
@@ -239,8 +240,9 @@ def test_bhav_file_without_network(tmp_path, kind):
             row("IDF", "2026-10-27", sym="BANKNIFTY", vol=5)]
     src = tmp_path / f"manual.{kind}"
     src.write_bytes(zip_bytes(rows) if kind == "zip" else csv_bytes(rows))
+    (tmp_path / "data" / "NIFTY_FnO_1min" / DAY).mkdir(parents=True)   # an old-style day folder
     status, line, summary = bhav.run_bhav(date(2026, 10, 12), str(tmp_path / "data"), bhav_file=str(src), log=lambda m: None)
-    out = tmp_path / "data" / "NIFTY_FnO_1min" / DAY / "bhavcopy"
+    out = day_of(tmp_path / "data" / "NIFTY_FnO_1min", DAY) / "bhavcopy"
     assert status == "diffs" and line == "Bhavcopy check: CHECK (2 missing); liquid buckets: 2 missing, 0 diffs" and summary is None
     assert (out / f"manual.{kind}").read_bytes() == src.read_bytes()        # original kept unchanged
     assert len(read_csv(out / "nifty_bhav.csv")) == 3                        # header + 2 NIFTY rows
@@ -281,7 +283,7 @@ def summary_by(path):
 def test_summary_gets_bhav_columns_and_keeps_them(tmp_path, fake_kite):
     data = tmp_path / "data"
     run(data)
-    day = data / "NIFTY_FnO_1min" / DAY
+    day = day_of(data / "NIFTY_FnO_1min", DAY)
     assert summary_by(day / "summary.csv")[("2026-10-13", "Current week")]["Bhav_traded_contracts"] == ""
     status, line, rows = bhav.run_bhav(RUN_DATE, str(data), bhav_file=day_bhav(tmp_path / "b.zip"), log=lambda m: None)
     assert (status, line) == ("diffs", "Bhavcopy check: CHECK (1 missing); liquid buckets: 1 missing, 0 diffs")
@@ -311,7 +313,7 @@ def test_check_writes_only_the_summary_files(tmp_path, fake_kite):
     data = tmp_path / "data"
     run(data)
     bhav.run_bhav(RUN_DATE, str(data), bhav_file=day_bhav(tmp_path / "b.zip"), log=lambda m: None)
-    out = data / "NIFTY_FnO_1min" / DAY / "bhavcopy"
+    out = day_of(data / "NIFTY_FnO_1min", DAY) / "bhavcopy"
     summary = dict_rows(out / bhav.SUMMARY_FILE)
     top = summary[0]
     assert (top["Expiry"], top["Date"], top["Status"], top["Missing"], top["Bhav_traded"]) == ("ALL", DAY, "CHECK", "1", "6")
@@ -345,7 +347,7 @@ def test_kite_run_saves_and_checks_the_bhavcopy(tmp_path, fake_kite, auto_bhav):
     auto_bhav["data"] = open(day_bhav(tmp_path / "b.zip"), "rb").read()
     data = tmp_path / "data"
     assert run(data) == "finished_failures"            # the bhavcopy never changes the download's status
-    out = data / "NIFTY_FnO_1min" / DAY / "bhavcopy"
+    out = day_of(data / "NIFTY_FnO_1min", DAY) / "bhavcopy"
     assert auto_bhav["fetched"] == [(RUN_DATE, bhav.CHECK_BUDGET)]
     assert (out / "BhavCopy_NSE_FO_0_0_0_20261012_F_0000.csv.zip").exists() and (out / "nifty_bhav.csv").exists()
     for name in ["bhav_compare.csv", bhav.SUMMARY_FILE, bhav.DAYS_SUMMARY_FILE]:
@@ -365,9 +367,9 @@ def test_kite_run_bhavcopy_not_published(tmp_path, fake_kite, auto_bhav):
     data = tmp_path / "data"
     assert run(data) == "finished_failures"
     root = data / "NIFTY_FnO_1min"
-    assert not (root / DAY / "bhavcopy" / "bhav_check.json").exists()
+    assert not (day_of(root, DAY) / "bhavcopy" / "bhav_check.json").exists()
     assert "2026-10-12: NSE has no F&O bhavcopy" in (root / "bhavcopy.log").read_text(encoding="utf-8")
-    assert "Bhavcopy for 2026-10-12 not saved" in (root / DAY / "run.log").read_text(encoding="utf-8")
+    assert "Bhavcopy for 2026-10-12 not saved" in (day_of(root, DAY) / "run.log").read_text(encoding="utf-8")
     assert "Bhavcopy: pending (NSE has no F&O bhavcopy" in JOB["message"]
     assert bhav.list_days(str(data))[0]["status"] == "pending"
 
@@ -390,7 +392,7 @@ def job_begin_fno(data):
 # --- CLI ----------------------------------------------------------------------------------------
 
 def make_day(root, d, checked=False):
-    day = root / "NIFTY_FnO_1min" / d
+    day = day_of(root / "NIFTY_FnO_1min", d)
     day.mkdir(parents=True)
     (day / "summary.csv").write_text("x")
     if checked:
@@ -468,7 +470,7 @@ def client(monkeypatch):
 
 def checked_day(root, d, status="ok", counts=None, units=None, rows=()):
     """A saved Kite day with a stored bhavcopy check (status None = pending)."""
-    day = root / "NIFTY_FnO_1min" / d
+    day = day_of(root / "NIFTY_FnO_1min", d)
     day.mkdir(parents=True, exist_ok=True)
     (day / "summary.csv").write_text("x")
     if status:
@@ -486,7 +488,7 @@ def test_list_days_latest_first(tmp_path):
     checked_day(tmp_path, "2026-10-07", "ok")
     checked_day(tmp_path, "2026-10-08", "diffs", {"missing": 1})
     checked_day(tmp_path, "2026-10-09", None)
-    (tmp_path / "NIFTY_FnO_1min" / "2026-10-10").mkdir()          # no summary.csv: not a saved day
+    (day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-10")).mkdir()          # no summary.csv: not a saved day
     days = bhav.list_days(str(tmp_path))
     assert [(d["date"], d["status"]) for d in days] == [("2026-10-09", "pending"), ("2026-10-08", "diffs"),
                                                         ("2026-10-07", "ok")]
@@ -522,7 +524,7 @@ def test_diff_rows(tmp_path, monkeypatch):
 def test_redownload_fixes_missing_contract(tmp_path, fake_kite):
     data = tmp_path / "data"
     run(data)
-    day = data / "NIFTY_FnO_1min" / DAY
+    day = day_of(data / "NIFTY_FnO_1min", DAY)
     os.remove(day / "options" / "NIFTY2510013OCT26CE.csv")        # lost: the bhavcopy says it traded
     status, line, _ = bhav.run_bhav(RUN_DATE, str(data), bhav_file=day_bhav(tmp_path / "b.zip"), log=lambda m: None)
     assert line == "Bhavcopy check: CHECK (2 missing); liquid buckets: 2 missing, 0 diffs"
@@ -717,7 +719,7 @@ def test_list_days_severity_and_banners(tmp_path):
     checked_day(tmp_path, "2026-10-07", "diffs")
     checked_day(tmp_path, "2026-10-08", "diffs", counts={"missing": 0, "volume_diffs": 0, "oi_diffs": 2, "liquid_missing": 0,
                                                          "liquid_diffs": 2, "liquid_volume_diffs": 0, "far_problems": 0})
-    path = tmp_path / "NIFTY_FnO_1min" / "2026-10-07" / "bhavcopy" / "bhav_check.json"
+    path = day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-07") / "bhavcopy" / "bhav_check.json"
     data = json.loads(path.read_text())
     data["severity"] = "far"                                               # name used by the previous version
     path.write_text(json.dumps(data))
@@ -745,7 +747,7 @@ def test_diff_rows_fills_bucket_for_old_checks(tmp_path, fake_kite):
     data = tmp_path / "data"
     run(data)
     bhav.run_bhav(RUN_DATE, str(data), bhav_file=day_bhav(tmp_path / "b.zip"), log=lambda m: None)
-    cmp = data / "NIFTY_FnO_1min" / DAY / "bhavcopy" / "bhav_compare.csv"
+    cmp = day_of(data / "NIFTY_FnO_1min", DAY) / "bhavcopy" / "bhav_compare.csv"
     old = [{k: v for k, v in r.items() if k != "Bucket"} for r in csv.DictReader(open(cmp, newline=""))]
     fno.write_csv(str(cmp), [c for c in bhav.COMPARE_COLUMNS if c != "Bucket"], old)   # as written before buckets
     rows, _ = bhav.diff_rows(str(data), "NIFTY", RUN_DATE)
@@ -757,6 +759,7 @@ def test_load_eod_for_backtests(tmp_path):
     src = tmp_path / "b.zip"
     src.write_bytes(zip_bytes([row("IDF", "2026-10-27", vol=3, oi=130000, last=22625, close=22612.6, settle=22612.6),
                                row("IDO", "2026-10-13", "25000.00", "CE", vol=2, oi=6500, last=10, close=10.5, settle=10.45)]))
+    (tmp_path / "data" / "NIFTY_FnO_1min" / DAY).mkdir(parents=True)
     bhav.run_bhav(RUN_DATE, str(tmp_path / "data"), bhav_file=str(src), log=lambda m: None)
     eod = load_eod(str(tmp_path / "data"), DAY).set_index("Contract")
     assert list(eod.columns) == ["Expiry", "Type", "Strike", "Close", "Last", "Settle", "OI", "Volume_contracts", "Lot"]
@@ -939,19 +942,19 @@ def test_export_days_summary(tmp_path, client):
 
 def test_check_saves_checked_days_summary(tmp_path, fake_kite):
     data = checked_fake_day(tmp_path)
-    out = data / "NIFTY_FnO_1min" / DAY / "bhavcopy" / bhav.DAYS_SUMMARY_FILE
+    out = day_of(data / "NIFTY_FnO_1min", DAY) / "bhavcopy" / bhav.DAYS_SUMMARY_FILE
     assert out.read_bytes() == bhav_export.export(str(data), "NIFTY", "days")[1]   # only one day checked
     assert read_csv(out)[0] == bhav_export.DAY_COLUMNS
     # with another checked day, the day's file still holds only its own row; the download lists both
     other = checked_day(data, "2026-10-09", "ok", counts={"missing": 0, "bhav_traded": 900})
-    bhav.check_saved(str(data / "NIFTY_FnO_1min" / DAY), RUN_DATE, log=lambda m: None)
+    bhav.check_saved(str(day_of(data / "NIFTY_FnO_1min", DAY)), RUN_DATE, log=lambda m: None)
     assert [r["Date"] for r in dict_rows(out)] == [DAY]
     assert len(bhav_export.days_rows(str(data), "NIFTY")) == 2
     assert not (other / "bhavcopy" / bhav.DAYS_SUMMARY_FILE).exists()
 
 
 def test_checked_days_summary_needs_a_saved_day(tmp_path):
-    day = tmp_path / "NIFTY_FnO_1min" / DAY      # contract files and a bhavcopy, but no summary.csv
+    day = day_of(tmp_path / "NIFTY_FnO_1min", DAY)      # contract files and a bhavcopy, but no summary.csv
     kite_file(str(day), "NIFTY27OCT26", [100.0])
     (day / "bhavcopy").mkdir()
     fno.write_csv(str(day / "bhavcopy" / "nifty_bhav.csv"), bhav.BHAV_HEADER, [row("IDF", "2026-10-27", vol=1, last=100)])
@@ -970,7 +973,7 @@ def test_export_unchecked_day_is_404(tmp_path, client, capsys):
     assert exported(client, tmp_path, date=DAY, scope="nope").status_code == 400
     assert nifty_bhav.main(["--export", DAY, "--folder", str(tmp_path)]) == 1
     assert "Not exported" in capsys.readouterr().err
-    assert not (tmp_path / "NIFTY_FnO_1min" / DAY / "bhavcopy").exists()
+    assert not (day_of(tmp_path / "NIFTY_FnO_1min", DAY) / "bhavcopy").exists()
 
 
 def test_export_changes_nothing_in_day_folder(tmp_path, client, fake_kite):
@@ -984,7 +987,7 @@ def test_export_changes_nothing_in_day_folder(tmp_path, client, fake_kite):
 
 def test_cli_export(tmp_path, capsys, fake_kite):
     data = checked_fake_day(tmp_path)
-    exports = data / "NIFTY_FnO_1min" / DAY / "bhavcopy" / "exports"
+    exports = day_of(data / "NIFTY_FnO_1min", DAY) / "bhavcopy" / "exports"
     assert nifty_bhav.main(["--export", DAY, "--folder", str(data)]) == 0
     assert capsys.readouterr().out.strip() == str(exports / "bhavcopy_check_2026-10-12.xlsx")
     assert nifty_bhav.main(["--export", DAY, "--csv", "--folder", str(data)]) == 0

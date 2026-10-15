@@ -14,6 +14,7 @@ from app import app
 from backfill import bhav, bhav_export, dhan_api, fno
 from backfill.job import JOB, JOB_LOCK
 from test_bhav import DAY, csv_bytes, kite_file, read_csv, row
+from conftest import day_of
 
 IST = fno.IST
 RUN_DATE = date(2026, 10, 12)
@@ -33,7 +34,7 @@ def no_network(monkeypatch):
 
 def dhan_day(root):
     """A saved Dhan day: the near future and one call; the bhavcopy also has a traded put (missing)."""
-    day = root / "NIFTY_FnO_1min_Dhan" / DAY
+    day = day_of(root / "NIFTY_FnO_1min_Dhan", DAY)
     kite_file(str(day), "NIFTY27OCT26", [22600.0], vol=150)
     kite_file(str(day), "NIFTY2500013OCT26CE", [10.0], vol=100)
     (day / "summary.csv").write_text("Expiry\n", encoding="utf-8")
@@ -52,7 +53,7 @@ def test_run_bhav_on_dhan_files(tmp_path):
     root = tmp_path / "data"
     dhan_day(root)
     status, line, _ = bhav.run_bhav(RUN_DATE, str(root), bhav_file=str(bhav_file(tmp_path)), log=lambda m: None, source="dhan")
-    out = root / "NIFTY_FnO_1min_Dhan" / DAY / "bhavcopy"
+    out = day_of(root / "NIFTY_FnO_1min_Dhan", DAY) / "bhavcopy"
     assert status == "diffs" and "1 missing" in line
     assert json.loads((out / "bhav_check.json").read_text())["counts"]["missing"] == 1
     assert {r[0] for r in read_csv(out / "bhav_compare.csv")[1:]} == {"NIFTY27OCT26", "NIFTY2500013OCT26CE", "NIFTY2500013OCT26PE"}
@@ -79,7 +80,7 @@ def test_exports_say_dhan(tmp_path):
     assert name == f"bhavcopy_check_{DAY}_dhan.xlsx" and data[:2] == b"PK"
     with pytest.raises(bhav.BhavError):   # the Kite folder has no check
         bhav_export.export(str(root), "NIFTY", "all", RUN_DATE)
-    saved = (root / "NIFTY_FnO_1min_Dhan" / DAY / "bhavcopy" / bhav.DAYS_SUMMARY_FILE).read_bytes()
+    saved = (day_of(root / "NIFTY_FnO_1min_Dhan", DAY) / "bhavcopy" / bhav.DAYS_SUMMARY_FILE).read_bytes()
     assert saved == bhav_export.export(str(root), "NIFTY", "days", source="dhan")[1]   # one checked day
     lines = saved.decode().splitlines()
     assert "Zero_volume_in_dhan" in lines[0] and len(lines) == 2 and lines[1].startswith(DAY)
@@ -148,11 +149,13 @@ def test_route_redownload_on_dhan(client, tmp_path, monkeypatch):
     monkeypatch.setattr(fno, "redownload_contract", fake)
     monkeypatch.setattr(bhav, "check_saved", lambda day_dir, *a, **kw: seen.update(day_dir=day_dir) or ("ok", "Bhavcopy check: OK", None))
     monkeypatch.setattr(dhan_api.DhanClient, "profile", lambda self: {"user_id": "1000000001", "data_plan": "Active"})
+    day = tmp_path / "NIFTY_FnO_1min_Dhan" / f"{DAY}_exp-2026-10-13_withZeroVol_dl-2026-10-12_1605"
+    day.mkdir(parents=True)
     j = c.post("/fno/redownload", data={"folder": str(tmp_path), "date": DAY, "contract": "NIFTY2500013OCT26PE",
                                        "source": "dhan"}).get_json()
     assert j["saved"] is True and j["line"] == "Bhavcopy check: OK"
     assert seen["source"] == "dhan" and isinstance(seen["kite"], dhan_api.DhanClient) and seen["token"] == DHAN_ENV["DHAN_ACCESS_TOKEN"]
-    assert seen["day_dir"] == os.path.join(str(tmp_path), "NIFTY_FnO_1min_Dhan", DAY)
+    assert seen["day_dir"] == str(day)                           # the new-style folder, found by its date
 
 
 def test_route_redownload_on_dhan_checks_token_and_plan(client, tmp_path, monkeypatch):

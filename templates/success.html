@@ -670,14 +670,17 @@
 
       <dl className="details">
         <div><dt>Candles</dt><dd>09:00 to 16:00 IST, every row ${B.name} returns. Contracts without candles get no file; see the switch below for zero-volume ones.</dd></div>
-        ${DHAN && html`<div><dt>Folder</dt><dd><code>${`${F.underlying}_FnO_1min_Dhan/<date>/`}</code>, separate from the Kite files</dd></div>
+        ${DHAN && html`<div><dt>Folder</dt><dd><code>${`${F.underlying}_FnO_1min_Dhan/<date>_exp-<expiry>_<withZeroVol|noZeroVol>_dl-<date>_<HHMM>/`}</code>, separate from the Kite files</dd></div>
           <div><dt>Contracts</dt><dd>Only those in ${X}'s bhavcopy for the day (traded or not) once it is published, usually in the evening; before that, all of Dhan's list.</dd></div>`}
-        ${!DHAN && html`<div><dt>Folder</dt><dd><code>${`${F.underlying}_FnO_1min/<date>/`}</code></dd></div>`}
+        ${!DHAN && html`<div><dt>Folder</dt><dd><code>${`${F.underlying}_FnO_1min/<date>_exp-<expiry>_<withZeroVol|noZeroVol>_dl-<date>_<HHMM>/`}</code></dd></div>`}
         <div><dt>Files</dt><dd><code>futures/${F.underlying}${ex[0]}.csv</code>, <code>options/${F.underlying}${ex[1]}.csv</code>, plus summary.csv and run.log</dd></div>
-        <div><dt>Bhavcopy</dt><dd>After each day, ${X}'s F&O bhavcopy and the check go into <code>${"<date>/bhavcopy/"}</code>: bhav_compare.csv,
+        <div><dt>Bhavcopy</dt><dd>After each day, ${X}'s F&O bhavcopy and the check go into <code>${"<day folder>/bhavcopy/"}</code>: bhav_compare.csv,
           bhav_summary.csv and checked_days_summary.csv.${" "}
           ${X} publishes it in the evening; until then the day stays pending (Check below).</dd></div>
         ${win && html`<div><dt>Week expiry</dt><dd>${weekdayDate(win.current_expiry)}</dd></div>`}
+        ${win && win.days && html`<div><dt>Saved days</dt><dd>${win.days.count
+          ? `${n(win.days.count)} (${long(parse(win.days.first))} to ${long(parse(win.days.last))}; ${n(win.days.with)} with zero volume, ${n(win.days.no)} without${win.days.old ? `, ${n(win.days.old)} old-style` : ""})`
+          : "None yet"}</dd></div>`}
       </dl>
 
       ${win && win.today_is_expiry && html`<div className="message warn">Today is expiry. Run after ${F.ready_at} or this contract's data is lost.</div>`}
@@ -862,12 +865,13 @@
           items=${[["All days summary (CSV)", { scope: "days" }]]} />
       </div>
       <div className="table-wrap sum bhav-days"><table>
-        <thead><tr><th>Date</th><th>Status</th><th title="Current week, next week, current month and next month">Liquid buckets</th><th className="num">Bhav traded</th><th className="num">${brand("Kite files")}</th><th className="num">Missing</th>
+        <thead><tr><th>Date</th><th>Expiry</th><th title="Keep contracts with candles but zero volume">Zero vol</th><th>Downloaded</th><th>Status</th><th title="Current week, next week, current month and next month">Liquid buckets</th><th className="num">Bhav traded</th><th className="num">${brand("Kite files")}</th><th className="num">Missing</th>
           <th className="num">Extra</th><th className="num">Volume diffs</th><th className="num">OI diffs</th><th className="num">Price diffs</th></tr></thead>
         <tbody>${days.map(d => html`<tr key=${d.date} className=${"day-" + sev(d) + (openDay === d.date ? " open" : "")}
               onClick=${() => d.status !== "pending" && setOpenDay(openDay === d.date ? "" : d.date)}
               title=${brand(d.status === "pending" ? d.line : `${d.line}. Click to see the differences.`)}>
-          <td>${long(parse(d.date))}</td>
+          <td title=${d.folder || ""}>${long(parse(d.date))}</td>
+          <td>${d.expiry ? long(parse(d.expiry)) : ""}</td><td>${{ with: "With", no: "No" }[d.zero_volume] || ""}</td><td>${d.downloaded || ""}</td>
           <td>${d.status === "pending"
             ? html`<button type="button" className="btn btn-ghost btn-sm" disabled=${running || checkingAll || !!busy} onClick=${e => { e.stopPropagation(); checkNow(d.date); }}>
                 ${busy === d.date ? html`<span className="spinner"></span>` : "Check now"}</button>`

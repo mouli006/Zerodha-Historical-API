@@ -86,7 +86,7 @@ def day_status(d):
 def day_row(data_root, underlying, d, source="kite"):
     """A list_days() entry in DAY_COLUMNS; counts an older check doesn't have stay blank."""
     counts = d["counts"]
-    day_dir = os.path.join(fno.fno_root(data_root, underlying, source), d["date"])
+    day_dir = os.path.join(fno.fno_root(data_root, underlying, source), d["folder"])
     return {"Date": d["date"], "Status": day_status(d),
             **{col: counts.get(key, "") for col, key in DAY_COUNTS.items()},
             "Toggle_keep_zero_volume": fno.saved_keep_zero(day_dir)}
@@ -103,8 +103,9 @@ def days_rows(data_root, underlying, source="kite"):
 
 def expiry_rows(data_root, underlying, run_date, contracts, source="kite"):
     """Per-expiry rows from summary.csv; Volume_diffs counted from the day's contract rows."""
-    path = os.path.join(fno.fno_root(data_root, underlying, source), run_date.isoformat(), "summary.csv")
-    if not os.path.exists(path):
+    day_dir = fno.day_dir(data_root, underlying, run_date, source)
+    path = os.path.join(day_dir, "summary.csv") if day_dir else ""
+    if not path or not os.path.exists(path):
         return []
     volume = {}
     for r in contracts:

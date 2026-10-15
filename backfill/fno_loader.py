@@ -14,22 +14,17 @@ fill_oi=False gives the raw values. The saved files are never changed.
 For end-of-day close, settlement price and final OI use load_eod, not the last minute bar."""
 import glob
 import os
-import re
 
 import pandas as pd
 
-from .fno import HEADER, fno_root
-
-DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+from .fno import HEADER, day_folders, find_day_dir, fno_root
 
 
 def day_dirs(data_root, underlying="NIFTY", source="kite"):
-    """Saved day folders, oldest first (source "dhan": the Dhan folder)."""
+    """Saved day folders (old <YYYY-MM-DD> and new <YYYY-MM-DD>_exp-..._dl-... names), oldest first
+    (source "dhan": the Dhan folder)."""
     root = fno_root(data_root, underlying, source)
-    if not os.path.isdir(root):
-        return []
-    return [os.path.join(root, d) for d in sorted(os.listdir(root))
-            if DAY_RE.match(d) and os.path.isdir(os.path.join(root, d))]
+    return [os.path.join(root, d) for _, d in sorted(day_folders(root).items())]
 
 
 def fill_oi(df):
@@ -64,8 +59,8 @@ def load_day(data_root, day, underlying="NIFTY", kind="all", fill_oi=True, sourc
     """Every contract file of one day; kind is "all", "futures" or "options". fill_oi: see the module notes.
     source "dhan" reads <UNDERLYING>_FnO_1min_Dhan/."""
     root = fno_root(data_root, underlying, source)
-    day_dir = os.path.join(root, str(day))
-    if not os.path.isdir(day_dir):
+    day_dir = find_day_dir(root, str(day))
+    if day_dir is None:
         raise FileNotFoundError(f"No saved {underlying} F&O day {day} in {root}")
     subs = ("futures", "options") if kind == "all" else (kind,)
     paths = sorted(p for sub in subs for p in glob.glob(os.path.join(day_dir, sub, "*.csv")))
@@ -91,8 +86,8 @@ def load_eod(data_root, day, underlying="NIFTY", source="kite"):
     volume in shares; it is divided by the lot here)."""
     from .bhav import SOURCES, saved_items   # bhav imports kiteconnect via fno; only needed here
     from .fno import exchange_name
-    day_dir = os.path.join(fno_root(data_root, underlying, source), str(day))
-    items = saved_items(day_dir, underlying)
+    day_dir = find_day_dir(fno_root(data_root, underlying, source), str(day))
+    items = saved_items(day_dir, underlying) if day_dir else None
     if items is None:
         flags = (f" --underlying {underlying}" if underlying != "NIFTY" else "") + (f" --source {source}" if source != "kite" else "")
         raise FileNotFoundError(f"No saved bhavcopy for {underlying} {day}; run python nifty_bhav.py {day}{flags} first.")

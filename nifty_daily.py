@@ -7,10 +7,17 @@ today works after 15:40 IST. After each day the NSE (NIFTY) or BSE (SENSEX) bhav
     python nifty_daily.py ... --source dhan    (from Dhan into <UNDERLYING>_FnO_1min_Dhan/, speed up to 5)
     python nifty_daily.py --inspect CONTRACT YYYY-MM-DD    (e.g. NIFTY2415013OCT26PE 2026-10-07)
     python nifty_daily.py --inspect-missing YYYY-MM-DD
+    python nifty_daily.py --rename-folders [--underlying NIFTY|SENSEX|all] [--source kite|dhan|all] [--apply]
+    python nifty_daily.py --update-day-count [--underlying NIFTY|SENSEX|all] [--source kite|dhan|all]
 
 --inspect prints Kite's raw candles for one contract (and the saved bhavcopy row); --inspect-missing
 does it for every MISSING_IN_KITE contract of the day's bhav_compare.csv and prints a table. Neither
 writes anything to the data folder.
+
+--rename-folders renames old <YYYY-MM-DD> day folders to
+<YYYY-MM-DD>_exp-<expiry>_<withZeroVol|noZeroVol>_dl-<YYYY-MM-DD>_<HHMM> (default every underlying and source).
+Without --apply it only prints old -> new; it takes the download lock. --update-day-count rewrites each root's
+_DAYS-<n>_<first>_to_<last>.txt and days_index.csv.
 
 Allowed dates run from the day after the previous expiry to today: on those days every contract
 is still live on Kite, so the download is complete. --missing downloads every such date without a
@@ -32,8 +39,10 @@ from kiteconnect import exceptions as kex
 from backfill.bhav_export import relabel
 from backfill.dhan_api import MAX_SPEED as DHAN_MAX_SPEED
 from backfill.dhan_api import DhanClient, data_plan_error, token_ok
-from backfill.fno import (BROKER, INSPECT_COLUMNS, UNDERLYINGS, LockBusy, acquire_lock, fno_root, inspect_contracts,
-                          job_fields, missing_in_kite, refetch_no_trade, run_daily, run_missing, table)
+from backfill.fno import (BROKER, FOLDERS, INSPECT_COLUMNS, UNDERLYINGS, DayFolderError, LockBusy, acquire_lock,
+                          day_dir, inspect_contracts, job_fields, missing_in_kite, refetch_no_trade, run_daily,
+                          run_missing, table)
+from backfill.fno_rename import rename_day_folders, update_day_counts
 from backfill.job import job_begin
 from backfill.storage import check_folder
 from config import data_dir, keep_zero_volume, load_env, weekly_expiry_weekday
@@ -59,15 +68,30 @@ def main(argv=None):
                        help="print Kite's raw candles for one contract on a date; writes nothing")
     which.add_argument("--inspect-missing", metavar="DATE",
                        help="--inspect every MISSING_IN_KITE contract of the day's bhavcopy check; writes nothing")
+    which.add_argument("--rename-folders", action="store_true",
+                       help="rename old <YYYY-MM-DD> day folders to the new name (dry run without --apply)")
+    which.add_argument("--update-day-count", action="store_true",
+                       help="rewrite each F&O root's _DAYS-*.txt marker and days_index.csv")
+    p.add_argument("--apply", action="store_true", help="with --rename-folders: rename (default: only print)")
     p.add_argument("--folder", help="save folder, default the dashboard's (KITE_DATA_DIR) or ./data")
     p.add_argument("--speed", type=float, default=2.5, help="requests per second, at most 3 (default 2.5)")
-    p.add_argument("--underlying", default="NIFTY", choices=sorted(UNDERLYINGS),
-                   help="NIFTY (NSE, default) or SENSEX (BSE)")
-    p.add_argument("--source", default="kite", choices=["kite", "dhan"],
-                   help="kite (default) or dhan: from your Dhan account into <UNDERLYING>_FnO_1min_Dhan/")
+    p.add_argument("--underlying", choices=sorted(UNDERLYINGS) + ["all"],
+                   help="NIFTY (NSE, default) or SENSEX (BSE); all only with --rename-folders / --update-day-count (their default)")
+    p.add_argument("--source", choices=sorted(FOLDERS) + ["all"],
+                   help="kite (default) or dhan: from your Dhan account into <UNDERLYING>_FnO_1min_Dhan/; "
+                        "all only with --rename-folders / --update-day-count (their default)")
     p.add_argument("--keep-zero-volume", action=argparse.BooleanOptionalAction, default=None,
                    help="keep contracts whose candles all have volume 0 (default from .env KEEP_ZERO_VOLUME / config.py)")
     args = p.parse_args(argv)
+    if args.rename_folders or args.update_day_count:
+        if args.apply and not args.rename_folders:
+            p.error("--apply goes with --rename-folders")
+        return rename(args)
+    if args.apply:
+        p.error("--apply goes with --rename-folders")
+    if "all" in (args.underlying, args.source):
+        p.error("--underlying all / --source all go with --rename-folders or --update-day-count only")
+    args.underlying, args.source = args.underlying or "NIFTY", args.source or "kite"
 
     run_date = None
     day = args.date or args.refetch_no_trade or (args.inspect[1] if args.inspect else args.inspect_missing)
@@ -157,7 +181,12 @@ def inspect(args, run_date):
     if args.inspect:
         names = [args.inspect[0].strip().upper()]
     else:
-        names = missing_in_kite(os.path.join(fno_root(folder, args.underlying, args.source), run_date.isoformat()))
+        try:
+            saved = day_dir(folder, args.underlying, run_date, args.source)
+        except DayFolderError as e:
+            print(f"Not run: {e}", file=sys.stderr)
+            return 1
+        names = missing_in_kite(saved) if saved else None
         if names is None:
             print(f"Not run: {run_date} has no bhav_compare.csv in {folder}; run the bhavcopy check first.",
                   file=sys.stderr)
@@ -182,6 +211,20 @@ def inspect(args, run_date):
             results[r["Result"]] = results.get(r["Result"], 0) + 1
         print("Results: " + ", ".join(f"{k} {v}" for k, v in sorted(results.items())))
     return 0
+
+
+def rename(args):
+    """--rename-folders (old -> new for every old-style day folder; renames only with --apply) and
+    --update-day-count."""
+    folder = os.path.normpath(os.path.expanduser((args.folder or data_dir()).strip()))
+    if not os.path.isdir(folder):
+        print(f"Not run: {folder} is not a folder.", file=sys.stderr)
+        return 1
+    underlyings = sorted(UNDERLYINGS) if args.underlying in (None, "all") else [args.underlying]
+    sources = sorted(FOLDERS) if args.source in (None, "all") else [args.source]
+    if args.update_day_count:
+        return update_day_counts(folder, underlyings, sources)
+    return rename_day_folders(folder, underlyings, sources, apply=args.apply)
 
 
 if __name__ == "__main__":

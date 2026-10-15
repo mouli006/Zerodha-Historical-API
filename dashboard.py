@@ -11,7 +11,7 @@ from kiteconnect import KiteConnect
 from kiteconnect import exceptions as kex
 
 import dhan
-from backfill import bhav, bhav_export, fno
+from backfill import bhav, bhav_export, fno, fno_days
 from backfill.dhan_api import DhanClient, data_plan_error, token_ok
 from backfill.fetch import INTERVALS, MAX_INDEX_RANGE_DAYS, MAX_RANGE_DAYS
 from backfill.instruments import INDEX_CHOICES
@@ -21,6 +21,12 @@ from backfill.storage import FILE_FORMATS, check_folder, job_run_key
 from config import DEFAULT_DATA_DIR, credentials, data_dir, keep_zero_volume, load_env, save_env, weekly_expiry_weekday
 
 bp = Blueprint("dashboard", __name__)
+
+
+@bp.errorhandler(fno.DayFolderError)
+def day_folder_error(e):
+    """Two folders for one trading day: every F&O route answers with the folders to fix."""
+    return jsonify({"error": str(e)})
 
 
 @bp.route("/success")
@@ -159,7 +165,8 @@ def download_fno_window():
     return jsonify({"min_date": w.min_date.isoformat(), "max_date": w.max_date.isoformat(),
                     "current_expiry": w.current_expiry.isoformat(), "previous_expiry": w.previous_expiry.isoformat(),
                     "estimated": w.estimated, "today_is_expiry": w.current_expiry == w.max_date,
-                    "missing": [d.isoformat() for d in fno.missing_dates(folder, underlying, w)]})
+                    "missing": [d.isoformat() for d in fno.missing_dates(folder, underlying, w)],
+                    "days": fno_days.day_summary(fno.fno_root(folder, underlying))})
 
 
 @bp.route("/download/fno-start", methods=["POST"])
@@ -215,8 +222,8 @@ def download_fno_start():
         err = fno.window_error(run_date, w) or fno.too_early(run_date)
         if err:
             return fail(err)
-        if refetch and not os.path.exists(os.path.join(fno.fno_root(folder, underlying), run_date.isoformat(),
-                                                       "summary.csv")):
+        saved = fno.day_dir(folder, underlying, run_date)
+        if refetch and not (saved and os.path.exists(os.path.join(saved, "summary.csv"))):
             return fail(f"{run_date} has not been downloaded in this folder yet; download the day first.")
     try:
         lock = fno.acquire_lock(folder, underlying, "dashboard")
@@ -441,7 +448,7 @@ def fno_redownload():
                                                  folder, contract, underlying, read_speed() or DEFAULT_SPEED,
                                                  keep_zero=request.values.get("keep_zero") == "1",
                                                  kite=client, source=source)
-        day_dir = os.path.join(fno.fno_root(folder, underlying, source), run_date.isoformat())
+        day_dir = fno.day_dir(folder, underlying, run_date, source)
         status, line, rows = bhav.check_saved(day_dir, run_date, underlying) if saved else ("", "", None)
         refresh_live_summary(folder, run_date, rows, source)
     except (bhav.BhavError, OSError) as e:

@@ -9,6 +9,7 @@ import nifty_daily
 from app import app
 from backfill import fno
 from backfill.job import JOB, JOB_LOCK
+from conftest import day_of
 
 AFTER = datetime(2026, 10, 12, 16, 0, tzinfo=fno.IST)
 BEFORE = datetime(2026, 10, 12, 15, 0, tzinfo=fno.IST)
@@ -66,7 +67,8 @@ def test_window_endpoint(client, tmp_path):
     j = client.get("/download/fno-window", query_string={"folder": str(tmp_path)}).get_json()
     assert j == {"min_date": "2026-10-10", "max_date": "2026-10-12", "current_expiry": "2026-10-13",
                  "previous_expiry": "2026-10-09", "estimated": False, "today_is_expiry": False,
-                 "missing": ["2026-10-10", "2026-10-11", "2026-10-12"]}
+                 "missing": ["2026-10-10", "2026-10-11", "2026-10-12"],
+                 "days": {"count": 0, "first": "", "last": "", "with": 0, "no": 0, "old": 0}}
 
 
 def test_window_endpoint_today_is_expiry(client, tmp_path, ist_now, monkeypatch):
@@ -364,7 +366,7 @@ def test_fno_refetch_needs_saved_day(client, tmp_path):
 
 
 def test_fno_refetch_runs(client, tmp_path, monkeypatch):
-    day = tmp_path / "NIFTY_FnO_1min" / "2026-10-12"
+    day = day_of(tmp_path / "NIFTY_FnO_1min", "2026-10-12")
     day.mkdir(parents=True)
     (day / "summary.csv").write_text("Expiry\n")
     seen = {}

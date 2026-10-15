@@ -88,7 +88,7 @@ Other rules:
 - At startup the job calls `kite.profile()` to check the access token. If the token is invalid, the job stops and the CLI exits with code 2.
 - The job fetches today's instrument list and keeps NIFTY FUT/CE/PE contracts with an expiry on or after the chosen date. Each contract is fetched for that date, 09:00 to 16:00 IST, with OI. Every row Kite returns is kept, including pre-open and post-close rows. Requests are throttled (2.5 requests/s by default, at most 3), and network errors and rate limits are retried up to 3 times.
 - A contract with no candles gets **no file** (counted as "No candles" in `run.log`).
-- Kite can report a contract that traded only once as candles with the right price and OI but volume 0 on every bar (it builds volume from changes in the day's cumulative volume). The switch **Keep contracts with candles but zero volume** (CLI `--keep-zero-volume` / `--no-keep-zero-volume`; default OFF, set `KEEP_ZERO_VOLUME=ON` in `.env` or `KEEP_ZERO_VOLUME` in `config.py` to change it) decides whether they get a file. Kept rows are saved exactly as Kite returns them. Either way they are listed in `<date>/zero_volume_contracts.csv` (`Contract, Candles, Last_close, Last_OI, Kept`), `run.log` shows "Zero-volume candles: kept N / skipped N", and the setting is recorded in `run.log` and in summary.csv's `Keep_zero_volume` column.
+- Kite can report a contract that traded only once as candles with the right price and OI but volume 0 on every bar (it builds volume from changes in the day's cumulative volume). The switch **Keep contracts with candles but zero volume** (CLI `--keep-zero-volume` / `--no-keep-zero-volume`; default OFF, set `KEEP_ZERO_VOLUME=ON` in `.env` or `KEEP_ZERO_VOLUME` in `config.py` to change it) decides whether they get a file. Kept rows are saved exactly as Kite returns them. Either way they are listed in `<day folder>/zero_volume_contracts.csv` (`Contract, Candles, Last_close, Last_OI, Kept`), `run.log` shows "Zero-volume candles: kept N / skipped N", and the setting is recorded in `run.log` and in summary.csv's `Keep_zero_volume` column.
 - **Re-check no-trade contracts for <date>** (switch ON, a saved day; CLI `python nifty_daily.py --refetch-no-trade YYYY-MM-DD`) requests every contract of that day without a file again, skipping those with a file, then re-runs the bhavcopy check if the bhavcopy is saved. Use it for days saved before the switch existed, while their contracts are still live.
 - If the nearest future has no candles, the job asks Kite for the spot index (NIFTY 50 / SENSEX). If the spot has candles, the market was open: the future just did not trade (this happens with BSE's thin SENSEX futures), so it is skipped like any other untraded contract and the day goes on. If the spot is empty too, the day is treated as a **market holiday** or weekend. The day is recorded in `<UNDERLYING>_FnO_1min/holidays.log`, the day folder is removed and the job exits cleanly. **Download all missing days** skips days already in that log.
 - A contract that fails, whether from a Kite error or an unexpected strike that can't be named, is marked failed and the run continues. Failed contracts are retried once at the end. Running a day again skips everything already saved, so you can re-run safely after a crash.
@@ -99,7 +99,9 @@ Other rules:
 <save folder>/NIFTY_FnO_1min/
     expiries_seen.csv      (every NIFTY expiry seen so far, with the date it was first seen)
     holidays.log
-    2026-10-12/
+    _DAYS-5_2026-10-07_to_2026-10-13.txt   (day count; the leading _ keeps it at the top in Explorer)
+    days_index.csv                         (the same list as a table)
+    2026-10-12_exp-2026-10-13_withZeroVol_dl-2026-10-13_2319/
         futures/NIFTY27OCT26.csv  NIFTY24NOV26.csv  NIFTY29DEC26.csv
         options/NIFTY2500013OCT26CE.csv  NIFTY1200029DEC26PE.csv  ...
         instruments_NFO.csv   (the raw Kite instrument list; instruments_NFO_fetched_<date>.csv
@@ -107,6 +109,45 @@ Other rules:
         summary.csv
         run.log
 ```
+#### Day folder names
+Each day folder is named `<trading day>_exp-<nearest option expiry>_<withZeroVol|noZeroVol>_dl-<download date>_<HHMM>`, for example:
+```
+NIFTY_FnO_1min/2026-10-12_exp-2026-10-13_withZeroVol_dl-2026-10-13_2319/futures/NIFTY27OCT26.csv
+NIFTY_FnO_1min_Dhan/2026-10-12_exp-2026-10-13_noZeroVol_dl-2026-10-14_0905/...
+SENSEX_FnO_1min/2026-10-15_exp-2026-10-15_withZeroVol_dl-2026-10-15_1812/...
+```
+- **Trading day** comes first, so folders still sort by date.
+- **exp** is the nearest option expiry on or after the trading day. It is taken from the run's full instrument list (Kite or Dhan; for Dhan, before the list is trimmed to the bhavcopy). On an expiry day it is the day itself, and NIFTY and SENSEX each use their own expiries. If the list has no option expiry on or after the day, the run stops and creates nothing.
+- **withZeroVol / noZeroVol** is the **Keep contracts with candles but zero volume** setting. Once any run with the setting ON has written the day, it is `withZeroVol`: a later OFF run never deletes those files. So a `noZeroVol` folder is renamed to `withZeroVol` at the end of an ON run, a **Re-check no-trade contracts** run, or a contract re-download with the setting ON. That is the only rename ever made, and an OFF run never renames a `withZeroVol` day. If Windows refuses the rename (the folder is open in Explorer), the job message says so and the next ON run tries again.
+- **dl** is when the folder was first created (IST, `YYYY-MM-DD_HHMM`; Windows does not allow colons). It never changes.
+- Resuming a day, **Download all missing days**, re-downloading a contract and the bhavcopy check find the folder by its date and reuse it. Each later run adds its start time and zero-volume setting to `run.log`.
+- Two folders for the same trading day stop every run and check with an error that lists them; keep one.
+- Holidays still create no day folder. The bhavcopy check refuses a day that was never downloaded ("download it first").
+
+#### Day count
+Each F&O root has one `_DAYS-<count>_<first day>_to_<last day>.txt` (`_DAYS-0.txt` when it is empty) and a `days_index.csv`. They are only for looking at; nothing reads them back, except the dashboard's "Saved days" line.
+- The .txt starts with a totals line, e.g. `5 days (withZeroVol 3, noZeroVol 2), 2026-10-07 to 2026-10-13, updated 2026-10-14 09:12 IST`, then one line per day.
+- Each day's line gives its folder, expiry, zero-volume setting, download time and the number of futures and option files.
+- `days_index.csv` has the same data (`Day, Folder, Expiry, Zero_volume, Downloaded, Futures_files, Option_files`).
+- Both are rewritten after a run that creates, renames or removes a day folder, after `--rename-folders --apply`, and by `python nifty_daily.py --update-day-count`. Old-style folders count too.
+- The count is not in the root folder's name: Windows can't rename a folder while the download lock file inside it is open.
+
+#### Older folders
+Days saved before this change are named just `YYYY-MM-DD`. Everything still reads them. To rename them:
+```
+python nifty_daily.py --rename-folders                 # dry run: prints old -> new, changes nothing
+python nifty_daily.py --rename-folders --apply         # renames (folders only; files inside are untouched)
+python nifty_daily.py --rename-folders --underlying NIFTY --source kite --folder D:\market_data
+python nifty_daily.py --update-day-count               # rewrite every root's _DAYS-*.txt and days_index.csv
+```
+Both commands work on every underlying and source unless you name one.
+- **exp** comes from the day's `summary.csv` ("Current week" row), else from `expiries_seen.csv`.
+- **Zero-volume setting**: `withZeroVol` if `summary.csv`'s `Keep_zero_volume` is ON, or `run.log` shows any run with it ON, or `zero_volume_contracts.csv` has a kept row. It is `noZeroVol` if `summary.csv` says OFF or `run.log` shows only OFF runs.
+- **dl** is the first run's start time in `run.log`, else the folder's creation time.
+- A folder whose expiry or zero-volume setting can't be told is skipped and listed. Each line says where every part came from.
+- It takes the same lock as downloads (the dry run too), so it refuses while a download runs.
+- With `--apply`, the first error stops it and lists what was already renamed. After a successful `--apply` it writes the day count.
+
 File names are built from each contract's expiry and strike, not from Kite's tradingsymbol:
 - Futures: `NIFTY{DD}{MON}{YY}`, for example `NIFTY27OCT26`
 - Options: `NIFTY{strike}{DD}{MON}{YY}{CE|PE}`, for example `NIFTY1200029DEC26PE`
@@ -136,7 +177,7 @@ The NSE F&O bhavcopy is the exchange's official end-of-day record of every contr
 python nifty_bhav.py 2026-10-09 --folder D:\market_data
 python nifty_bhav.py --missing --folder D:\market_data              # every saved day without a check yet
 python nifty_bhav.py 2026-10-09 --bhav-file C:\Downloads\BhavCopy_NSE_FO_0_0_0_20261009_F_0000.csv.zip
-python nifty_bhav.py --export 2026-10-07          # Excel report into <date>/bhavcopy/exports/
+python nifty_bhav.py --export 2026-10-07          # Excel report into <day folder>/bhavcopy/exports/
 python nifty_bhav.py --export 2026-10-07 --csv    # every contract as CSV
 python nifty_bhav.py --export-days                # one row per checked day, into NIFTY_FnO_1min/
 ```
@@ -148,7 +189,7 @@ The **Bhavcopy check** card under the F&O card lists every saved day in the F&O 
 - A missing contract that hasn't expired gets a **Re-download** button. It fetches just that contract for that day, then re-runs the comparison from the saved bhavcopy. This uses the same lock and rate limit, and needs the day's Kite sign-in.
 
 **Download** menus export what the check saved, without comparing again or changing any file:
-- Next to the day table, **All days summary (CSV)**: one row per checked day (`bhavcopy_check_all_days_<today>.csv`) with Date, Status, Liquid_missing, Liquid_diffs, Bhav_traded, Kite_files, Missing, Extra, Volume_diffs, Zero_volume_in_kite, OI_diffs, Price_diffs and Toggle_keep_zero_volume. Every check also saves the checked day's row by itself as `<date>/bhavcopy/checked_days_summary.csv` (that day only; the download is the list of all days).
+- Next to the day table, **All days summary (CSV)**: one row per checked day (`bhavcopy_check_all_days_<today>.csv`) with Date, Status, Liquid_missing, Liquid_diffs, Bhav_traded, Kite_files, Missing, Extra, Volume_diffs, Zero_volume_in_kite, OI_diffs, Price_diffs and Toggle_keep_zero_volume. Every check also saves the checked day's row by itself as `<day folder>/bhavcopy/checked_days_summary.csv` (that day only; the download is the list of all days).
 - Above a day's difference list: **This view (CSV)**, the rows shown for the chosen bucket in the same order (`bhavcopy_check_<date>_<bucket>.csv`, e.g. `_current_week`); **All contracts for this day (CSV)**, including OK ones (`_all_contracts.csv`); and **Full report (Excel)** (`bhavcopy_check_<date>.xlsx`) with sheets Summary (the day row and one row per expiry), Not OK, All contracts and Settlement (bhavcopy close, settlement price and OI per contract, for backtest P&L), each with a frozen header row, filters and fitted columns.
 
 Contract rows have Expiry and Bucket, and one value per column: Bhav_volume (contracts), Bhav_volume_shares, Kite_volume, Bhav_OI, Kite_OI, Bhav_last, Kite_last, Kite_regular_close (the 15:29 bar), Kite_last_bar_time, Bhav_close, Bhav_settle, Status and Status_note. Numbers are plain (`2036458500`, never `2,03,64,58,500`), dates are YYYY-MM-DD, and each CSV starts with its header, so Excel and `pandas.read_csv` read them directly. A day without a check gives an error instead of a file.
@@ -157,7 +198,7 @@ A red banner at the top of the dashboard appears if any of the last 10 saved day
 
 The file is downloaded from `https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_<YYYYMMDD>_F_0000.csv.zip`, with 3 tries. If NSE blocks the download (it sometimes does, especially from cloud servers), download the zip in a browser and pass it with `--bhav-file`. A zip or a CSV both work. A 404 means the file isn't published yet, or there was no trading that day. In that case only a line in `NIFTY_FnO_1min/bhavcopy.log` is written, and the exit code is 4.
 
-The check uses the same lock as the Kite download, so the two never run at the same time. It writes into `<date>/bhavcopy/`:
+The check uses the same lock as the Kite download, so the two never run at the same time. It writes into `<day folder>/bhavcopy/`:
 - the bhavcopy zip exactly as downloaded, and `nifty_bhav.csv` (the NIFTY index future and option rows, in NSE's columns)
 - `bhav_compare.csv`, one row per contract in the bhavcopy and per file on disk: `Contract, Expiry, Bucket, Type, Strike, Bhav_volume, Kite_volume, Bhav_OI, Kite_OI, Bhav_last, Kite_last, Kite_last_regular, Last_bar, Bhav_close, Bhav_settle, Status, Note`
 - `bhav_check.json` with the result, counts and units
@@ -213,9 +254,9 @@ python nifty_daily.py --missing --underlying SENSEX
 python nifty_bhav.py 2026-10-12 --underlying SENSEX
 ```
 
-- Files go to `<save folder>/SENSEX_FnO_1min/<date>/{futures,options}/` with names such as `SENSEX29OCT26.csv` and `SENSEX7470015OCT26CE.csv`, plus `instruments_BFO.csv`, `summary.csv` and `run.log`; the ATM strike is rounded to 100.
+- Files go to `<save folder>/SENSEX_FnO_1min/<day folder>/{futures,options}/` with names such as `SENSEX29OCT26.csv` and `SENSEX7470015OCT26CE.csv`, plus `instruments_BFO.csv`, `summary.csv` and `run.log`; the ATM strike is rounded to 100.
 - SENSEX's weekly expiry is Thursday. The date-window fallback uses `WEEKLY_EXPIRY_WEEKDAY_SENSEX` in `.env` (default `THU`); NIFTY uses `WEEKLY_EXPIRY_WEEKDAY_NIFTY` or the older `WEEKLY_EXPIRY_WEEKDAY` (default `TUE`).
-- The bhavcopy comes from `https://www.bseindia.com/download/Bhavcopy/Derivative/BhavCopy_BSE_FO_0_0_0_<YYYYMMDD>_F_0000.CSV`, a plain CSV with the same columns as NSE's. BSE answers a day it hasn't published with its web page instead of a 404; that counts as "not published yet" (pending, exit code 4). The CSV is saved as downloaded next to `sensex_bhav.csv` in `<date>/bhavcopy/`, with the same `bhav_compare.csv`, `bhav_check.json`, `bhav_summary.csv` and `checked_days_summary.csv`.
+- The bhavcopy comes from `https://www.bseindia.com/download/Bhavcopy/Derivative/BhavCopy_BSE_FO_0_0_0_<YYYYMMDD>_F_0000.CSV`, a plain CSV with the same columns as NSE's. BSE answers a day it hasn't published with its web page instead of a 404; that counts as "not published yet" (pending, exit code 4). The CSV is saved as downloaded next to `sensex_bhav.csv` in `<day folder>/bhavcopy/`, with the same `bhav_compare.csv`, `bhav_check.json`, `bhav_summary.csv` and `checked_days_summary.csv`.
 - BSE gives volume and OI both in shares (NSE gives volume in contracts); the units are detected per day as before. `load_eod(..., underlying="SENSEX")` still returns `Volume_contracts` (BSE volume divided by the lot).
 - CSV/Excel downloads of a SENSEX check end in `_sensex` (e.g. `bhavcopy_check_2026-10-12_sensex.xlsx`).
 - SENSEX is Kite only; the Dhan page stays NIFTY.
@@ -229,12 +270,12 @@ The **Dhan** tab on the sign-in page (`http://127.0.0.1:5000/dhan`) connects a D
 2. Open http://127.0.0.1:5000, click the **Dhan** tab, enter your Dhan Client ID, paste the token and click **Connect Dhan**. The app checks the token with Dhan (it must belong to that Client ID), saves it with its validity and opens the Dhan F&O page.
 3. Pick a date or a range (previous expiry + 1 to today, after 15:40 IST for today), a save folder and a speed (up to 5 requests/s, Dhan's limit), then **Download F&O**, or **Download all missing days**.
 
-Files go to `<save folder>/NIFTY_FnO_1min_Dhan/` or `SENSEX_FnO_1min_Dhan/`, then `<date>/{futures,options}/`, in the same CSV layout as the Kite files (plus `summary.csv`, `run.log`, `zero_volume_contracts.csv` and `instruments_NSE_FNO.csv` / `instruments_BSE_FNO.csv`), so Kite and Dhan data never overwrite each other. Dhan's instrument list also has far strikes the exchange did not list that day, so a Dhan run first gets the exchange's bhavcopy for the date (NSE for NIFTY, BSE for SENSEX; at most 30 seconds) and downloads only the contracts in it, traded or not; when it is not published yet or the exchange is slow, it downloads Dhan's full list (`run.log` says which). Running a day again skips saved contracts. Dhan tokens expire: paste a new one on the Dhan tab and start again.
+Files go to `<save folder>/NIFTY_FnO_1min_Dhan/` or `SENSEX_FnO_1min_Dhan/`, then `<day folder>/{futures,options}/`, in the same CSV layout as the Kite files (plus `summary.csv`, `run.log`, `zero_volume_contracts.csv` and `instruments_NSE_FNO.csv` / `instruments_BSE_FNO.csv`), so Kite and Dhan data never overwrite each other. Dhan's instrument list also has far strikes the exchange did not list that day, so a Dhan run first gets the exchange's bhavcopy for the date (NSE for NIFTY, BSE for SENSEX; at most 30 seconds) and downloads only the contracts in it, traded or not; when it is not published yet or the exchange is slow, it downloads Dhan's full list (`run.log` says which). Running a day again skips saved contracts. Dhan tokens expire: paste a new one on the Dhan tab and start again.
 
 The Dhan page has the same **Bhavcopy check** as the Kite dashboard (Check vs NSE / BSE bhavcopy, the checked-days table, differences per contract with the bucket filter, Re-download for live contracts, and the CSV/Excel downloads), working on the Dhan folder; its tables and files say Dhan instead of Kite (`Dhan_volume`, `MISSING_IN_DHAN`, file names ending `_dhan`). **Log out** (top right) removes the Dhan token from `.env`.
 
 Everything the Kite NIFTY and SENSEX F&O sections do works on Dhan too:
-- **Bhavcopy after every day:** each Dhan download (one day, a range or all missing days) saves the NSE (NIFTY) or BSE (SENSEX) bhavcopy into `<date>/bhavcopy/` and checks the day (`bhav_compare.csv`, `bhav_check.json`, `bhav_summary.csv`, `checked_days_summary.csv`). The download reuses the bhavcopy it fetched for the contract list. When the exchange hasn't published yet, the day stays pending and `<INDEX>_FnO_1min_Dhan/bhavcopy.log` says why.
+- **Bhavcopy after every day:** each Dhan download (one day, a range or all missing days) saves the NSE (NIFTY) or BSE (SENSEX) bhavcopy into `<day folder>/bhavcopy/` and checks the day (`bhav_compare.csv`, `bhav_check.json`, `bhav_summary.csv`, `checked_days_summary.csv`). The download reuses the bhavcopy it fetched for the contract list. When the exchange hasn't published yet, the day stays pending and `<INDEX>_FnO_1min_Dhan/bhavcopy.log` says why.
 - **Holiday check:** as on Kite, an untraded nearest future is checked against the index itself before a day is called a holiday.
 - **Re-check no-trade contracts for <date>** (switch ON, a saved Dhan day) requests every contract of that day without a file again, then re-checks the day.
 - **Command line:** add `--source dhan`, plus `--underlying SENSEX` for SENSEX (it uses the Dhan token saved by the Dhan tab and needs an active Data API plan; speed up to 5):

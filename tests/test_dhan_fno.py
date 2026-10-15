@@ -7,10 +7,12 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+import dashboard
 import dhan
 from app import app
 from backfill import bhav, dhan_api, fno
 from backfill.job import JOB, JOB_LOCK, STOP, job_begin
+from conftest import day_of
 
 IST = fno.IST
 TOKEN = "SECRET-DHAN-TOKEN"
@@ -79,7 +81,9 @@ def test_run_daily_on_dhan(tmp_path, dhan_http):
     st = fno.run_daily("", TOKEN, RUN_DATE, root, 1000, kite=dhan_api.DhanClient(TOKEN), user="1000000001",
                        log=lambda m: None, source="dhan")
     assert st == "finished"
-    day = tmp_path / "NIFTY_FnO_1min_Dhan" / "2026-10-12"
+    day = day_of(tmp_path / "NIFTY_FnO_1min_Dhan", "2026-10-12")
+    assert day.name == "2026-10-12_exp-2026-10-13_noZeroVol_dl-2026-10-12_1600"  # expiry from Dhan's list
+    assert JOB["out_dirs"] == [os.path.join("NIFTY_FnO_1min_Dhan", day.name)]
     assert os.listdir(day / "futures") == ["NIFTY27OCT26.csv"]
     assert os.listdir(day / "options") == ["NIFTY2510013OCT26CE.csv"]          # the PE had no data
     assert (day / "instruments_NSE_FNO.csv").exists() and (day / "summary.csv").exists()
@@ -121,6 +125,7 @@ def client(monkeypatch, tmp_path):
     env = {"DHAN_CLIENT_ID": "1000000001", "DHAN_ACCESS_TOKEN": TOKEN, "DHAN_TOKEN_EXPIRY": "2099-01-01T09:00:00"}
     calls = {"run": [], "env": env, "weekday": []}
     monkeypatch.setattr(dhan, "load_env", lambda: dict(env))
+    monkeypatch.setattr(dashboard, "load_env", lambda: dict(env))   # the /fno/* routes check the Dhan token too
     monkeypatch.setattr(dhan, "save_env", lambda updates: None)
     monkeypatch.setattr(dhan, "dhan_credentials", lambda: (env.get("DHAN_CLIENT_ID", ""), env.get("DHAN_ACCESS_TOKEN", "")))
     monkeypatch.setattr(dhan, "keep_zero_volume", lambda: False)
@@ -261,7 +266,7 @@ def test_weekly_and_monthly_with_the_same_dhan_symbol_get_their_own_files(tmp_pa
     assert job_begin(**fno.job_fields("NIFTY", RUN_DATE, root, 1000, source="dhan"))
     assert fno.run_daily("", TOKEN, RUN_DATE, root, 1000, kite=dhan_api.DhanClient(TOKEN), log=lambda m: None,
                          source="dhan") == "finished"
-    opt = tmp_path / "NIFTY_FnO_1min_Dhan" / "2026-10-12" / "options"
+    opt = day_of(tmp_path / "NIFTY_FnO_1min_Dhan", "2026-10-12") / "options"
     assert sorted(os.listdir(opt)) == ["NIFTY2500013OCT26CE.csv", "NIFTY2500019OCT26CE.csv", "NIFTY2500027OCT26CE.csv"]
     for name, close in (("13OCT26", "13"), ("19OCT26", "19"), ("27OCT26", "27")):
         rows = (opt / f"NIFTY25000{name}CE.csv").read_text(encoding="utf-8").splitlines()
@@ -305,7 +310,7 @@ def trim_run(tmp_path, monkeypatch):
     root = str(tmp_path)
     assert job_begin(**fno.job_fields("NIFTY", RUN_DATE, root, 1000, source="dhan"))
     st = fno.run_daily("", TOKEN, RUN_DATE, root, 1000, kite=dhan_api.DhanClient(TOKEN), log=lambda m: None, source="dhan")
-    day = tmp_path / "NIFTY_FnO_1min_Dhan" / "2026-10-12"
+    day = day_of(tmp_path / "NIFTY_FnO_1min_Dhan", "2026-10-12")
     return st, requested, day, (day / "run.log").read_text(encoding="utf-8")
 
 
@@ -335,7 +340,7 @@ def test_bhavcopy_timeout_downloads_the_full_list(tmp_path, monkeypatch):
 
 
 def test_saved_bhavcopy_is_used_without_network(tmp_path, monkeypatch, no_nse):
-    day = tmp_path / "NIFTY_FnO_1min_Dhan" / "2026-10-12" / "bhavcopy"
+    day = day_of(tmp_path / "NIFTY_FnO_1min_Dhan", "2026-10-12") / "bhavcopy"
     day.mkdir(parents=True)
     fno.write_csv(str(day / "nifty_bhav.csv"), bhav.BHAV_HEADER, bhav_rows())
     st, requested, _, log = trim_run(tmp_path, monkeypatch)

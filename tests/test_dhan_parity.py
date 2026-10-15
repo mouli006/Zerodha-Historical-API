@@ -14,12 +14,13 @@ from backfill.job import JOB, JOB_LOCK, job_begin
 from test_bhav import zip_bytes
 from test_dhan_fno import (RUN_DATE, TOKEN, TRIM_CSV, Resp, arrays, bhav_rows, client, error_of,  # noqa: F401
                            no_nse, trim_run, wait_for)
+from conftest import day_of
 
 DAY = RUN_DATE.isoformat()
 
 
 def dhan_day(root):
-    return root / "NIFTY_FnO_1min_Dhan" / DAY
+    return day_of(root / "NIFTY_FnO_1min_Dhan", DAY)
 
 
 # --- the bhavcopy check after every Dhan day ----------------------------------------------------
@@ -78,6 +79,9 @@ def test_refetch_no_trade_on_dhan(tmp_path, monkeypatch):
     st, _ = fno.refetch_no_trade("", TOKEN, RUN_DATE, str(tmp_path), 1000, log=lambda m: None,
                                  kite=dhan_api.DhanClient(TOKEN), user="1000000001", source="dhan")
     assert st == "finished" and requested == ["40002"]        # only the contract without a file
+    assert not day.exists() and "noZeroVol" in day.name      # an ON run renames the day to withZeroVol
+    day = dhan_day(tmp_path)
+    assert "withZeroVol" in day.name
     assert (day / "options" / "NIFTY2500013OCT26PE.csv").exists()
     assert not (tmp_path / "NIFTY_FnO_1min").exists()
 
@@ -212,8 +216,8 @@ def test_bhav_cli_dhan(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(nifty_bhav, "run_bhav", lambda d, folder, underlying, bhav_file, log=print, source="kite":
                         seen.append((d, source)) or ("ok", "", None))
     for d in ("2026-10-09", "2026-10-12"):
-        (tmp_path / "NIFTY_FnO_1min_Dhan" / d).mkdir(parents=True)
-        (tmp_path / "NIFTY_FnO_1min_Dhan" / d / "summary.csv").write_text("x")
+        (day_of(tmp_path / "NIFTY_FnO_1min_Dhan", d)).mkdir(parents=True)
+        (day_of(tmp_path / "NIFTY_FnO_1min_Dhan", d) / "summary.csv").write_text("x")
     assert nifty_bhav.main(["--missing", "--folder", str(tmp_path), "--source", "dhan"]) == 0
     assert seen == [(date(2026, 10, 9), "dhan"), (RUN_DATE, "dhan")]
     assert nifty_bhav.main(["--missing", "--folder", str(tmp_path)]) == 0     # Kite folder: nothing saved

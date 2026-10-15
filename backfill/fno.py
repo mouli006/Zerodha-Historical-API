@@ -1,15 +1,19 @@
 """Daily F&O download: 1-minute candles with OI for every live futures and options contract
 of one underlying (NIFTY on NFO, SENSEX on BFO), saved in the Accelpix file layout:
 
-    <save folder>/<UNDERLYING>_FnO_1min/<YYYY-MM-DD>/futures/NIFTY27OCT26.csv
+    <save folder>/<UNDERLYING>_FnO_1min/<day folder>/futures/NIFTY27OCT26.csv
                                                     /options/NIFTY2500013OCT26CE.csv
                                                     /instruments_NFO.csv, summary.csv, run.log
+
+The day folder is <YYYY-MM-DD>_exp-<nearest option expiry>_dl-<YYYY-MM-DD>_<HHMM> (when it was first created,
+IST), e.g. 2026-10-12_exp-2026-10-13_dl-2026-10-13_2319; older days are plain <YYYY-MM-DD> (see day_folders).
 
 Kite only serves live contracts. A day D can be downloaded completely only while every contract
 that existed on D is still live, i.e. for D after the most recent expiry (see date_window)."""
 import csv
 import math
 import os
+import re
 import shutil
 import time
 import glob
@@ -154,10 +158,13 @@ def read_expiries(data_root, underlying, source="kite"):
             return {date.fromisoformat(r["expiry"]): r["first_seen"] for r in csv.DictReader(f)}
     seen = {}
     for dump in sorted(glob.glob(os.path.join(base, "*", "instruments_*.csv"))):
+        parsed = parse_day_folder(os.path.basename(os.path.dirname(dump)))
+        if not parsed:
+            continue
         with open(dump, newline="", encoding="utf-8") as f:
             for r in csv.DictReader(f):
                 if r.get("name") == underlying and r.get("instrument_type") in TYPES and r.get("expiry"):
-                    seen.setdefault(as_date(r["expiry"]), os.path.basename(os.path.dirname(dump)))
+                    seen.setdefault(as_date(r["expiry"]), parsed[0].isoformat())
     return seen
 
 
@@ -206,7 +213,9 @@ def missing_dates(data_root, underlying, window, now=None, source="kite"):
         if d not in skip and not too_early(d, now):
             out.append(d)
         d += timedelta(days=1)
-    done = [d for d in out if os.path.exists(os.path.join(fno_root(data_root, underlying, source), d.isoformat(), "summary.csv"))]
+    root = fno_root(data_root, underlying, source)
+    folders = day_folders(root)
+    done = [d for d in out if d in folders and os.path.exists(os.path.join(root, folders[d], "summary.csv"))]
     if done:
         db = open_db(data_root)
         try:
@@ -586,6 +595,88 @@ def acquire_lock(data_root, underlying, owner, source="kite"):
     return RunLock(os.path.join(fno_root(data_root, underlying, source), ".lock")).acquire(owner)
 
 
+# --- day folders: <YYYY-MM-DD>_exp-<nearest option expiry>_<withZeroVol|noZeroVol>_dl-<YYYY-MM-DD>_<HHMM> ----------
+# dl is when the folder was first created (IST). Older days are plain <YYYY-MM-DD>. A day's folder is found
+# by its date; the only rename ever made is noZeroVol -> withZeroVol (mark_with_zero_volume).
+
+ZERO_PARTS = {True: "withZeroVol", False: "noZeroVol"}
+DAY_FOLDER_RE = re.compile(r"(\d{4}-\d{2}-\d{2})(?:_exp-(\d{4}-\d{2}-\d{2})_(withZeroVol|noZeroVol)"
+                           r"_dl-(\d{4}-\d{2}-\d{2})_(\d{2})(\d{2}))?")
+
+
+class DayFolderError(RuntimeError):
+    """A trading day has more than one folder in a root."""
+
+
+def day_folder_name(day, expiry, keep_zero, created_at):
+    """e.g. 2026-10-12_exp-2026-10-13_withZeroVol_dl-2026-10-13_2319; created_at is shown in IST."""
+    return f"{as_date(day)}_exp-{as_date(expiry)}_{ZERO_PARTS[bool(keep_zero)]}_dl-{to_ist(created_at):%Y-%m-%d_%H%M}"
+
+
+def parse_day_folder(name):
+    """(trading day, expiry, keep zero-volume True/False, download time IST) of a day folder name; all but
+    the day are None for an old-style <YYYY-MM-DD> name. None when the name is not a day folder."""
+    m = DAY_FOLDER_RE.fullmatch(name)
+    if not m:
+        return None
+    try:
+        day = date.fromisoformat(m.group(1))
+        if not m.group(2):
+            return day, None, None, None
+        created = datetime.strptime(f"{m.group(4)} {m.group(5)}{m.group(6)}", "%Y-%m-%d %H%M").replace(tzinfo=IST)
+        return day, date.fromisoformat(m.group(2)), m.group(3) == ZERO_PARTS[True], created
+    except ValueError:
+        return None
+
+
+def mark_with_zero_volume(day_dir):
+    """A noZeroVol day folder becomes withZeroVol once a run with keep zero-volume ON has written it (its
+    zero-volume files are never deleted later). Returns the folder's path from now on: the new one, or
+    day_dir unchanged for any other name. The caller holds the root's lock; files inside must be closed."""
+    parsed = parse_day_folder(os.path.basename(day_dir))
+    if not parsed or parsed[2] is not False:
+        return day_dir
+    new = os.path.join(os.path.dirname(day_dir), day_folder_name(parsed[0], parsed[1], True, parsed[3]))
+    os.rename(day_dir, new)
+    return new
+
+
+def day_folders(root):
+    """{trading day: folder name} for every day folder in root (old and new names). Creates nothing;
+    raises DayFolderError when a day has two folders."""
+    if not os.path.isdir(root):
+        return {}
+    found = {}
+    for n in sorted(os.listdir(root)):
+        parsed = parse_day_folder(n)
+        if parsed and os.path.isdir(os.path.join(root, n)):
+            found.setdefault(parsed[0], []).append(n)
+    dups = {d: ns for d, ns in found.items() if len(ns) > 1}
+    if dups:
+        raise DayFolderError(f"More than one folder for the same trading day in {root}: " +
+                             "; ".join(", ".join(ns) for _, ns in sorted(dups.items())) +
+                             ". Keep one per day (move or merge the others) and run again.")
+    return {d: ns[0] for d, ns in found.items()}
+
+
+def find_day_dir(root, day):
+    """Full path of the existing folder for day in root, or None. Raises DayFolderError on duplicates."""
+    name = day_folders(root).get(as_date(day))
+    return os.path.join(root, name) if name else None
+
+
+def day_dir(data_root, underlying, run_date, source="kite"):
+    """The saved folder of run_date for this underlying and source, or None."""
+    return find_day_dir(fno_root(data_root, underlying, source), run_date)
+
+
+def nearest_option_expiry(instruments, underlying, run_date):
+    """Earliest CE/PE expiry on or after run_date in the instrument list, or None."""
+    exp = [as_date(i["expiry"]) for i in instruments if i.get("name") == underlying
+           and i.get("instrument_type") in ("CE", "PE") and i.get("expiry") and as_date(i["expiry"]) >= run_date]
+    return min(exp) if exp else None
+
+
 def exchange_of(underlying, source="kite"):
     """Kite's exchange (NFO / BFO), or on Dhan its segment (NSE_FNO / BSE_FNO)."""
     exch = UNDERLYINGS[underlying][0]
@@ -783,12 +874,23 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
     if msg:
         return stop_with(echo, "outside_window", msg)
 
-    job_update(run=run, fno_date=run_date.isoformat(), fno_summary=[], fno_futures=[],
-               out_dirs=[os.path.join(fno_folder(underlying, source), run_date.isoformat())])
+    # The day's folder: the existing one (any name), else a new one named with the nearest option expiry
+    # in this run's full instrument list (before the Dhan trim), the zero-volume setting and the time
     today = today_ist()
     base = fno_root(data_root, underlying, source)
-    day = os.path.join(base, run_date.isoformat())
-    created = not os.path.isdir(day)
+    try:
+        day = find_day_dir(base, run_date)
+    except DayFolderError as e:
+        return stop_with(echo, "error", str(e))
+    created = day is None
+    if created:
+        expiry = nearest_option_expiry(instruments, underlying, run_date)
+        if expiry is None:
+            return stop_with(echo, "error", f"No {underlying} option expiry on or after {run_date} in the "
+                                            f"{BROKER[source]} instrument list; nothing was saved.")
+        day = os.path.join(base, day_folder_name(run_date, expiry, keep_zero, now_ist()))
+    job_update(run=run, fno_date=run_date.isoformat(), fno_summary=[], fno_futures=[],
+               out_dirs=[os.path.join(fno_folder(underlying, source), os.path.basename(day))])
     for sub in ("futures", "options"):
         os.makedirs(os.path.join(day, sub), exist_ok=True)
     db = open_db(data_root)
@@ -1065,6 +1167,38 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
     finally:
         db.close()
         rlog.close()
+        finish_day_folder(day, base, created, keep_zero, echo, underlying, source)
+
+
+def finish_day_folder(day, base, created, keep_zero, echo, underlying, source, report=True):
+    """After a run (files closed): a noZeroVol folder written with keep zero-volume ON becomes withZeroVol,
+    and the root's day count is rewritten when a folder was created (or removed again on a holiday) or
+    renamed. A failed rename (e.g. the folder open in Explorer) is reported; the next ON run tries again.
+    Returns the day folder's path from now on."""
+    renamed = False
+    if keep_zero and os.path.isdir(day):
+        try:
+            new = mark_with_zero_volume(day)
+        except OSError as e:
+            msg = (f"Could not rename {os.path.basename(day)} to withZeroVol ({e}); close it in Explorer. "
+                   f"The next run with keep zero-volume ON renames it.")
+            echo(msg)
+            if report:
+                with JOB_LOCK:
+                    JOB["message"] = f"{JOB['message']} {msg}".strip()
+        else:
+            renamed, day = new != day, new
+            if renamed:
+                echo(f"Day folder renamed to {os.path.basename(day)}")
+                if report:
+                    job_update(out_dirs=[os.path.join(fno_folder(underlying, source), os.path.basename(day))])
+    if created or renamed:
+        from . import fno_days   # fno_days imports this module
+        try:
+            fno_days.write_day_count(base)
+        except (OSError, DayFolderError) as e:
+            echo(f"Day count not updated: {e}")
+    return day
 
 
 def spot_traded(kite, limiter, underlying, source, start, end):
@@ -1214,8 +1348,8 @@ def inspect_contracts(api_key, access_token, run_date, data_root, names, underly
             return status, []
     instruments = kite.instruments(UNDERLYINGS[underlying][0])
     found = find_contracts(instruments, names, underlying)
-    day_dir = os.path.join(fno_root(data_root, underlying, source), run_date.isoformat())
-    items = bhav.saved_items(day_dir, underlying) if os.path.isdir(day_dir) else None
+    folder = day_dir(data_root, underlying, run_date, source)
+    items = bhav.saved_items(folder, underlying) if folder else None
     bhav_of = {i["name"]: i for i in items or []}
     start, end = datetime.combine(run_date, WINDOW[0]), datetime.combine(run_date, WINDOW[1])
     limiter, out = RateLimiter(speed), []
@@ -1265,12 +1399,13 @@ def refetch_no_trade(api_key, access_token, run_date, data_root, speed, underlyi
     (kite = a DhanClient) works on the Dhan folder.
     Returns (run_daily status or "not_downloaded", bhavcopy line or "")."""
     from . import bhav   # bhav imports this module
-    day = os.path.join(fno_root(data_root, underlying, source), run_date.isoformat())
-    if not os.path.exists(os.path.join(day, "summary.csv")):
+    day = day_dir(data_root, underlying, run_date, source)
+    if not day or not os.path.exists(os.path.join(day, "summary.csv")):
         return stop_with(lambda m: log(f"[{run_key(underlying, run_date, source)}] {m}"), "not_downloaded",
                          f"{run_date} has not been downloaded in this folder yet; download the day first."), ""
     status = run_daily(api_key, access_token, run_date, data_root, speed, underlying, log, weekday,
                        kite=kite, user=user, keep_zero=True, refetch=True, source=source)
+    day = day_dir(data_root, underlying, run_date, source)   # the run may have renamed it to withZeroVol
     if not status.startswith("finished") or bhav.saved_items(day, underlying) is None:
         return status, ""
     _, line, rows = bhav.check_saved(day, run_date, underlying, log=log)
@@ -1287,8 +1422,8 @@ def redownload_contract(api_key, access_token, run_date, data_root, contract, un
     bhavcopy check found missing. Only while Kite (or Dhan, source="dhan" with kite=DhanClient) still
     serves it (expiry today or later). The caller holds the lock. Returns (saved, message)."""
     broker = BROKER[source]
-    day_dir = os.path.join(fno_root(data_root, underlying, source), run_date.isoformat())
-    dumps = sorted(glob.glob(os.path.join(day_dir, "instruments_*.csv")))
+    folder = day_dir(data_root, underlying, run_date, source)
+    dumps = sorted(glob.glob(os.path.join(folder, "instruments_*.csv"))) if folder else []
     if not dumps:
         return False, f"{run_date} has no saved instrument list; download the day first."
     with open(dumps[0], newline="", encoding="utf-8") as f:
@@ -1297,7 +1432,7 @@ def redownload_contract(api_key, access_token, run_date, data_root, contract, un
     found = None
     for c in contracts:
         try:
-            name, path = contract_file(day_dir, c, underlying)
+            name, path = contract_file(folder, c, underlying)
         except ValueError:
             continue
         if name == contract:
@@ -1315,6 +1450,10 @@ def redownload_contract(api_key, access_token, run_date, data_root, contract, un
             return False, msg
     if hasattr(kite, "learn"):   # DhanClient: instrument type per id from the saved list
         kite.learn(saved_list)
+    from . import bhav   # bhav imports this module
+    bhav.log_line(os.path.join(folder, "run.log"),
+                  f"=== Re-download of {contract} for {run_date} ({broker}), started {now_ist():%Y-%m-%d %H:%M:%S} IST, "
+                  f"keep zero-volume contracts {on_off(keep_zero)}")
     start, end = datetime.combine(run_date, WINDOW[0]), datetime.combine(run_date, WINDOW[1])
     token = c["instrument_token"] if source == "dhan" else int(c["instrument_token"])
     try:
@@ -1326,7 +1465,7 @@ def redownload_contract(api_key, access_token, run_date, data_root, contract, un
     zero = bool(candles) and candle_volume(candles) == 0
     reason = None if bars else ZERO_VOLUME if zero else NO_CANDLES
     if zero:
-        write_zero_volume(day_dir, {contract: {"Contract": contract, **zero_volume_info(candles),
+        write_zero_volume(folder, {contract: {"Contract": contract, **zero_volume_info(candles),
                                                "Kept": "Y" if bars else "N"}})
     db = open_db(data_root)
     try:
@@ -1339,6 +1478,8 @@ def redownload_contract(api_key, access_token, run_date, data_root, contract, un
         db.commit()
     finally:
         db.close()
+    if keep_zero:   # noZeroVol -> withZeroVol, as after a run with the setting ON
+        finish_day_folder(folder, os.path.dirname(folder), False, True, echo, underlying, source, report=False)
     if bars:
         msg = f"{contract}: saved {bars} bars for {run_date}" + (" (all with volume 0)." if zero else ".")
     elif zero:

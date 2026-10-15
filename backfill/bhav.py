@@ -373,7 +373,9 @@ def bhav_summary(rows, expiry_of):
 # --- files of a day -----------------------------------------------------------------------------
 
 def bhav_dir(data_root, underlying, run_date, source="kite"):
-    return os.path.join(fno.fno_root(data_root, underlying, source), run_date.isoformat(), "bhavcopy")
+    """<day folder>/bhavcopy of run_date, or None when the day has no folder."""
+    day = fno.day_dir(data_root, underlying, run_date, source)
+    return os.path.join(day, "bhavcopy") if day else None
 
 
 def saved_items(day_dir, underlying):
@@ -386,8 +388,9 @@ def saved_items(day_dir, underlying):
 
 
 def read_check(data_root, underlying, run_date, source="kite"):
-    path = os.path.join(bhav_dir(data_root, underlying, run_date, source), "bhav_check.json")
-    if not os.path.exists(path):
+    out = bhav_dir(data_root, underlying, run_date, source)
+    path = os.path.join(out, "bhav_check.json") if out else ""
+    if not path or not os.path.exists(path):
         return None
     with open(path, encoding="utf-8") as f:
         return json.load(f)
@@ -396,14 +399,8 @@ def read_check(data_root, underlying, run_date, source="kite"):
 def unchecked_days(data_root, underlying="NIFTY", source="kite"):
     """Saved days (summary.csv present) without a bhavcopy check, oldest first."""
     root = fno.fno_root(data_root, underlying, source)
-    if not os.path.isdir(root):
-        return []
     out = []
-    for d in sorted(os.listdir(root)):
-        try:
-            day = date.fromisoformat(d)
-        except ValueError:
-            continue
+    for day, d in sorted(fno.day_folders(root).items()):
         if (os.path.exists(os.path.join(root, d, "summary.csv"))
                 and not os.path.exists(os.path.join(root, d, "bhavcopy", "bhav_check.json"))):
             out.append(day)
@@ -442,7 +439,9 @@ def run_bhav(run_date, data_root, underlying="NIFTY", bhav_file=None, log=print,
     if not mine:
         raise BhavError(f"No {underlying} index futures or options in this bhavcopy.")
 
-    day_dir = os.path.join(root, run_date.isoformat())
+    day_dir = fno.find_day_dir(root, run_date)
+    if day_dir is None:
+        raise BhavError(f"{run_date} has not been downloaded in this folder yet; download it first.")
     out = os.path.join(day_dir, "bhavcopy")
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, original), "wb") as f:
@@ -522,7 +521,7 @@ def write_days_summary(day_dir, underlying="NIFTY"):
     source = "dhan" if os.path.basename(root).endswith(fno.FOLDERS["dhan"]) else "kite"
     data_root = os.path.dirname(root)
     rows = [day_row(data_root, underlying, d, source) for d in list_days(data_root, underlying, source)
-            if d["date"] == os.path.basename(day_dir) and d["status"] != "pending"]
+            if d["folder"] == os.path.basename(day_dir) and d["status"] != "pending"]
     if not rows:
         return
     columns, rows = relabel(DAY_COLUMNS, rows, source)
@@ -571,18 +570,20 @@ def list_days(data_root, underlying="NIFTY", source="kite"):
     """Every saved day (summary.csv present), latest first, with its bhavcopy check or pending.
     Creates nothing on disk."""
     root = fno.fno_root(data_root, underlying, source)
-    if not os.path.isdir(root):
-        return []
     out = []
-    for d in sorted(os.listdir(root), reverse=True):
-        try:
-            day = date.fromisoformat(d)
-        except ValueError:
-            continue
+    for day, d in sorted(fno.day_folders(root).items(), reverse=True):
         if not os.path.exists(os.path.join(root, d, "summary.csv")):
             continue
-        check = read_check(data_root, underlying, day, source)
-        out.append({"date": d, "status": check["status"] if check else "pending",
+        path = os.path.join(root, d, "bhavcopy", "bhav_check.json")
+        check = None
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as f:
+                check = json.load(f)
+        _, expiry, zero, created = fno.parse_day_folder(d)
+        out.append({"date": day.isoformat(), "folder": d, "expiry": expiry.isoformat() if expiry else "",
+                    "zero_volume": {True: "with", False: "no"}.get(zero, ""),
+                    "downloaded": f"{created:%Y-%m-%d %H:%M}" if created else "",
+                    "status": check["status"] if check else "pending",
                     "severity": day_severity(check) if check else "",
                     "line": check["line"] if check else PENDING,
                     "counts": check.get("counts", {}) if check else {},
@@ -617,7 +618,8 @@ def compare_rows(data_root, underlying, run_date, source="kite"):
     """(every row of the day's saved bhav_compare.csv, check). Reads only; a file saved before buckets
     existed is compared again in memory. Raises BhavError if the day has not been checked."""
     check = read_check(data_root, underlying, run_date, source)
-    path = os.path.join(bhav_dir(data_root, underlying, run_date, source), "bhav_compare.csv")
+    out = bhav_dir(data_root, underlying, run_date, source)
+    path = os.path.join(out, "bhav_compare.csv") if out else ""
     if not check or not os.path.exists(path):
         raise BhavError(f"{run_date} has not been checked against the bhavcopy yet.")
     with open(path, newline="", encoding="utf-8") as f:
