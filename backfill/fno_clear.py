@@ -113,8 +113,9 @@ def plan_clear(underlying, sources, variants, backtest, env):
     return {"roots": roots, "dbs": [d for d in db_list if d["rows"]], "backtest": bt}
 
 
-def window_lines(underlying, roots, today=None):
-    """(lines, lost days): which cleared days can still be downloaded, from the saved expiry history (no login)."""
+def window_lines(underlying, roots, today=None, also=(), also_label="Correct data"):
+    """(lines, lost days): which cleared days can still be downloaded, from the saved expiry history (no login).
+    also: days that exist elsewhere too (fno_store.py import: the days being copied in), marked in the lost list."""
     days = sorted({d for r in roots for d in r["days"]})
     if not days:
         return [], []
@@ -135,8 +136,13 @@ def window_lines(underlying, roots, today=None):
     ok = [d for d in days if d not in lost]
     lines.append("Can be downloaded again: " + (", ".join(map(str, ok)) or "none") + ".")
     if lost:
-        lines.append("Cannot be downloaded again (outside the window): " + ", ".join(map(str, lost))
-                     + " - they will exist only in the archive.")
+        if also:
+            lines.append("Cannot be downloaded again (outside the window): "
+                         + ", ".join(f"{d} (also in {also_label})" if d in also else f"{d} (archive only)" for d in lost)
+                         + f" - they will exist only in the archive" + (f" and in {also_label}" if any(d in also for d in lost) else "") + ".")
+        else:
+            lines.append("Cannot be downloaded again (outside the window): " + ", ".join(map(str, lost))
+                         + " - they will exist only in the archive.")
     return lines, lost
 
 
@@ -288,11 +294,12 @@ def clear(underlying, sources, variants, env, backtest=True, archive_to=None, ap
             lock.release()
 
 
-def run_clear(scope, underlying, env, home, archive, apply, delete, yes, command, log, ask, interactive):
+def run_clear(scope, underlying, env, home, archive, apply, delete, yes, command, log, ask, interactive, label="Clear",
+              also=(), dry_tail=True):
     target = (lambda p: os.path.join(archive, rel_to(p, home))) if archive else (lambda p: "(deleted)")
     items = [(p, "item") for r in scope["roots"] for p in r["items"]] + [(p, "backtest") for p in scope["backtest"]]
     verb = "delete" if delete else "archive"
-    log(f"== Clear {underlying} F&O data ({'DELETE, no archive' if delete else f'archive: {archive}'})")
+    log(f"== {label} {underlying} F&O data ({'DELETE, no archive' if delete else f'archive: {archive}'})")
     for r in scope["roots"]:
         log(f"{r['root']}:")
         for p in r["items"]:
@@ -305,7 +312,7 @@ def run_clear(scope, underlying, env, home, archive, apply, delete, yes, command
         log(f"backtest: {verb} {p}" + ("" if delete else f" -> {target(p)}"))
     if scope["backtest"]:
         log("  (the backtest folders hold every broker; the next publish rebuilds them from the raw data that is left)")
-    window, lost = window_lines(underlying, scope["roots"])
+    window, lost = window_lines(underlying, scope["roots"], also=also)
     for line in window:
         log(line)
     n_rows = sum(d["rows"] for d in scope["dbs"])
@@ -314,7 +321,8 @@ def run_clear(scope, underlying, env, home, archive, apply, delete, yes, command
         log("Nothing to clear.")
         return 0
     if not apply:
-        log("Dry run: nothing changed. Run again with --apply to " + verb + ".")
+        if dry_tail:
+            log("Dry run: nothing changed. Run again with --apply to " + verb + ".")
         return 0
     if lost and not yes:
         if not interactive():

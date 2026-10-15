@@ -10,6 +10,7 @@
     python fno_store.py clear --underlying NIFTY|SENSEX [--source kite|dhan|all] [--variant with|without|all]
                               [--no-backtest] [--archive-to PATH] [--apply] [--delete] [--yes]
     python fno_store.py restore --from "<archive folder>" [--apply]
+    python fno_store.py import --from "<prepared folder>" --underlying NIFTY|SENSEX [--apply] [--yes]
     python fno_store.py publish [--raw-kite PATH] [--raw-dhan PATH] [--out PATH] [--variant with|without|both]
                                 [--underlying NIFTY|SENSEX|all] [--from YYYY-MM-DD] [--to YYYY-MM-DD]
                                 [--prefer kite|dhan] [--force] [--prune] [--prune-old-layout]
@@ -30,6 +31,10 @@ clear (backfill/fno_clear.py) moves one underlying's day folders, day counts, pr
 it says which cleared days can no longer be downloaded. restore puts an archive back. Both are dry runs without
 --apply; clear --apply --delete deletes instead (typed confirmation).
 
+import (backfill/fno_import.py) replaces one underlying's live data with a prepared copy (kite*/dhan* folders holding
+"with zero volume" / "without zero volume" save folders): it checks and compares every day, archives the live data
+like clear, copies the days in (checked), writes their progress rows and publishes. Dry run without --apply.
+
 publish (backfill/fno_publish.py) builds <out>/<with_zero_volume|without_zero_volume>/<UNDERLYING>/ from the raw
 stores: one Parquet file per day and source, the EOD bhavcopy, contracts.parquet, expiries.csv, days.csv. Only
 new or changed days are rebuilt (--force: all); raw is never written. Read the store with backfill/fno_backtest.py.
@@ -43,6 +48,7 @@ from datetime import date
 from backfill.fno import UNDERLYINGS
 from backfill.fno_clear import clear, restore
 from backfill.fno_derive import compare_variants, derive_without
+from backfill.fno_import import import_data
 from backfill.fno_publish import publish_variants
 from backfill.fno_store import move_raw, split_stores
 from config import FNO_RAW_KEYS, VARIANTS, fno_backtest_dir, fno_raw_dir, load_env
@@ -106,6 +112,12 @@ def main(argv=None):
     r = sub.add_parser("restore", help="put a clear's archive back (dry run)")
     r.add_argument("--from", dest="archive", required=True, metavar="PATH", help="the archive folder clear wrote")
     r.add_argument("--apply", action="store_true", help="restore (default: only print)")
+    i = sub.add_parser("import", help="replace one underlying's data with a prepared copy (dry run)")
+    i.add_argument("--from", dest="src", required=True, metavar="PATH",
+                   help="folder holding kite* / dhan* folders with 'with zero volume' / 'without zero volume' inside")
+    i.add_argument("--underlying", choices=sorted(UNDERLYINGS), required=True, help="no default: name it")
+    i.add_argument("--apply", action="store_true", help="archive the live data and copy (default: only print)")
+    i.add_argument("--yes", action="store_true", help="don't ask when archived days can't be downloaded again")
     b = sub.add_parser("publish", help="build the backtest store from the raw folders")
     b.add_argument("--raw-kite", help="Kite raw base folder (default .env FNO_RAW_KITE)")
     b.add_argument("--raw-dhan", help="Dhan raw base folder (default .env FNO_RAW_DHAN)")
@@ -133,6 +145,9 @@ def main(argv=None):
         variants = sorted(VARIANTS) if args.variant == "all" else [args.variant]
         return clear(args.underlying, sources, variants, env, backtest=not args.no_backtest, archive_to=args.archive_to,
                      apply=args.apply, delete=args.delete, yes=args.yes, command=" ".join(["python fno_store.py", *(argv or sys.argv[1:])]))
+    if args.cmd == "import":
+        return import_data(args.src, args.underlying, env, apply=args.apply, yes=args.yes,
+                           command=" ".join(["python fno_store.py", *(argv or sys.argv[1:])]))
     if args.cmd == "restore":
         return restore(args.archive, apply=args.apply)
     if args.cmd == "split-stores":

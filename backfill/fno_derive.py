@@ -164,11 +164,12 @@ def copy_progress(with_data_root, without_data_root, underlying, source, run_dat
         db.close()
 
 
-def derive_day(with_day, without_data_root, underlying, source="kite", quiet=lambda m: None):
+def derive_day(with_day, without_data_root, underlying, source="kite", quiet=lambda m: None, name=None):
     """Write the without copy of the with day folder with_day into without_data_root's root. Returns
     (new folder path, number of zero-volume files removed). Raises DeriveError (nothing written) or OSError
-    (the .part is removed). The caller holds both roots' locks."""
-    name = os.path.basename(os.path.normpath(with_day))
+    (the .part is removed). The caller holds both roots' locks. name: the with day's new-style folder name when
+    with_day itself has an old-style one (fno_store.py import)."""
+    name = name or os.path.basename(os.path.normpath(with_day))
     new_name = without_name(name)
     run_date = fno.parse_day_folder(name)[0]
     if not os.path.exists(os.path.join(with_day, "summary.csv")):
@@ -352,14 +353,12 @@ def compare_variants(with_folder, without_folder, source, underlyings, d_from=No
                 if not in_range(day, d_from, d_to):
                     continue
                 a, b = os.path.join(a_root, a_days[day]), os.path.join(b_root, b_days[day])
-                with tempfile.TemporaryDirectory(prefix="fno_compare_") as tmp:
-                    try:
-                        derived, removed = derive_day(a, tmp, u, source)
-                    except (DeriveError, OSError, bhav.BhavError) as e:
-                        log(f"{u} {day}: not compared: {e}")
-                        code = 1
-                        continue
-                    line = diff_line(*compare_days(derived, b), a_label="derived", b_label="real without")
+                try:
+                    line, removed = compare_day(a, b, u, source)
+                except (DeriveError, OSError, bhav.BhavError) as e:
+                    log(f"{u} {day}: not compared: {e}")
+                    code = 1
+                    continue
                 n += 1
                 log(f"{u} {day}: {line} (derived from {a_days[day]}, {removed} zero-volume files removed; "
                     f"real without {b_days[day]})")
@@ -370,6 +369,14 @@ def compare_variants(with_folder, without_folder, source, underlyings, d_from=No
                 lock.release()
     log(f"Compared {n} days.")
     return code
+
+
+def compare_day(with_day, without_day, underlying, source="kite", name=None):
+    """(diff_line of the without copy derived from with_day against without_day, zero-volume files removed).
+    Derives into a temporary folder; writes nothing next to either day. Raises DeriveError, OSError, BhavError."""
+    with tempfile.TemporaryDirectory(prefix="fno_compare_") as tmp:
+        derived, removed = derive_day(with_day, tmp, underlying, source, name=name)
+        return diff_line(*compare_days(derived, without_day), a_label="derived", b_label="real without"), removed
 
 
 def config_same(a, b):

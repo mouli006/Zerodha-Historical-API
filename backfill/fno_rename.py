@@ -72,37 +72,47 @@ def zero_volume_setting(day_dir, lines):
     return None, ""
 
 
+def new_name(path, day, expiries):
+    """(new folder name, how it was decided) for the old-style day folder at path, or (None, why not).
+    expiries: a callable returning the sorted expiry history (asked only when summary.csv has no expiry)."""
+    exp, exp_from = summary_expiry(path), "summary.csv"
+    if exp is None:
+        exp, exp_from = next((e for e in expiries() if e >= day), None), fno.EXPIRIES_FILE
+    if exp is None:
+        return None, (f"no expiry: no Current week row in summary.csv and nothing on or after {day} "
+                      f"in {fno.EXPIRIES_FILE}")
+    lines = run_log_lines(path)
+    zero, zero_from = zero_volume_setting(path, lines)
+    if zero is None:
+        return None, ("zero-volume setting unknown (no Keep_zero_volume in summary.csv, no setting in "
+                      f"run.log, no kept row in {fno.ZERO_VOLUME_FILE})")
+    dl, dl_from = first_start(lines), "run.log"
+    if dl is None:
+        dl, dl_from = datetime.fromtimestamp(os.stat(path).st_ctime, fno.IST), "folder created time"
+    return fno.day_folder_name(day, exp, zero, dl), f"exp: {exp_from}; zero volume: {zero_from}; dl: {dl_from}"
+
+
 def plan_root(data_root, underlying, source):
     """(moves [(old path, new path, how)], skipped [(name, why)], already named [name]) for one root.
     Raises DayFolderError on duplicate days."""
     root = fno.fno_root(data_root, underlying, source)
-    expiries = None
+    cache = []
+
+    def expiries():
+        if not cache:
+            cache.append(sorted(fno.read_expiries(data_root, underlying, source)))
+        return cache[0]
     moves, skipped, named = [], [], []
     for day, name in sorted(fno.day_folders(root).items()):
         if fno.parse_day_folder(name)[1] is not None:
             named.append(name)
             continue
         path = os.path.join(root, name)
-        exp, exp_from = summary_expiry(path), "summary.csv"
-        if exp is None:
-            if expiries is None:
-                expiries = sorted(fno.read_expiries(data_root, underlying, source))
-            exp, exp_from = next((e for e in expiries if e >= day), None), fno.EXPIRIES_FILE
-        if exp is None:
-            skipped.append((name, f"no expiry: no Current week row in summary.csv and nothing on or after {day} "
-                                  f"in {fno.EXPIRIES_FILE}"))
-            continue
-        lines = run_log_lines(path)
-        zero, zero_from = zero_volume_setting(path, lines)
-        if zero is None:
-            skipped.append((name, "zero-volume setting unknown (no Keep_zero_volume in summary.csv, no setting in "
-                                  f"run.log, no kept row in {fno.ZERO_VOLUME_FILE})"))
-            continue
-        dl, dl_from = first_start(lines), "run.log"
-        if dl is None:
-            dl, dl_from = datetime.fromtimestamp(os.stat(path).st_ctime, fno.IST), "folder created time"
-        moves.append((path, os.path.join(root, fno.day_folder_name(day, exp, zero, dl)),
-                      f"exp: {exp_from}; zero volume: {zero_from}; dl: {dl_from}"))
+        new, how = new_name(path, day, expiries)
+        if new is None:
+            skipped.append((name, how))
+        else:
+            moves.append((path, os.path.join(root, new), how))
     return moves, skipped, named
 
 
