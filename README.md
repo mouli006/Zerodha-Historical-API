@@ -384,6 +384,21 @@ python fno_store.py split-stores            # dry run, Kite and Dhan; --source k
 ```
 Every day folder of `FNO_RAW_<SOURCE>\<ROOT>` moves into `with_zero_volume\<ROOT>` (names ending `withZeroVol`) or `without_zero_volume\<ROOT>` (`noZeroVol`); old-style names are decided like `--rename-folders` (summary.csv, run.log, zero_volume_contracts.csv), else skipped and listed. `expiries_seen.csv`, `holidays.log` and each moved day's `progress.sqlite` rows are merged into the store, as with move-raw. Duplicates are listed, never moved or replaced; the emptied old roots stay. Days that exist only as `noZeroVol` are listed as "no with copy (can't be derived)". Afterwards run `derive-without` for the with days the without store still lacks.
 
+### Clearing an index to download it fresh (archive) and restoring it
+```
+python fno_store.py clear --underlying SENSEX                   # dry run: everything that would go, and the window warning
+python fno_store.py clear --underlying SENSEX --apply           # move it into the archive
+python fno_store.py restore --from "D:\Data\fno\archive\2026-10-16_1030_clear_SENSEX" --apply
+```
+- `--underlying` is required (no default), so NIFTY is never cleared by accident. `--source kite|dhan|all` and `--variant with|without|all` (default all) limit the stores; `--no-backtest` leaves the published folders.
+- **What goes:** in every root of the index (`with_zero_volume` and `without_zero_volume` of each broker, and with `--variant all` the old roots directly under `FNO_RAW_KITE` / `FNO_RAW_DHAN`): every day folder, the `_DAYS-*.txt` marker, `days_index.csv` and `bhavcopy.log`; then a fresh `_DAYS-0.txt` and empty `days_index.csv` are written. The index's rows in every `progress.sqlite` (run keys `fno:SENSEX:` / `fno-dhan:SENSEX:`, range and missing-days keys too). Unless `--no-backtest`: `backtest\with_zero_volume\SENSEX`, `backtest\without_zero_volume\SENSEX` and the old `backtest\SENSEX` (whole, with the manifest, so the next publish rebuilds them; they hold both brokers, so with `--source kite` the next publish rebuilds the Dhan part from raw).
+- **What stays:** `expiries_seen.csv` (the date window needs the expiry history), `holidays.log` (known holidays are skipped) and `.lock`; every other underlying's folders and rows and the equity rows. The progress rows must go: otherwise a fresh run would skip contracts that were done without a file (no candles or zero volume) and the new download would be incomplete.
+- **Archive, not delete:** everything moves to `D:\Data\fno\archive\<YYYY-MM-DD_HHMM IST>_clear_SENSEX\` (`--archive-to` to choose) under its path relative to `D:\Data\fno` (e.g. `archive\...\raw\kite\with_zero_volume\SENSEX_FnO_1min\2026-10-09_...`); the rows go to `progress_sensex.sqlite` next to each save folder's path. `CLEARED.txt` lists the time, command, every item, the row counts and how to restore; `clear_manifest.json` is what `restore` reads. On the same drive items are renamed, across drives copied and checked first.
+- **Window warning:** from the saved expiry history (no login), the dry run and `--apply` say which cleared days can still be downloaded and which cannot (outside the window): those exist only in the archive afterwards. `--apply` then asks for `y` (`--yes` skips it; without a terminal it is refused).
+- `--apply --delete` deletes instead of archiving, after printing the list and asking you to type `DELETE SENSEX`; only in an interactive terminal.
+- It takes the `.lock` of every root it touches and refuses while one is busy (a download running). The first error stops it, lists what was moved and keeps the rows in place; `restore` puts the moved part back.
+- `restore` is a dry run until `--apply`. It moves every item back to its original path, except items whose path exists again (e.g. a fresh download of that day), which are listed and left alone; the day count files are rewritten, not restored. Progress rows go back per run key only where the live database has none for it (rows still there after a stopped clear count as restored).
+
 ### Publishing
 ```
 python fno_store.py publish                       # both stores, every underlying, from FNO_RAW_KITE / FNO_RAW_DHAN into FNO_BACKTEST_DIR

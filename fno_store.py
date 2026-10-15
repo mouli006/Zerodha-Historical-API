@@ -7,6 +7,9 @@
                                        [--with PATH] [--without PATH] [--apply]
     python fno_store.py compare-variants --source kite|dhan [--underlying ...] [--from D] [--to D]
                                          [--with PATH] [--without PATH]
+    python fno_store.py clear --underlying NIFTY|SENSEX [--source kite|dhan|all] [--variant with|without|all]
+                              [--no-backtest] [--archive-to PATH] [--apply] [--delete] [--yes]
+    python fno_store.py restore --from "<archive folder>" [--apply]
     python fno_store.py publish [--raw-kite PATH] [--raw-dhan PATH] [--out PATH] [--variant with|without|both]
                                 [--underlying NIFTY|SENSEX|all] [--from YYYY-MM-DD] [--to YYYY-MM-DD]
                                 [--prefer kite|dhan] [--force] [--prune] [--prune-old-layout]
@@ -22,6 +25,11 @@ its zero-volume files); compare-variants derives into a temporary folder and com
 downloads. All but compare-variants are dry runs without --apply; a day the target already has is never moved,
 replaced or deleted, only listed.
 
+clear (backfill/fno_clear.py) moves one underlying's day folders, day counts, progress rows and backtest folders into
+<home>/archive/<time>_clear_<U>/ so its next downloads start clean (expiries_seen.csv, holidays.log and .lock stay);
+it says which cleared days can no longer be downloaded. restore puts an archive back. Both are dry runs without
+--apply; clear --apply --delete deletes instead (typed confirmation).
+
 publish (backfill/fno_publish.py) builds <out>/<with_zero_volume|without_zero_volume>/<UNDERLYING>/ from the raw
 stores: one Parquet file per day and source, the EOD bhavcopy, contracts.parquet, expiries.csv, days.csv. Only
 new or changed days are rebuilt (--force: all); raw is never written. Read the store with backfill/fno_backtest.py.
@@ -33,6 +41,7 @@ import sys
 from datetime import date
 
 from backfill.fno import UNDERLYINGS
+from backfill.fno_clear import clear, restore
 from backfill.fno_derive import compare_variants, derive_without
 from backfill.fno_publish import publish_variants
 from backfill.fno_store import move_raw, split_stores
@@ -85,6 +94,18 @@ def main(argv=None):
     store_args(d)
     c = sub.add_parser("compare-variants", help="derive into a temporary folder and compare with real without days")
     store_args(c, apply=False)
+    k = sub.add_parser("clear", help="archive one underlying's F&O data so it can be downloaded fresh (dry run)")
+    k.add_argument("--underlying", choices=sorted(UNDERLYINGS), required=True, help="no default: name it")
+    k.add_argument("--source", choices=sorted(FNO_RAW_KEYS) + ["all"], default="all")
+    k.add_argument("--variant", choices=sorted(VARIANTS) + ["all"], default="all")
+    k.add_argument("--no-backtest", action="store_true", help="leave the published backtest folders")
+    k.add_argument("--archive-to", help="archive folder (default <common folder of the .env bases>/archive/<time>_clear_<U>)")
+    k.add_argument("--apply", action="store_true", help="move into the archive (default: only print)")
+    k.add_argument("--delete", action="store_true", help="with --apply: delete instead of archiving (typed confirmation)")
+    k.add_argument("--yes", action="store_true", help="don't ask when cleared days can't be downloaded again")
+    r = sub.add_parser("restore", help="put a clear's archive back (dry run)")
+    r.add_argument("--from", dest="archive", required=True, metavar="PATH", help="the archive folder clear wrote")
+    r.add_argument("--apply", action="store_true", help="restore (default: only print)")
     b = sub.add_parser("publish", help="build the backtest store from the raw folders")
     b.add_argument("--raw-kite", help="Kite raw base folder (default .env FNO_RAW_KITE)")
     b.add_argument("--raw-dhan", help="Dhan raw base folder (default .env FNO_RAW_DHAN)")
@@ -107,6 +128,13 @@ def main(argv=None):
         else:
             to = args.to or base
         return move_raw(args.froms, args.source, to, apply=args.apply)
+    if args.cmd == "clear":
+        sources = sorted(FNO_RAW_KEYS) if args.source == "all" else [args.source]
+        variants = sorted(VARIANTS) if args.variant == "all" else [args.variant]
+        return clear(args.underlying, sources, variants, env, backtest=not args.no_backtest, archive_to=args.archive_to,
+                     apply=args.apply, delete=args.delete, yes=args.yes, command=" ".join(["python fno_store.py", *(argv or sys.argv[1:])]))
+    if args.cmd == "restore":
+        return restore(args.archive, apply=args.apply)
     if args.cmd == "split-stores":
         return split_stores(sorted(FNO_RAW_KEYS) if args.source == "all" else [args.source], env, apply=args.apply)
     if args.cmd in ("derive-without", "compare-variants"):
