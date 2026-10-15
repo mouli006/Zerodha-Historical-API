@@ -123,7 +123,7 @@ SENSEX_FnO_1min/2026-10-15_exp-2026-10-15_withZeroVol_dl-2026-10-15_1812/...
 ```
 - **Trading day** comes first, so folders still sort by date.
 - **exp** is the nearest option expiry on or after the trading day. It is taken from the run's full instrument list (Kite or Dhan), before the list is trimmed to the bhavcopy. On an expiry day it is the day itself, and NIFTY and SENSEX each use their own expiries. If the list has no option expiry on or after the day, the run stops and creates nothing.
-- **withZeroVol / noZeroVol** is the **Keep contracts with candles but zero volume** setting. Once any run with the setting ON has written the day, it is `withZeroVol`: a later OFF run never deletes those files. So a `noZeroVol` folder is renamed to `withZeroVol` at the end of an ON run, a **Re-check no-trade contracts** run, or a contract re-download with the setting ON. That is the only rename ever made, and an OFF run never renames a `withZeroVol` day. If Windows refuses the rename (the folder is open in Explorer), the job message says so and the next ON run tries again.
+- **withZeroVol / noZeroVol** is the **Keep contracts with candles but zero volume** setting. Once any run with the setting ON has written the day, it is `withZeroVol`: a later OFF run never deletes those files. So a `noZeroVol` folder is renamed to `withZeroVol` at the end of an ON run, a **Re-check no-trade contracts** run, or a contract re-download with the setting ON. That is the only rename ever made, and an OFF run never renames a `withZeroVol` day. If Windows refuses the rename (the folder is open in Explorer), the job message says so and the next ON run tries again. Inside the `with_zero_volume` / `without_zero_volume` stores (see [F&O backtest store](#fo-backtest-store)) there is no rename: each store holds one setting, and the without copy of a day is derived instead.
 - **dl** is when the folder was first created (IST, `YYYY-MM-DD_HHMM`; Windows does not allow colons). It never changes.
 - Resuming a day, **Download all missing days**, re-downloading a contract and the bhavcopy check find the folder by its date and reuse it. Each later run adds its start time and zero-volume setting to `run.log`.
 - Two folders for the same trading day stop every run and check with an error that lists them; keep one.
@@ -303,28 +303,62 @@ python nifty_bhav.py 2026-10-13 --source dhan --underlying SENSEX
 ## F&O backtest store
 F&O data lives in two places: **raw**, the folders the app downloads into (format unchanged), and **backtest**, Parquet files built from raw by `publish` that backtests read. Equity is not part of this.
 
+Both keep two versions of every day apart: **with zero volume** (contracts whose candles all have volume 0 are saved: "Keep contracts with candles but zero volume" ON) and **without zero volume** (those contracts get no file: OFF).
+
 ```
 D:\Data\fno\
 ├── raw\
-│   ├── kite\                      Kite F&O save folder: NIFTY_FnO_1min\, SENSEX_FnO_1min\ (day folders as always)
-│   └── dhan\                      Dhan F&O save folder: NIFTY_FnO_1min_Dhan\, SENSEX_FnO_1min_Dhan\
-└── backtest\                      built from raw\ by publish; can be deleted and rebuilt at any time
-    ├── NIFTY\
-    │   ├── minute\kite\<YYYY>\<YYYY-MM-DD>.parquet
-    │   ├── minute\dhan\<YYYY>\<YYYY-MM-DD>.parquet
-    │   ├── eod\<YYYY>.parquet
-    │   ├── contracts.parquet, expiries.csv, days.csv, publish_manifest.json
-    └── SENSEX\                    (the same layout)
+│   ├── kite\                          FNO_RAW_KITE (the base)
+│   │   ├── with_zero_volume\          save folder: NIFTY_FnO_1min\, SENSEX_FnO_1min\, progress.sqlite
+│   │   └── without_zero_volume\       save folder: the same roots, its own progress.sqlite
+│   └── dhan\                          FNO_RAW_DHAN
+│       ├── with_zero_volume\          NIFTY_FnO_1min_Dhan\, SENSEX_FnO_1min_Dhan\, progress.sqlite
+│       └── without_zero_volume\
+└── backtest\                          FNO_BACKTEST_DIR; built from raw\ by publish, can be deleted and rebuilt
+    ├── with_zero_volume\
+    │   ├── NIFTY\
+    │   │   ├── minute\kite\<YYYY>\<YYYY-MM-DD>.parquet
+    │   │   ├── minute\dhan\<YYYY>\<YYYY-MM-DD>.parquet
+    │   │   ├── eod\<YYYY>.parquet
+    │   │   ├── contracts.parquet, expiries.csv, days.csv, publish_manifest.json
+    │   └── SENSEX\                    (the same layout)
+    └── without_zero_volume\           (the same layout)
 ```
+
+Each store is an ordinary save folder (its own roots, `.lock`, `progress.sqlite`, `expiries_seen.csv`, `holidays.log`, day count). Day folders keep their names: `..._withZeroVol_...` in the with store, `..._noZeroVol_...` in the without store.
+
+### Which store a download goes to
+- When the folder is the base (`FNO_RAW_KITE` / `FNO_RAW_DHAN`: the F&O cards' start folder and the CLIs' default), the keep zero-volume setting picks the store: ON -> `with_zero_volume`, OFF -> `without_zero_volume`. This holds for the Kite and Dhan F&O cards (the card shows "Saving to ...\with_zero_volume" and changes it with the switch; the bhavcopy table shows that store's days), `nifty_daily.py` (`--keep-zero-volume` / `--no-keep-zero-volume`, else `KEEP_ZERO_VOLUME`), `--refetch-no-trade` (always the with store), re-download, `--inspect`, and `nifty_bhav.py` (same flags, they only pick the store).
+- Any other folder (typed in the card, or `--folder`) is used as it is, as before.
+- A run into a store of the other setting (ON into `without_zero_volume`, OFF into `with_zero_volume`) is refused. Inside the stores a folder is never renamed `noZeroVol` -> `withZeroVol`; that rename is kept only for folders outside this layout.
+- Without `FNO_RAW_KITE` / `FNO_RAW_DHAN` there are no stores and everything works as before.
+
+### The without copy: derived from the with day
+**Without = with minus the zero-volume contract files.** A run with the setting OFF writes exactly the files of a run with it ON, except the contracts whose candles all have volume 0 (Kept = Y in `zero_volume_contracts.csv`). So the without version of a day can be made from the with version without downloading again, also for days that can no longer be downloaded. The reverse is impossible: an OFF run never fetched those contracts.
+
+- **Automatically:** after a day finishes with keep zero-volume ON in the with store (a download, Re-check no-trade, or a re-download), its without copy is written into the without store, unless that store already has the day. Setting `DERIVE_WITHOUT_ZERO_VOLUME` (default ON; `.env` ON/OFF overrides), dashboard switch "Also save a without-zero-volume copy" (shown with keep zero-volume ON), CLI `--derive-without` / `--no-derive-without`. A day with failed contracts is not derived (run it again first).
+- A day the without store already has (e.g. a real OFF download) is **never overwritten**; it is compared instead, and run.log and the job message say "Without copy already present (...): identical" or "differs: N files (...)".
+- The copy: the folder name with `withZeroVol` -> `noZeroVol` (same exp and dl), every file except the zero-volume contract files, `zero_volume_contracts.csv` with Kept = N, `summary.csv` counted again from the files with `Keep_zero_volume` OFF (`Trim_to_bhav` unchanged), the bhavcopy checked again from the saved file (no network; zero-volume contracts become MISSING_IN_KITE instead of ZERO_VOLUME_IN_KITE), a line "Derived from <with folder> on <time>: removed N zero-volume contracts" in run.log and `derived_from.txt` naming the with folder. The day's `progress.sqlite` rows go into the without store, the zero-volume contracts DONE with reason ZERO_VOLUME, so a later OFF run doesn't request them again. It is built in `<folder>.part` and renamed into place; an error removes the `.part`.
+- A contract counts as zero-volume when its file's total volume is 0, and that must agree with `zero_volume_contracts.csv`; if it doesn't, the day is listed as an error and nothing is written.
+
+```
+python fno_store.py derive-without --source kite                      # dry run: each day and how many files it removes
+python fno_store.py derive-without --source dhan --underlying SENSEX --from 2026-10-09 --to 2026-10-15 --apply
+python fno_store.py compare-variants --source dhan --underlying NIFTY  # derive into a temp folder, compare with real OFF days
+```
+- `derive-without` handles every with day the without store lacks; old-style and `noZeroVol` days are skipped and listed, as are days only in the without store ("no with copy (can't be derived)"). It takes both roots' `.lock`.
+- `compare-variants` checks the rule on real data: for each day with both a with and a without download, it derives the with day into a temporary folder and compares the contract files (names and contents) with the real without day. It prints identical, or the differences (up to 20 names per kind). Nothing is written in raw; exit 1 when a day differs.
+- Both take `--with PATH` / `--without PATH` to use other folders than the stores of `FNO_RAW_<SOURCE>`.
 
 ### Settings
 Optional keys in `.env`:
 
 | Key | Used for |
 |---|---|
-| `FNO_RAW_KITE` | Start folder of the Kite F&O card, default `--folder` of `nifty_daily.py` / `nifty_bhav.py`, default `--to` of `move-raw --source kite` and `--raw-kite` of `publish` |
+| `FNO_RAW_KITE` | Base of the Kite stores: start folder of the Kite F&O card, default `--folder` of `nifty_daily.py` / `nifty_bhav.py` (its store of the keep zero-volume setting), base of `move-raw --variant`, `split-stores`, `derive-without`, `compare-variants` and `--raw-kite` of `publish` |
 | `FNO_RAW_DHAN` | The same for Dhan (`--source dhan`, the Dhan F&O card, `--raw-dhan`) |
-| `FNO_BACKTEST_DIR` | Default `--out` of `publish` and `root` of the backtest loader |
+| `FNO_BACKTEST_DIR` | Base of the published stores: default `--out` of `publish` and `root` of the backtest loader |
+| `DERIVE_WITHOUT_ZERO_VOLUME` | ON/OFF: save the without copy after a with run (default ON, `config.DERIVE_WITHOUT_ZERO_VOLUME`) |
 
 When `FNO_RAW_KITE` / `FNO_RAW_DHAN` are not set, everything uses `KITE_DATA_DIR` as before. When they are set, starting an F&O download no longer changes `KITE_DATA_DIR`, which stays the **New download** folder.
 
@@ -339,13 +373,25 @@ python fno_store.py move-raw --from "D:\Data\Dhan API data\with zero volume" --f
 - Several `--from` are handled in order, so the second folder's days that the first one already brings are listed as duplicates.
 - Each root's `expiries_seen.csv` (union, earliest first seen) and `holidays.log` (holidays it does not list yet; the time a line was logged is ignored, so a weekend logged by both folders counts once) are merged. The `progress.sqlite` rows of every moved day are copied to `<to>\progress.sqlite`, so a later run of that day doesn't request contracts again that were done without a file. The day counts of both roots are rewritten.
 - It takes the `.lock` of both roots. A root that is busy stops it ("Not run", exit 1); an error stops it and lists what was already moved. Old roots are left in place even when empty. Other content of the old folder (equity data, zip files) is not touched.
+- `--variant with|without` instead of `--to` moves into that store of `FNO_RAW_<SOURCE>`. Into a store (also a `--to` ending in `with_zero_volume` / `without_zero_volume`) only days of its setting move; the others are listed as REFUSED (old-style names are decided like `--rename-folders`):
+  ```
+  python fno_store.py move-raw --from "D:\Data\Dhan API data\Without zero volume" --source dhan --variant without
+  ```
+
+### Splitting the raw folders into the two stores (once)
+```
+python fno_store.py split-stores            # dry run, Kite and Dhan; --source kite|dhan; --apply moves
+```
+Every day folder of `FNO_RAW_<SOURCE>\<ROOT>` moves into `with_zero_volume\<ROOT>` (names ending `withZeroVol`) or `without_zero_volume\<ROOT>` (`noZeroVol`); old-style names are decided like `--rename-folders` (summary.csv, run.log, zero_volume_contracts.csv), else skipped and listed. `expiries_seen.csv`, `holidays.log` and each moved day's `progress.sqlite` rows are merged into the store, as with move-raw. Duplicates are listed, never moved or replaced; the emptied old roots stay. Days that exist only as `noZeroVol` are listed as "no with copy (can't be derived)". Afterwards run `derive-without` for the with days the without store still lacks.
 
 ### Publishing
 ```
-python fno_store.py publish                       # every underlying, from FNO_RAW_KITE / FNO_RAW_DHAN into FNO_BACKTEST_DIR
-python fno_store.py publish --underlying NIFTY --from 2026-10-01 --to 2026-10-31 --prefer dhan
+python fno_store.py publish                       # both stores, every underlying, from FNO_RAW_KITE / FNO_RAW_DHAN into FNO_BACKTEST_DIR
+python fno_store.py publish --variant without --underlying NIFTY --from 2026-10-01 --to 2026-10-31 --prefer dhan
 python fno_store.py publish --raw-kite D:\Data\fno\raw\kite --raw-dhan D:\Data\fno\raw\dhan --out D:\Data\fno\backtest
 ```
+- `--variant with|without|both` (default both): `backtest\with_zero_volume\` is built from the with stores, `backtest\without_zero_volume\` from the without stores, each with its own days.csv, eod, contracts, expiries and manifest. `--raw-kite`, `--raw-dhan` and `--out` are base folders, like the `.env` keys.
+- Stores published before the split (`backtest\NIFTY`, `backtest\SENSEX`) are left in place and listed as "old layout"; `--prune-old-layout` removes them.
 - Only new days and days whose raw folder changed (file count, total size or newest file time; a bhavcopy check counts) are rebuilt; `--force` rebuilds all. `publish_manifest.json` remembers what was published.
 - A day without `summary.csv` (not finished) is skipped and listed.
 - Raw is never written: publish only takes each raw root's `.lock` while reading it, so it never reads a day that is being downloaded. A busy root is skipped (exit 1).
@@ -372,7 +418,7 @@ Other files per index:
 - `eod\<YYYY>.parquet`: the exchange bhavcopy (NSE for NIFTY, BSE for SENSEX) of each day, from Kite's saved copy, else Dhan's: `date, contract, type, expiry, strike` and `Contract, Expiry, Type, Strike, Close, Last, Settle, OI, Volume_contracts, Lot`.
 - `contracts.parquet`: `contract, type, expiry, strike, lot, first_date, last_date, days_with_data`.
 - `expiries.csv`: `expiry, weekday, kind` (`monthly` = the last expiry of its month, else `weekly`).
-- `days.csv`: one row per trading day in either broker: `date, expiry, dte, kite_available, dhan_available, kite_check, dhan_check` (OK / minor / major / unchecked), `kite_zero_volume, dhan_zero_volume` (with / no), `kite_trim, dhan_trim` (ON / OFF / FALLBACK), `kite_contracts, dhan_contracts, eod_available, best_source, best_reason, published_at, raw_missing`.
+- `days.csv`: one row per trading day in either broker: `date, expiry, dte, kite_available, dhan_available, kite_check, dhan_check` (OK / minor / major / unchecked), `kite_zero_volume, dhan_zero_volume` (with / no), `kite_trim, dhan_trim` (ON / OFF / FALLBACK), `kite_contracts, dhan_contracts`, `kite_derived, dhan_derived` (True when the day folder was derived: it has `derived_from.txt`), `eod_available, best_source, best_reason, published_at, raw_missing`.
   - **best_source** is the broker whose bhavcopy check is best: OK, then minor, then unchecked, then major. When both have the same label, the counts in each day's `bhav_check.json` decide, fewer is better: missing contracts, then volume differences over the limits, then all differences. Only when all three are equal (or the day is unchecked) is it `--prefer` (default kite).
   - **best_reason** says why, e.g. `both major; dhan fewer volume diffs 32 vs 99`, `dhan major, kite minor`, `only kite (OK)` or `both OK, same counts; --prefer kite`.
 
@@ -385,8 +431,9 @@ ce = load_fno_day("NIFTY", "2026-10-12", source="kite", expiry="2026-10-13", typ
                   strikes=[25000, 25100], drop_zero_volume=True, columns=["contract", "datetime", "close", "oi"])
 df, skipped = load_fno_range("SENSEX", "2026-10-07", "2026-10-15")   # days without data are listed in skipped
 eod = load_eod("NIFTY", "2026-10-01", "2026-10-31")           # official close, settlement price, final OI
+off = load_fno_day("NIFTY", "2026-10-12", variant="without")  # the without-zero-volume store
 ```
-Filters are applied while reading, so only the needed rows and columns are loaded. `root=` defaults to `FNO_BACKTEST_DIR`. A day or broker that is not published raises `FileNotFoundError`. `backfill/fno_loader.py` still reads the raw folders.
+Every function takes `variant="with"` (default) or `"without"`: it reads `<root>\with_zero_volume` or `<root>\without_zero_volume`. Filters are applied while reading, so only the needed rows and columns are loaded. `root=` (the base) defaults to `FNO_BACKTEST_DIR`. A day or broker that is not published raises `FileNotFoundError`. `backfill/fno_loader.py` still reads the raw folders.
 
 ## NSE delisting and merger reference
 `nse_reference.py` collects which NSE stocks were delisted, suspended or merged away since 2015, so backtests can account for stocks that no longer trade. It needs no Kite or Dhan login and is run by hand:

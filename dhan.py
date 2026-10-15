@@ -17,8 +17,8 @@ from backfill import fno, fno_days
 from backfill.dhan_api import MAX_SPEED, DhanClient, DhanError, data_plan_error, fetch_profile, token_connected
 from backfill.job import JOB, JOB_LOCK, STOP, job_begin
 from backfill.storage import check_folder
-from config import (DEFAULT_DATA_DIR, FNO_RAW_KEYS, data_dir, dhan_credentials, keep_zero_volume, load_env, save_env,
-                    trim_to_bhav, weekly_expiry_weekday)
+from config import (DEFAULT_DATA_DIR, FNO_RAW_KEYS, VARIANTS, data_dir, derive_without, dhan_credentials, fno_target,
+                    keep_zero_volume, load_env, save_env, store_base, trim_to_bhav, weekly_expiry_weekday)
 
 bp = Blueprint("dhan", __name__)
 
@@ -122,15 +122,18 @@ def dashboard():
         speed = JOB["speed"] if mine else DEFAULT_SPEED
         last = JOB["folder"]
     # the last Dhan F&O job's folder, else .env FNO_RAW_DHAN, else the last folder used / KITE_DATA_DIR
-    raw = load_env().get(FNO_RAW_KEYS[SOURCE])
+    env = load_env()
+    raw = env.get(FNO_RAW_KEYS[SOURCE])
     folder = (last if mine and last else "") or raw or last or data_dir()
+    folder = store_base(folder, SOURCE, env)   # a store folder of FNO_RAW_DHAN shows as the base
     form = {"folder": folder, "speed": speed}
     underlyings = [{"name": u, "exchange": fno.exchange_of(u, SOURCE), "bhav": fno.exchange_name(u)}
                    for u in fno.UNDERLYINGS if u in UNDERLYINGS]
     fno_info = {"underlying": "NIFTY", "exchange": fno.exchange_of("NIFTY", SOURCE),
                 "underlyings": underlyings, "ready_at": fno.READY_AT.strftime("%H:%M"),
                 "today": fno.today_ist().isoformat(), "keep_zero_volume": keep_zero_volume(),
-                "trim_to_bhav": trim_to_bhav()}
+                "trim_to_bhav": trim_to_bhav(), "base": raw or "", "variants": VARIANTS,
+                "derive_without": derive_without() if raw else False}
     user = {"user_id": st["client_id"], "user_name": "", "email": "", "broker": "DHAN", "login_time": ""}
     return render_template("success.html", mode="dhan", broker=broker_info(), user=user, form=form, index_choices=[],
                            today=date.today().isoformat(), fno=fno_info, dhan=st, kite=("access_token" in session),
@@ -170,6 +173,9 @@ def fno_window_route():
     if not os.path.isabs(folder):
         return jsonify({"error": "Enter the save folder as a full path."})
     folder = os.path.normpath(folder)
+    keep = {"1": True, "0": False}.get(request.args.get("keep_zero", ""))
+    if keep is not None:
+        folder = fno_target(folder, SOURCE, keep, False, load_env())[0]
     w, err = fno_window(folder, underlying, token)
     if err:
         return jsonify({"error": err})
@@ -222,6 +228,13 @@ def fno_start():
     folder, err = check_folder(request.form.get("folder", "") or DEFAULT_DATA_DIR)
     if err:
         return fail(err)
+    derive = {"1": True, "0": False}.get(request.form.get("derive", ""))
+    folder, derive_to = fno_target(folder, SOURCE, keep_zero, derive, load_env())
+    folder, err = check_folder(folder)
+    if not err:
+        err = fno.store_mismatch(folder, keep_zero)
+    if err:
+        return fail(err)
     client = DhanClient(token)
     try:
         profile = client.profile()
@@ -252,7 +265,8 @@ def fno_start():
     except fno.LockBusy as e:
         return fail(str(e))
     label = f"{dates[0]}_to_{dates[-1]}" if dates else "missing"
-    if not job_begin(**fno.job_fields(underlying, run_date, folder, speed, keep_zero, SOURCE, label, trim)):
+    if not job_begin(**fno.job_fields(underlying, run_date, folder, speed, keep_zero, SOURCE, label, trim,
+                                      derive=bool(derive_to))):
         lock.release()
         return fail("A download is already running. Stop it or wait for it to finish.")
     if not load_env().get(FNO_RAW_KEYS[SOURCE]):   # with FNO_RAW_DHAN set, KITE_DATA_DIR stays the planner's
@@ -265,13 +279,14 @@ def fno_start():
             if missing or dates:
                 fno.run_missing("", token, folder, speed, underlying, weekday=weekly_expiry_weekday(underlying),
                                 keep_zero=keep_zero, kite=client, user=user, source=SOURCE, dates=dates,
-                                trim_to_bhav=trim)
+                                trim_to_bhav=trim, derive_to=derive_to)
             elif refetch:
                 fno.refetch_no_trade("", token, run_date, folder, speed, underlying, weekday=weekly_expiry_weekday(underlying),
-                                     kite=client, user=user, source=SOURCE, trim_to_bhav=trim)
+                                     kite=client, user=user, source=SOURCE, trim_to_bhav=trim, derive_to=derive_to)
             else:
                 fno.run_daily("", token, run_date, folder, speed, underlying, weekday=weekly_expiry_weekday(underlying),
-                              kite=client, user=user, keep_zero=keep_zero, source=SOURCE, trim_to_bhav=trim)
+                              kite=client, user=user, keep_zero=keep_zero, source=SOURCE, trim_to_bhav=trim,
+                              derive_to=derive_to)
         finally:
             lock.release()
 

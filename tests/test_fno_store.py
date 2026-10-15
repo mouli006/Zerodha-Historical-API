@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import shutil
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -95,10 +96,10 @@ def logs():
 # --- Part 1: settings ------------------------------------------------------------------------------
 
 def test_fno_raw_dir_falls_back_to_kite_data_dir():
-    assert config.fno_raw_dir("kite", {}) == config.DEFAULT_DATA_DIR
-    assert config.fno_raw_dir("dhan", {"KITE_DATA_DIR": "D:/old"}) == "D:/old"
+    assert config.fno_raw_dir("kite", env={}) == config.DEFAULT_DATA_DIR
+    assert config.fno_raw_dir("dhan", env={"KITE_DATA_DIR": "D:/old"}) == "D:/old"
     env = {"KITE_DATA_DIR": "D:/old", "FNO_RAW_KITE": "D:/fno/raw/kite", "FNO_RAW_DHAN": "D:/fno/raw/dhan"}
-    assert config.fno_raw_dir("kite", env) == "D:/fno/raw/kite" and config.fno_raw_dir("dhan", env) == "D:/fno/raw/dhan"
+    assert config.fno_raw_dir("kite", env=env) == "D:/fno/raw/kite" and config.fno_raw_dir("dhan", env=env) == "D:/fno/raw/dhan"
     assert config.fno_backtest_dir({}) == "" and config.fno_backtest_dir({"FNO_BACKTEST_DIR": "D:/b"}) == "D:/b"
 
 
@@ -192,17 +193,22 @@ def test_cli_update_day_count_uses_each_sources_folder(monkeypatch, tmp_path):
     assert os.path.exists(tmp_path / "d" / "NIFTY_FnO_1min_Dhan" / fno_days.INDEX_FILE)
 
 
-@pytest.mark.parametrize("env,expected", [({"FNO_RAW_DHAN": "dhanraw", "KITE_DATA_DIR": "old"}, "dhanraw"),
-                                          ({"KITE_DATA_DIR": "old"}, "old")])
-def test_nifty_bhav_default_folder(monkeypatch, tmp_path, env, expected):
+@pytest.mark.parametrize("env,flags,expected", [
+    ({"FNO_RAW_DHAN": "dhanraw", "KITE_DATA_DIR": "old"}, [], os.path.join("dhanraw", "without_zero_volume")),
+    ({"FNO_RAW_DHAN": "dhanraw"}, ["--keep-zero-volume"], os.path.join("dhanraw", "with_zero_volume")),
+    ({"KITE_DATA_DIR": "old"}, ["--keep-zero-volume"], "old"),
+    ({"KITE_DATA_DIR": "old"}, [], "old")])
+def test_nifty_bhav_default_folder(monkeypatch, tmp_path, env, flags, expected):
+    """FNO_RAW_DHAN's store of the zero-volume setting (OFF here), else KITE_DATA_DIR as it is."""
     monkeypatch.setattr(nifty_bhav, "load_env", lambda: {k: str(tmp_path / v) for k, v in env.items()})
+    monkeypatch.setattr(config, "keep_zero_volume", lambda: False)
     seen = []
 
     def export(folder, *a, **k):
         seen.append(folder)
         raise bhav.BhavError("nothing checked")
     monkeypatch.setattr(nifty_bhav.bhav_export, "export", export)
-    assert nifty_bhav.main(["--export-days", "--source", "dhan"]) == 1
+    assert nifty_bhav.main(["--export-days", "--source", "dhan"] + flags) == 1
     assert seen == [str(tmp_path / expected)]
 
 
@@ -425,6 +431,15 @@ def pub(tmp_path, kite=True, dhan=True, **kw):
     return code, lines
 
 
+def as_store(tmp_path):
+    """tmp_path/bt (published by pub) as the with_zero_volume store of a backtest base folder, for the loader."""
+    base = tmp_path / "bt_base"
+    if not (base / "with_zero_volume").exists():
+        base.mkdir()
+        shutil.copytree(tmp_path / "bt", base / "with_zero_volume")
+    return str(base)
+
+
 def days_csv(tmp_path, u="NIFTY"):
     with open(tmp_path / "bt" / u / "days.csv", newline="", encoding="utf-8") as f:
         return {r["date"]: r for r in csv.DictReader(f)}
@@ -505,12 +520,12 @@ def test_publish_contracts_and_expiries(tmp_path):
     fno.write_csv(os.path.join(fno.fno_root(str(tmp_path / "kite"), "NIFTY"), fno.EXPIRIES_FILE), ["expiry", "first_seen"],
                   [{"expiry": "2026-10-06", "first_seen": "2026-10-01"}, {"expiry": "2026-11-24", "first_seen": "2026-10-01"}])
     assert pub(tmp_path)[0] == 0
-    c = fno_backtest.load_contracts("NIFTY", root=str(tmp_path / "bt"))
+    c = fno_backtest.load_contracts("NIFTY", root=as_store(tmp_path))
     assert list(c.columns) == fno_publish.CONTRACT_COLUMNS
     fut = c[c["contract"] == "NIFTY27OCT26"].iloc[0]
     assert fut["days_with_data"] == 2 and fut["first_date"] == date(2026, 10, 7) and fut["last_date"] == date(2026, 10, 8)
     assert fut["lot"] == 65
-    ex = {r["expiry"]: (r["weekday"], r["kind"]) for _, r in fno_backtest.load_expiries("NIFTY", str(tmp_path / "bt")).iterrows()}
+    ex = {r["expiry"]: (r["weekday"], r["kind"]) for _, r in fno_backtest.load_expiries("NIFTY", as_store(tmp_path)).iterrows()}
     assert ex == {"2026-10-06": ("TUE", "weekly"), "2026-10-13": ("TUE", "weekly"), "2026-10-20": ("TUE", "weekly"),
                   "2026-10-27": ("TUE", "monthly"), "2026-11-24": ("TUE", "monthly")}
 
@@ -650,10 +665,10 @@ def test_publish_refusals(tmp_path):
 
 
 def test_cli_publish_uses_env(tmp_path, monkeypatch):
-    make_day(str(tmp_path / "kite"), D1)
+    make_day(str(tmp_path / "kite" / "with_zero_volume"), D1)
     monkeypatch.setattr(cli, "load_env", lambda: {"FNO_RAW_KITE": str(tmp_path / "kite"), "FNO_BACKTEST_DIR": str(tmp_path / "bt")})
     assert cli.main(["publish", "--underlying", "NIFTY"]) == 0
-    assert (tmp_path / "bt" / "NIFTY" / "days.csv").exists()
+    assert (tmp_path / "bt" / "with_zero_volume" / "NIFTY" / "days.csv").exists()
 
 
 # --- Part 4: the loader ------------------------------------------------------------------------------
@@ -664,7 +679,7 @@ def published(tmp_path):
     make_day(str(tmp_path / "dhan"), D1, source="dhan", check="ok")
     make_day(str(tmp_path / "kite"), D3)
     assert pub(tmp_path)[0] == 0
-    return str(tmp_path / "bt")
+    return as_store(tmp_path)
 
 
 def test_load_day_best_and_forced(published, tmp_path):

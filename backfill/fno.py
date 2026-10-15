@@ -11,6 +11,7 @@ first created, IST), e.g. 2026-10-12_exp-2026-10-13_withZeroVol_dl-2026-10-13_23
 Kite only serves live contracts. A day D can be downloaded completely only while every contract
 that existed on D is still live, i.e. for D after the most recent expiry (see date_window)."""
 import csv
+import inspect
 import math
 import os
 import re
@@ -471,6 +472,22 @@ def saved_trim(day_dir):
     return saved_setting(day_dir, "Trim_to_bhav")
 
 
+def store_mismatch(data_root, keep_zero):
+    """Why a run with this keep zero-volume setting must not write into data_root, or "": a with_zero_volume
+    store takes only ON runs, a without_zero_volume store only OFF runs (config.VARIANTS)."""
+    import config
+    variant = config.store_variant(data_root)
+    if variant is None or (variant == "with") == bool(keep_zero):
+        return ""
+    return (f"{data_root} is the {config.VARIANTS[variant]} store, but keep zero-volume contracts is "
+            f"{on_off(keep_zero)}; use the {config.VARIANTS[config.variant_of(keep_zero)]} store.")
+
+
+def in_split_store(data_root):
+    import config
+    return config.store_variant(data_root) is not None
+
+
 def trim_default():
     """The "download only contracts in the bhavcopy" setting (config.trim_to_bhav: .env TRIM_TO_BHAV, else
     config.TRIM_TO_BHAV), read when a run starts."""
@@ -717,12 +734,12 @@ def run_key(underlying, run_date, source="kite"):
 
 
 def job_fields(underlying, run_date, data_root, speed, keep_zero=False, source="kite", label="missing",
-               trim_to_bhav=False):
+               trim_to_bhav=False, derive=False):
     """JOB values for job_begin() when an F&O run starts; run_date None for a missing-days run or a
     date range (label "<from>_to_<to>")."""
     day = run_date.isoformat() if run_date else ""
     return {"kind": "fno", "source": source, "run": run_key(underlying, day or label, source), "folder": data_root,
-            "speed": speed, "keep_zero": keep_zero, "trim_to_bhav": bool(trim_to_bhav),
+            "speed": speed, "keep_zero": keep_zero, "trim_to_bhav": bool(trim_to_bhav), "derive_without": bool(derive),
             "fno_date": day, "fno_underlying": underlying,
             "fno_exchange": exchange_of(underlying, source), "fno_summary": [], "fno_futures": [],
             "out_dirs": [os.path.join(fno_folder(underlying, source), day)] if day else []}
@@ -873,10 +890,43 @@ class DuplicateWrite(Exception):
         self.owner, self.name = owner, name
 
 
-def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIFTY", log=print,
-              weekday=WEEKLY_EXPIRY_WEEKDAY, kite=None, user="", instruments=None, window=None,
-              label="", last=True, keep_zero=False, refetch=False, source="kite", trim_to_bhav=None,
-              bhav_check=None):
+def run_daily(*args, derive_to=None, **kwargs):
+    """download_day (see there), then with keep zero-volume ON and derive_to (the without_zero_volume save folder)
+    the day's without copy is derived into derive_to, or compared with the one it already has
+    (backfill/fno_derive.py). Only after "finished": a day with failed contracts is not complete."""
+    status = download_day(*args, **kwargs)
+    a = inspect.signature(download_day).bind(*args, **kwargs)
+    a.apply_defaults()
+    a = a.arguments
+    if not derive_to or not a["keep_zero"] or not status.startswith("finished"):
+        return status
+    underlying, source, run_date = a["underlying"], a["source"], a["run_date"]
+    echo = lambda m: a["log"](f"[{run_key(underlying, run_date, source)}] {m}")
+    day = day_dir(a["data_root"], underlying, run_date, source)
+    if status == "finished_failures":
+        line = "Without-zero-volume copy not made: some contracts failed; run the day again first."
+    else:
+        from . import fno_derive   # fno_derive imports this module
+        line = fno_derive.after_run(day, derive_to, underlying, source)
+    report_derive(day, line, echo)
+    return status
+
+
+def report_derive(day, line, echo, report=True):
+    """The derive result into the with day's run.log, the console and the job message."""
+    from . import bhav   # bhav imports this module
+    if day and os.path.isdir(day):
+        bhav.log_line(os.path.join(day, "run.log"), line)
+    echo(line)
+    if report:
+        with JOB_LOCK:
+            JOB["message"] = f"{JOB['message']} {line}".strip()
+
+
+def download_day(api_key, access_token, run_date, data_root, speed, underlying="NIFTY", log=print,
+                 weekday=WEEKLY_EXPIRY_WEEKDAY, kite=None, user="", instruments=None, window=None,
+                 label="", last=True, keep_zero=False, refetch=False, source="kite", trim_to_bhav=None,
+                 bhav_check=None):
     """Download day run_date for every contract that was live on it. The caller holds the lock
     (acquire_lock) and has called job_begin(**job_fields(...)). run_missing passes kite, instruments
     and window to share them between days; last=False keeps the job running after this day.
@@ -901,6 +951,9 @@ def run_daily(api_key, access_token, run_date, data_root, speed, underlying="NIF
     msg = too_early(run_date)
     if msg:
         return stop_with(echo, "too_early", msg)
+    msg = store_mismatch(data_root, keep_zero)
+    if msg:
+        return stop_with(echo, "error", msg)
 
     # The token and the date window are checked before anything is created for the day
     if kite is None:
@@ -1235,7 +1288,8 @@ def finish_day_folder(day, base, created, keep_zero, echo, underlying, source, r
     renamed. A failed rename (e.g. the folder open in Explorer) is reported; the next ON run tries again.
     Returns the day folder's path from now on."""
     renamed = False
-    if keep_zero and os.path.isdir(day):
+    # in the with / without stores a day keeps its name: an ON run never writes into the without store
+    if keep_zero and os.path.isdir(day) and not in_split_store(os.path.dirname(base)):
         try:
             new = mark_with_zero_volume(day)
         except OSError as e:
@@ -1299,16 +1353,19 @@ def holiday(base, day, created, run, run_date, near, rlog, db, last=True):
 
 def run_missing(api_key, access_token, data_root, speed, underlying="NIFTY", log=print,
                 weekday=WEEKLY_EXPIRY_WEEKDAY, keep_zero=False, kite=None, user="", source="kite", dates=None,
-                trim_to_bhav=None):
+                trim_to_bhav=None, derive_to=None):
     """Download every date in the window that has no complete day folder, oldest first, sharing
     one Kite session and instrument list. Weekends and holidays end at the holiday check (and are
     logged, so the next run skips them). Same statuses as run_daily.
 
     dates: run these days instead (a range picked on the dashboard), minus logged holidays and
     today before READY_AT; saved days run again and skip their saved contracts.
-    trim_to_bhav (None = the setting) is used for every day."""
+    trim_to_bhav (None = the setting) is used for every day; derive_to (see run_daily) too."""
     if trim_to_bhav is None:
         trim_to_bhav = trim_default()
+    msg = store_mismatch(data_root, keep_zero)
+    if msg:
+        return stop_with(lambda m: log(m), "error", msg)
     what = f"{min(dates)}_to_{max(dates)}" if dates else "missing"
     echo = lambda m: log(f"[{run_key(underlying, what, source)}] {m}")
     if kite is None:
@@ -1347,7 +1404,7 @@ def run_missing(api_key, access_token, data_root, speed, underlying="NIFTY", log
             return stop_with(echo, "stopped", "Stopped. Start again to continue; finished days are skipped.")
         st = run_daily(api_key, access_token, d, data_root, speed, underlying, log, weekday, kite, user,
                        instruments, window, label=f"Day {n} of {len(dates)}, ", last=n == len(dates),
-                       keep_zero=keep_zero, source=source, trim_to_bhav=trim_to_bhav)
+                       keep_zero=keep_zero, source=source, trim_to_bhav=trim_to_bhav, derive_to=derive_to)
         results[d] = st
         if st in ("auth_failed", "stopped", "error"):
             return st
@@ -1455,7 +1512,8 @@ def inspect_contracts(api_key, access_token, run_date, data_root, names, underly
 
 
 def refetch_no_trade(api_key, access_token, run_date, data_root, speed, underlying="NIFTY", log=print,
-                     weekday=WEEKLY_EXPIRY_WEEKDAY, kite=None, user="", source="kite", trim_to_bhav=None):
+                     weekday=WEEKLY_EXPIRY_WEEKDAY, kite=None, user="", source="kite", trim_to_bhav=None,
+                     derive_to=None):
     """Request every contract of a saved day that has no file again, with keep zero-volume ON
     (contracts with a file are skipped), then re-run the bhavcopy check if the day's bhavcopy is saved.
     The caller holds the lock and has called job_begin(**job_fields(..., keep_zero=True)). source "dhan"
@@ -1469,22 +1527,29 @@ def refetch_no_trade(api_key, access_token, run_date, data_root, speed, underlyi
     status = run_daily(api_key, access_token, run_date, data_root, speed, underlying, log, weekday,
                        kite=kite, user=user, keep_zero=True, refetch=True, source=source, trim_to_bhav=trim_to_bhav)
     day = day_dir(data_root, underlying, run_date, source)   # the run may have renamed it to withZeroVol
-    if not status.startswith("finished") or bhav.saved_items(day, underlying) is None:
-        return status, ""
-    _, line, rows = bhav.check_saved(day, run_date, underlying, log=log)
-    with JOB_LOCK:
-        JOB["message"] += f" Checked again against the saved bhavcopy: {line}."
-        if rows is not None:
-            JOB["fno_summary"] = rows
+    line = ""
+    if status.startswith("finished") and bhav.saved_items(day, underlying) is not None:
+        _, line, rows = bhav.check_saved(day, run_date, underlying, log=log)
+        with JOB_LOCK:
+            JOB["message"] += f" Checked again against the saved bhavcopy: {line}."
+            if rows is not None:
+                JOB["fno_summary"] = rows
+    if derive_to and status == "finished":   # after the check, so the with day is final
+        from . import fno_derive   # fno_derive imports this module
+        report_derive(day, fno_derive.after_run(day, derive_to, underlying, source),
+                      lambda m: log(f"[{run_key(underlying, run_date, source)}] {m}"))
     return status, line
 
 
 def redownload_contract(api_key, access_token, run_date, data_root, contract, underlying="NIFTY",
-                        speed=2.5, log=print, keep_zero=False, kite=None, source="kite"):
+                        speed=2.5, log=print, keep_zero=False, kite=None, source="kite", derive_to=None):
     """Fetch one contract (our file name, e.g. NIFTY2500013OCT26CE) for run_date again, e.g. one the
     bhavcopy check found missing. Only while Kite (or Dhan, source="dhan" with kite=DhanClient) still
     serves it (expiry today or later). The caller holds the lock. Returns (saved, message)."""
     broker = BROKER[source]
+    msg = store_mismatch(data_root, keep_zero)
+    if msg:
+        return False, msg
     folder = day_dir(data_root, underlying, run_date, source)
     dumps = sorted(glob.glob(os.path.join(folder, "instruments_*.csv"))) if folder else []
     if not dumps:
@@ -1542,7 +1607,7 @@ def redownload_contract(api_key, access_token, run_date, data_root, contract, un
     finally:
         db.close()
     if keep_zero:   # noZeroVol -> withZeroVol, as after a run with the setting ON
-        finish_day_folder(folder, os.path.dirname(folder), False, True, echo, underlying, source, report=False)
+        folder = finish_day_folder(folder, os.path.dirname(folder), False, True, echo, underlying, source, report=False)
     if bars:
         msg = f"{contract}: saved {bars} bars for {run_date}" + (" (all with volume 0)." if zero else ".")
     elif zero:
@@ -1551,4 +1616,9 @@ def redownload_contract(api_key, access_token, run_date, data_root, contract, un
     else:
         msg = f"{contract}: {broker} returned no candles for {run_date}, so no file was written."
     echo(msg)
+    if derive_to and keep_zero and bars:
+        from . import fno_derive   # fno_derive imports this module
+        line = fno_derive.after_run(folder, derive_to, underlying, source)
+        report_derive(folder, line, echo, report=False)
+        msg = f"{msg} {line}"
     return bool(bars), msg

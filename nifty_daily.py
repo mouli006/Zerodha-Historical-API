@@ -43,11 +43,12 @@ from backfill.dhan_api import MAX_SPEED as DHAN_MAX_SPEED
 from backfill.dhan_api import DhanClient, data_plan_error, token_ok
 from backfill.fno import (BROKER, FOLDERS, INSPECT_COLUMNS, UNDERLYINGS, DayFolderError, LockBusy, acquire_lock,
                           day_dir, inspect_contracts, job_fields, missing_in_kite, refetch_no_trade, run_daily,
-                          run_missing, table)
+                          run_missing, store_mismatch, table)
 from backfill.fno_rename import rename_day_folders, update_day_counts
 from backfill.job import job_begin
 from backfill.storage import check_folder
-from config import fno_raw_dir, keep_zero_volume, load_env, trim_to_bhav, weekly_expiry_weekday
+from config import (VARIANTS, default_fno_folder, derive_without, fno_raw_dir, keep_zero_volume, load_env,
+                    split_stores_on, trim_to_bhav, weekly_expiry_weekday)
 
 EXIT = {"finished": 0, "holiday": 0, "auth_failed": 2, "outside_window": 3}
 
@@ -84,6 +85,9 @@ def main(argv=None):
                         "all only with --rename-folders / --update-day-count (their default)")
     p.add_argument("--keep-zero-volume", action=argparse.BooleanOptionalAction, default=None,
                    help="keep contracts whose candles all have volume 0 (default from .env KEEP_ZERO_VOLUME / config.py)")
+    p.add_argument("--derive-without", action=argparse.BooleanOptionalAction, default=None,
+                   help="after a keep zero-volume ON run into the with_zero_volume store, also save the day's "
+                        "without-zero-volume copy (default from .env DERIVE_WITHOUT_ZERO_VOLUME / config.py)")
     p.add_argument("--trim-to-bhav", action=argparse.BooleanOptionalAction, default=None,
                    help="download only the contracts in the day's NSE/BSE bhavcopy, full list while it is not published "
                         "(default from .env TRIM_TO_BHAV / config.py)")
@@ -116,10 +120,18 @@ def main(argv=None):
             p.error("--refetch-no-trade keeps zero-volume contracts; drop --no-keep-zero-volume")
         keep_zero = True
     trim = trim_to_bhav() if args.trim_to_bhav is None else args.trim_to_bhav
-    folder, err = check_folder(args.folder or default_folder(args.source))
+    env = load_env()
+    folder, err = check_folder(args.folder or default_fno_folder(args.source, keep_zero, env))
+    if not err:
+        err = store_mismatch(folder, keep_zero)
     if err:
         print(f"Not run: {err}", file=sys.stderr)
         return 1
+    # the without copy: only into the .env store (an explicit --folder is used as it is)
+    derive_to = None
+    if keep_zero and not args.folder and split_stores_on(args.source, env):
+        if derive_without() if args.derive_without is None else args.derive_without:
+            derive_to = fno_raw_dir(args.source, "without", env)
 
     api_key, token, extra, code = sign_in(args.source)
     if code:
@@ -133,16 +145,16 @@ def main(argv=None):
     weekday = weekly_expiry_weekday(args.underlying)
     try:
         job_begin(**job_fields(args.underlying, run_date, folder, args.speed, keep_zero, args.source,
-                               trim_to_bhav=trim))
+                               trim_to_bhav=trim, derive=bool(derive_to)))
         if args.missing:
             status = run_missing(api_key, token, folder, args.speed, args.underlying, weekday=weekday,
-                                 keep_zero=keep_zero, trim_to_bhav=trim, **extra)
+                                 keep_zero=keep_zero, trim_to_bhav=trim, derive_to=derive_to, **extra)
         elif args.refetch_no_trade:
             status, _ = refetch_no_trade(api_key, token, run_date, folder, args.speed, args.underlying,
-                                         weekday=weekday, trim_to_bhav=trim, **extra)
+                                         weekday=weekday, trim_to_bhav=trim, derive_to=derive_to, **extra)
         else:
             status = run_daily(api_key, token, run_date, folder, args.speed, args.underlying,
-                               weekday=weekday, keep_zero=keep_zero, trim_to_bhav=trim, **extra)
+                               weekday=weekday, keep_zero=keep_zero, trim_to_bhav=trim, derive_to=derive_to, **extra)
     except KeyboardInterrupt:
         print("Interrupted. Finished contracts are saved; run again to continue.", file=sys.stderr)
         return 1
@@ -184,7 +196,8 @@ def sign_in(source):
 
 def inspect(args, run_date):
     """--inspect / --inspect-missing: no folder check, no lock, nothing written."""
-    folder = os.path.normpath(os.path.expanduser((args.folder or default_folder(args.source)).strip()))
+    folder = os.path.normpath(os.path.expanduser(
+        (args.folder or default_fno_folder(args.source, args.keep_zero_volume, load_env())).strip()))
     if args.inspect:
         names = [args.inspect[0].strip().upper()]
     else:
@@ -221,8 +234,19 @@ def inspect(args, run_date):
 
 
 def default_folder(source):
-    """The default --folder of a source: .env FNO_RAW_KITE / FNO_RAW_DHAN, else KITE_DATA_DIR, else ./data."""
-    return fno_raw_dir(source, load_env())
+    """The base folder of a source: .env FNO_RAW_KITE / FNO_RAW_DHAN, else KITE_DATA_DIR, else ./data. Downloads
+    go to its with_zero_volume / without_zero_volume store when FNO_RAW_<SOURCE> is set (default_fno_folder)."""
+    return fno_raw_dir(source, env=load_env())
+
+
+def rename_folders_of(source):
+    """--rename-folders / --update-day-count without --folder: the base folder, plus each existing
+    with_zero_volume / without_zero_volume store when FNO_RAW_<SOURCE> is set."""
+    base = default_folder(source)
+    if not split_stores_on(source, load_env()):
+        return [base]
+    stores = [os.path.join(base, n) for n in VARIANTS.values() if os.path.isdir(os.path.join(base, n))]
+    return [base] + stores
 
 
 def rename(args):
@@ -232,8 +256,8 @@ def rename(args):
     sources = sorted(FOLDERS) if args.source in (None, "all") else [args.source]
     groups = {}   # folder -> sources in it
     for s in sources:
-        folder = os.path.normpath(os.path.expanduser((args.folder or default_folder(s)).strip()))
-        groups.setdefault(folder, []).append(s)
+        for folder in ([args.folder] if args.folder else rename_folders_of(s)):
+            groups.setdefault(os.path.normpath(os.path.expanduser(folder.strip())), []).append(s)
     code = 0
     for folder, srcs in groups.items():
         if not os.path.isdir(folder):

@@ -22,7 +22,8 @@ from backfill import bhav_export
 from backfill.bhav import BhavError, bhav_dir, run_bhav, unchecked_days
 from backfill.fno import UNDERLYINGS, DayFolderError, LockBusy, acquire_lock, fno_root
 from backfill.storage import check_folder
-from config import fno_raw_dir, load_env
+import config
+from config import load_env
 
 EXIT = {"ok": 0, "diffs": 1, "not_available": 4}
 
@@ -48,6 +49,9 @@ def main(argv=None):
                    help="NIFTY (NSE bhavcopy, default) or SENSEX (BSE bhavcopy)")
     p.add_argument("--source", default="kite", choices=["kite", "dhan"],
                    help="whose saved files to check: kite (default) or dhan (<UNDERLYING>_FnO_1min_Dhan/)")
+    p.add_argument("--keep-zero-volume", action=argparse.BooleanOptionalAction, default=None,
+                   help="without --folder: check the with_zero_volume (on) or without_zero_volume (off) store "
+                        "(default from .env KEEP_ZERO_VOLUME / config.py)")
     args = p.parse_args(argv)
     if args.bhav_file and (args.missing or args.export or args.export_days):
         p.error("--bhav-file needs a date, not --missing or an export")
@@ -59,7 +63,7 @@ def main(argv=None):
         dates = [date.fromisoformat(args.date)] if args.date else None
     except ValueError:
         p.error(f"invalid date {args.date!r}, use YYYY-MM-DD")
-    folder, err = check_folder(args.folder or fno_raw_dir(args.source, load_env()))
+    folder, err = check_folder(args.folder or default_folder(args))
     if err:
         print(f"Not run: {err}", file=sys.stderr)
         return 1
@@ -95,7 +99,7 @@ def main(argv=None):
 
 def export(p, args):
     """--export / --export-days: read the saved check, write the file, print its path. No lock needed."""
-    folder = os.path.normpath(os.path.expanduser((args.folder or fno_raw_dir(args.source, load_env())).strip()))
+    folder = os.path.normpath(os.path.expanduser((args.folder or default_folder(args)).strip()))
     run_date = None
     if args.export:
         try:
@@ -116,6 +120,12 @@ def export(p, args):
         f.write(data)
     print(path)
     return 0
+
+
+def default_folder(args):
+    """FNO_RAW_KITE / FNO_RAW_DHAN's store of the zero-volume setting (--keep-zero-volume, else the setting),
+    else KITE_DATA_DIR, else ./data."""
+    return config.default_fno_folder(args.source, args.keep_zero_volume, load_env())
 
 
 if __name__ == "__main__":

@@ -18,8 +18,8 @@ from backfill.instruments import INDEX_CHOICES
 from backfill.job import DEFAULT_SPEED, JOB, JOB_LOCK, STOP, job_begin
 from backfill.runner import bulk_download
 from backfill.storage import FILE_FORMATS, check_folder, job_run_key
-from config import (DEFAULT_DATA_DIR, FNO_RAW_KEYS, credentials, data_dir, keep_zero_volume, load_env, save_env,
-                    trim_to_bhav, weekly_expiry_weekday)
+from config import (DEFAULT_DATA_DIR, FNO_RAW_KEYS, VARIANTS, credentials, data_dir, derive_without, fno_target,
+                    keep_zero_volume, load_env, save_env, trim_to_bhav, weekly_expiry_weekday)
 
 bp = Blueprint("dashboard", __name__)
 
@@ -50,11 +50,12 @@ def success():
         }
     # the F&O and bhavcopy cards switch between these (exchange: Kite's; bhav: whose bhavcopy checks it)
     underlyings = [{"name": u, "exchange": exch, "bhav": fno.exchange_name(u)} for u, (exch, _) in fno.UNDERLYINGS.items()]
+    env = load_env()
     fno_info = {"underlying": "NIFTY", "exchange": fno.UNDERLYINGS["NIFTY"][0], "underlyings": underlyings,
                 "ready_at": fno.READY_AT.strftime("%H:%M"), "today": fno.today_ist().isoformat(),
                 "keep_zero_volume": keep_zero_volume(), "trim_to_bhav": trim_to_bhav(),
                 # the F&O card's start folder: .env FNO_RAW_KITE, else the planner's folder
-                "folder": load_env().get(FNO_RAW_KEYS["kite"]) or form["folder"]}
+                "folder": env.get(FNO_RAW_KEYS["kite"]) or form["folder"], **store_info("kite", env)}
     broker = {"name": "Kite", "maxSpeed": 3, "defaultSpeed": DEFAULT_SPEED,
               "urls": {"fnoWindow": url_for("dashboard.download_fno_window"), "fno": url_for("dashboard.download_fno_start"),
                        "page": url_for("dashboard.success")}}
@@ -70,6 +71,25 @@ def read_speed():
     except ValueError:
         return 0
     return speed if 0 < speed <= 3 else 0
+
+
+def store_info(source, env):
+    """Boot values for the F&O card's with / without zero-volume stores (base "" = no separate stores)."""
+    base = env.get(FNO_RAW_KEYS[source], "")
+    return {"base": base, "variants": VARIANTS, "derive_without": derive_without() if base else False}
+
+
+def read_flag(name):
+    """name=1|0 of a request, or None when absent."""
+    return {"1": True, "0": False}.get(request.values.get(name, ""))
+
+
+def store_folder(folder, source, keep_zero):
+    """(folder, derive_to, error): an F&O card's folder resolved to the store of keep_zero (fno_target), created
+    and write-tested, and refused when it is the store of the other setting."""
+    folder, derive_to = fno_target(folder, source, keep_zero, read_flag("derive"), load_env())
+    folder, err = check_folder(folder)
+    return folder, derive_to, err or fno.store_mismatch(folder, keep_zero)
 
 
 def read_trim():
@@ -168,6 +188,9 @@ def download_fno_window():
     if not os.path.isabs(folder):
         return jsonify({"error": "Enter the save folder as a full path."})
     folder = os.path.normpath(folder)
+    keep = read_flag("keep_zero")
+    if keep is not None:
+        folder = fno_target(folder, "kite", keep, False, load_env())[0]
     w, err = fno_window(folder, underlying)
     if err:
         return jsonify({"error": err})
@@ -219,6 +242,9 @@ def download_fno_start():
     folder, err = check_folder(request.form.get("folder", "") or DEFAULT_DATA_DIR)
     if err:
         return fail(err)
+    folder, derive_to, err = store_folder(folder, "kite", keep_zero)
+    if err:
+        return fail(err)
     w, err = fno_window(folder, underlying)
     if err:
         return fail(err)
@@ -241,7 +267,8 @@ def download_fno_start():
     except fno.LockBusy as e:
         return fail(str(e))
     label = f"{dates[0]}_to_{dates[-1]}" if dates else "missing"
-    if not job_begin(**fno.job_fields(underlying, run_date, folder, speed, keep_zero, label=label, trim_to_bhav=trim)):
+    if not job_begin(**fno.job_fields(underlying, run_date, folder, speed, keep_zero, label=label, trim_to_bhav=trim,
+                                      derive=bool(derive_to))):
         lock.release()
         return fail("A download is already running. Stop it or wait for it to finish.")
     if not load_env().get(FNO_RAW_KEYS["kite"]):   # with FNO_RAW_KITE set, KITE_DATA_DIR stays the planner's
@@ -254,16 +281,16 @@ def download_fno_start():
         try:
             if missing:
                 fno.run_missing(api_key, access_token, folder, speed, underlying, weekday=weekday,
-                                keep_zero=keep_zero, trim_to_bhav=trim)
+                                keep_zero=keep_zero, trim_to_bhav=trim, derive_to=derive_to)
             elif dates:
                 fno.run_missing(api_key, access_token, folder, speed, underlying, weekday=weekday,
-                                keep_zero=keep_zero, dates=dates, trim_to_bhav=trim)
+                                keep_zero=keep_zero, dates=dates, trim_to_bhav=trim, derive_to=derive_to)
             elif refetch:
                 fno.refetch_no_trade(api_key, access_token, run_date, folder, speed, underlying,
-                                     weekday=weekday, trim_to_bhav=trim)
+                                     weekday=weekday, trim_to_bhav=trim, derive_to=derive_to)
             else:
                 fno.run_daily(api_key, access_token, run_date, folder, speed, underlying,
-                              weekday=weekday, keep_zero=keep_zero, trim_to_bhav=trim)
+                              weekday=weekday, keep_zero=keep_zero, trim_to_bhav=trim, derive_to=derive_to)
         finally:
             lock.release()
 
@@ -434,6 +461,11 @@ def fno_redownload():
     if err:
         return jsonify({"error": err})
     env = load_env()
+    keep_zero = request.values.get("keep_zero") == "1"
+    folder, derive_to = fno_target(folder, source, keep_zero, read_flag("derive"), env)
+    err = fno.store_mismatch(folder, keep_zero)
+    if err:
+        return jsonify({"error": err})
     client = None
     if source == "dhan":
         # the same checks as /dhan/fno-start: token not expired, accepted by Dhan, Data API plan active
@@ -458,8 +490,8 @@ def fno_redownload():
     try:
         saved, message = fno.redownload_contract(credentials()[0] if source == "kite" else "", access_token, run_date,
                                                  folder, contract, underlying, read_speed() or DEFAULT_SPEED,
-                                                 keep_zero=request.values.get("keep_zero") == "1",
-                                                 kite=client, source=source)
+                                                 keep_zero=keep_zero, kite=client, source=source,
+                                                 derive_to=derive_to)
         day_dir = fno.day_dir(folder, underlying, run_date, source)
         status, line, rows = bhav.check_saved(day_dir, run_date, underlying) if saved else ("", "", None)
         refresh_live_summary(folder, run_date, rows, source)

@@ -13,7 +13,9 @@ import os
 import shutil
 import sqlite3
 
-from . import fno, fno_days
+import config
+
+from . import fno, fno_days, fno_rename
 from .storage import open_db
 
 
@@ -117,9 +119,11 @@ def move_day(src, dst):
         copy_verified(src, dst)
 
 
-def plan(froms, source, to):
+def plan(froms, source, to, pick=None):
     """The moves, duplicates and merges for every root of source in froms (processed in order: a later
-    folder sees the earlier ones' days as already in the target). Raises DayFolderError on duplicate days."""
+    folder sees the earlier ones' days as already in the target). Raises DayFolderError on duplicate days.
+    pick(name, path): True to move the day, None to leave it out silently (it goes elsewhere), or a reason
+    to list it as refused."""
     roots, targets = [], {}
     for frm in froms:
         for u in sorted(fno.UNDERLYINGS):
@@ -132,9 +136,15 @@ def plan(froms, source, to):
                 targets[dst_root] = {"days": dict(have), "expiries": read_expiries_file(dst_root),
                                      "holidays": {holiday_key(x) for x in read_lines(os.path.join(dst_root, "holidays.log"))}}
             t = targets[dst_root]
-            r = {"from": frm, "underlying": u, "src": src_root, "dst": dst_root, "moves": [], "dups": [],
-                 "expiries": [], "holidays": [], "progress": 0}
+            r = {"from": frm, "to": to, "underlying": u, "src": src_root, "dst": dst_root, "moves": [], "dups": [],
+                 "refused": [], "expiries": [], "holidays": [], "progress": 0}
             for day, name in sorted(fno.day_folders(src_root).items()):
+                ok = True if pick is None else pick(name, os.path.join(src_root, name))
+                if ok is None:
+                    continue
+                if ok is not True:
+                    r["refused"].append((name, ok))
+                    continue
                 if day in t["days"]:
                     have = t["days"][day]
                     zero_have, zero_new = fno.parse_day_folder(have)[2], fno.parse_day_folder(name)[2]
@@ -156,16 +166,56 @@ def plan(froms, source, to):
                     t["holidays"].add(holiday_key(line))
                     new.append(line)
             r["holidays"] = new
-            r["empty_after"] = len(r["moves"]) == len(fno.day_folders(src_root))
+            r["empty_after"] = pick is None and len(r["moves"]) == len(fno.day_folders(src_root))
             roots.append(r)
     return roots, targets
 
 
+def store_pick(variant):
+    """pick() for a move into the with / without store: a day of the other setting is refused; an old-style
+    name is decided like nifty_daily.py --rename-folders (summary.csv, run.log, zero_volume_contracts.csv)."""
+    want = variant == "with"
+
+    def pick(name, path):
+        zero = day_zero_volume(name, path)
+        if zero is None:
+            return "zero-volume setting unknown (old-style name, nothing in summary.csv / run.log); not moved"
+        if zero != want:
+            return f"is {fno.ZERO_PARTS[zero]}, this is the {config.VARIANTS[variant]} store; not moved"
+        return True
+    return pick
+
+
+def day_zero_volume(name, path):
+    """True / False / None: the day folder's zero-volume setting from its name, else as --rename-folders decides."""
+    zero = fno.parse_day_folder(name)[2]
+    if zero is None:
+        zero = fno_rename.zero_volume_setting(path, fno_rename.run_log_lines(path))[0]
+    return zero
+
+
+def take_locks(roots, create, owner):
+    """The .lock of every root in roots (create False: only roots that already have one, so a dry run creates
+    nothing). Raises LockBusy after releasing those taken."""
+    locks = []
+    try:
+        for root in roots:
+            if not create and not os.path.exists(os.path.join(root, ".lock")):
+                continue   # a root without a .lock has never been run, so it can't be busy
+            locks.append(fno.RunLock(os.path.join(root, ".lock")).acquire(owner))
+    except fno.LockBusy:
+        for lock in locks:
+            lock.release()
+        raise
+    return locks
+
+
 def move_raw(froms, source, to, apply=False, log=print):
-    """Print (dry run) or do (apply) the moves; see the module notes. Returns the exit code: 0 done or dry
+    """Print (dry run) or do (apply) the moves; see the module notes. Into a with / without store (by the --to
+    folder's name) only days of that setting move; the others are listed. Returns the exit code: 0 done or dry
     run, 1 not run or stopped by an error."""
     if not to:
-        log(f"Not run: give --to or set {('FNO_RAW_KITE', 'FNO_RAW_DHAN')[source == 'dhan']} in .env.")
+        log(f"Not run: give --to (or --variant) or set {('FNO_RAW_KITE', 'FNO_RAW_DHAN')[source == 'dhan']} in .env.")
         return 1
     to = os.path.normpath(to)
     if not os.path.isabs(to):
@@ -185,37 +235,37 @@ def move_raw(froms, source, to, apply=False, log=print):
         log(f"No {fno.BROKER[source]} F&O folders ({', '.join(fno.fno_folder(u, source) for u in sorted(fno.UNDERLYINGS))}) "
             f"in {', '.join(froms)}.")
         return 0
-    locks = []
+    dsts = sorted({fno.fno_root(to, u, source) for u in sorted(fno.UNDERLYINGS)
+                   if any(os.path.isdir(fno.fno_root(f, u, source)) for f in froms)})
     try:
-        dsts = sorted({fno.fno_root(to, u, source) for u in sorted(fno.UNDERLYINGS)
-                       if any(os.path.isdir(fno.fno_root(f, u, source)) for f in froms)})
-        for root in srcs + dsts:
-            if not apply and not os.path.exists(os.path.join(root, ".lock")):
-                continue   # a dry run creates nothing; a root without a .lock has never been run, so it can't be busy
-            try:
-                locks.append(fno.RunLock(os.path.join(root, ".lock")).acquire("fno_store.py move-raw"))
-            except fno.LockBusy as e:
-                log(f"Not run: {e}")
-                return 1
+        locks = take_locks(srcs + dsts, apply, "fno_store.py move-raw")
+    except fno.LockBusy as e:
+        log(f"Not run: {e}")
+        return 1
+    try:
+        variant = config.store_variant(to)
         try:
-            roots, _ = plan(froms, source, to)
+            roots, _ = plan(froms, source, to, store_pick(variant) if variant else None)
         except fno.DayFolderError as e:
             log(f"Not run: {e}")
             return 1
-        return report_and_apply(roots, to, apply, log)
+        return report_and_apply(roots, apply, log)
     finally:
         for lock in locks:
             lock.release()
 
 
-def report_and_apply(roots, to, apply, log):
-    n_move = n_dup = n_more = n_rows = 0
+def report_and_apply(roots, apply, log):
+    n_move = n_dup = n_more = n_rows = n_refused = 0
     for r in roots:
         log(f"{r['src']} -> {r['dst']}:")
         for name, *_ in r["moves"]:
             log(f"  {os.path.join(r['src'], name)} -> {os.path.join(r['dst'], name)}")
         for name, why, more in r["dups"]:
             log(f"  DUPLICATE {name}: {why}")
+        for name, why in r["refused"]:
+            log(f"  REFUSED {name}: {why}")
+        n_refused += len(r["refused"])
         log(f"  merge: +{len(r['expiries'])} expiries in {fno.EXPIRIES_FILE}, +{len(r['holidays'])} holidays.log lines, "
             f"+{r['progress']:,} progress.sqlite rows")
         if r["empty_after"] and r["moves"]:
@@ -225,12 +275,13 @@ def report_and_apply(roots, to, apply, log):
         n_more += sum(1 for d in r["dups"] if d[2])
         n_rows += r["progress"]
     log(f"Totals: {n_move} day folders to move, {n_dup} duplicates not moved"
-        + (f" ({n_more} where the incoming folder has more data)" if n_more else "") + f", {n_rows:,} progress rows.")
+        + (f" ({n_more} where the incoming folder has more data)" if n_more else "")
+        + (f", {n_refused} refused" if n_refused else "") + f", {n_rows:,} progress rows.")
     if not apply:
         log("Dry run: nothing moved. Run again with --apply to move.")
         return 0
     done, touched = [], []
-    db = None
+    db = db_root = None
     try:
         for r in roots:
             os.makedirs(r["dst"], exist_ok=True)
@@ -252,7 +303,11 @@ def report_and_apply(roots, to, apply, log):
                     if root not in touched:
                         touched.append(root)
                 if rows:
-                    db = db or open_db(to)
+                    if db is not None and db_root != r["to"]:
+                        db.close()
+                        db = None
+                    if db is None:
+                        db, db_root = open_db(r["to"]), r["to"]
                     have = {c[1] for c in db.execute("PRAGMA table_info(chunks)")}
                     use = [c for c in cols if c in have]
                     idx = [cols.index(c) for c in use]
@@ -273,7 +328,75 @@ def report_and_apply(roots, to, apply, log):
             except (OSError, fno.DayFolderError) as e:
                 log(f"Day count of {root} not updated: {e}")
     log(f"Moved {len(done)} day folders.")
-    for r in roots:
-        if os.path.isdir(r["src"]) and not fno.day_folders(r["src"]):
-            log(f"{r['src']} has no day folders left; it is left in place (not deleted).")
+    for src in dict.fromkeys(r["src"] for r in roots):
+        if os.path.isdir(src) and not fno.day_folders(src):
+            log(f"{src} has no day folders left; it is left in place (not deleted).")
     return 0
+
+
+def split_stores(sources, env, apply=False, log=print):
+    """python fno_store.py split-stores: move each root's day folders from FNO_RAW_<SOURCE> into its
+    with_zero_volume / without_zero_volume store (by the name's withZeroVol / noZeroVol; old-style names as
+    --rename-folders decides, else skipped and listed), with the merges of move-raw. The emptied roots stay.
+    Dry run by default. Returns the exit code: 0 done or dry run, 1 not run or stopped by an error."""
+    code = 0
+    for source in sources:
+        base = env.get(config.FNO_RAW_KEYS[source], "")
+        if not base:
+            log(f"{fno.BROKER[source]}: Not run: {config.FNO_RAW_KEYS[source]} is not set in .env.")
+            code = 1
+            continue
+        base = os.path.normpath(base)
+        srcs = [fno.fno_root(base, u, source) for u in sorted(fno.UNDERLYINGS)]
+        srcs = [s for s in srcs if os.path.isdir(s)]
+        log(f"== {fno.BROKER[source]}: {base}")
+        if not srcs:
+            log("  no F&O roots to split")
+            continue
+        to = {v: config.fno_raw_dir(source, v, env) for v in config.VARIANTS}
+        dsts = [fno.fno_root(to[v], u, source) for v in to for u in sorted(fno.UNDERLYINGS)
+                if os.path.isdir(fno.fno_root(base, u, source))]
+        try:
+            locks = take_locks(srcs + dsts, apply, "fno_store.py split-stores")
+        except fno.LockBusy as e:
+            log(f"Not run: {e}")
+            code = 1
+            continue
+        try:
+            unknown = []
+
+            def pick_for(variant):
+                def pick(name, path):
+                    zero = day_zero_volume(name, path)
+                    if zero is None:
+                        if variant == "with":
+                            unknown.append(path)
+                        return None
+                    return True if zero == (variant == "with") else None
+                return pick
+            try:
+                roots = []
+                for v in config.VARIANTS:
+                    roots += plan([base], source, to[v], pick_for(v))[0]
+            except fno.DayFolderError as e:
+                log(f"Not run: {e}")
+                code = 1
+                continue
+            for path in unknown:
+                log(f"  SKIPPED {path}: zero-volume setting unknown (old-style name, nothing in summary.csv / run.log); left in place")
+            for u in sorted(fno.UNDERLYINGS):
+                with_days = set(fno.day_folders(fno.fno_root(to["with"], u, source)))
+                without = {}
+                for r in roots:
+                    if r["underlying"] != u:
+                        continue
+                    names = [m[0] for m in r["moves"]]
+                    days = {fno.parse_day_folder(n)[0]: n for n in names}
+                    (without.update(days) if r["to"] == to["without"] else with_days.update(days))
+                for day in sorted(set(without) - with_days):
+                    log(f"  {u} {day}: only noZeroVol ({without[day]}): no with copy (can't be derived)")
+            code = max(code, report_and_apply(roots, apply, log))
+        finally:
+            for lock in locks:
+                lock.release()
+    return code

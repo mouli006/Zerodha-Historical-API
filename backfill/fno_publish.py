@@ -1,5 +1,10 @@
 """Build the F&O backtest store from the raw download folders (python fno_store.py publish).
 
+    <out base>/with_zero_volume/<UNDERLYING>/...      from <raw base>/<source>/with_zero_volume (publish_variants)
+    <out base>/without_zero_volume/<UNDERLYING>/...   from <raw base>/<source>/without_zero_volume
+
+and in each of them (publish):
+
     <out>/<UNDERLYING>/minute/<kite|dhan>/<YYYY>/<YYYY-MM-DD>.parquet   every contract of the day, one file per source
                       /eod/<YYYY>.parquet                              the exchange bhavcopy (Kite's copy, else Dhan's)
                       /contracts.parquet, expiries.csv, days.csv, publish_manifest.json
@@ -14,13 +19,17 @@ import glob
 import json
 import math
 import os
+import shutil
 from datetime import date
 
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+import config
+
 from . import bhav, fno, fno_loader
+from .fno_derive import DERIVED_FILE
 from .fno_store import read_expiries_file
 
 SOURCES = ("kite", "dhan")
@@ -33,7 +42,7 @@ EOD_KEYS = ["date", "contract", "type", "expiry", "strike"]
 CONTRACT_COLUMNS = ["contract", "type", "expiry", "strike", "lot", "first_date", "last_date", "days_with_data"]
 DAYS_COLUMNS = ["date", "expiry", "dte", "kite_available", "dhan_available", "kite_check", "dhan_check",
                 "kite_zero_volume", "dhan_zero_volume", "kite_trim", "dhan_trim", "kite_contracts", "dhan_contracts",
-                "eod_available", "best_source", "best_reason", "published_at", "raw_missing"]
+                "kite_derived", "dhan_derived", "eod_available", "best_source", "best_reason", "published_at", "raw_missing"]
 EXPIRY_COLUMNS = ["expiry", "weekday", "kind"]
 CHECK_RANK = {"OK": 0, "minor": 1, "unchecked": 2, "major": 3}
 MANIFEST = "publish_manifest.json"
@@ -216,6 +225,40 @@ def publish(raw, out, underlyings, date_from=None, date_to=None, prefer="kite", 
     return code
 
 
+def old_layout(out):
+    """<out>/<UNDERLYING> stores published before the with / without split (they hold a manifest)."""
+    return [os.path.join(out, u) for u in sorted(fno.UNDERLYINGS)
+            if os.path.exists(os.path.join(out, u, MANIFEST))]
+
+
+def publish_variants(raw_bases, out, variants, underlyings, date_from=None, date_to=None, prefer="kite", force=False,
+                     prune=False, prune_old_layout=False, log=print):
+    """publish() once per zero-volume store: raw_bases {"kite": FNO_RAW_KITE or None, "dhan": ...} and out
+    (FNO_BACKTEST_DIR) are base folders; variant v reads <raw base>/<VARIANTS[v]> and writes <out>/<VARIANTS[v]>.
+    The stores published before the split (<out>/NIFTY, <out>/SENSEX) are listed, and removed only with
+    prune_old_layout. Returns the exit code: 0 done, 1 something was skipped or failed, or not run."""
+    if not out:
+        log("Not run: give --out or set FNO_BACKTEST_DIR in .env.")
+        return 1
+    if not any(raw_bases.values()):
+        log("Not run: give --raw-kite and/or --raw-dhan, or set FNO_RAW_KITE / FNO_RAW_DHAN in .env.")
+        return 1
+    code = 0
+    for v in variants:
+        raw = {s: os.path.join(b, config.VARIANTS[v]) if b else None for s, b in raw_bases.items()}
+        log(f"== {config.VARIANTS[v]}")
+        code = max(code, publish(raw, os.path.join(out, config.VARIANTS[v]), underlyings, date_from, date_to,
+                                 prefer, force, prune, log))
+    for path in old_layout(out):
+        if prune_old_layout:
+            shutil.rmtree(path)
+            log(f"Old layout removed: {path}")
+        else:
+            log(f"Old layout (published before the with / without split): {path}; left in place "
+                "(--prune-old-layout removes it)")
+    return code
+
+
 def in_range(day, date_from, date_to):
     return (not date_from or day >= str(date_from)) and (not date_to or day <= str(date_to))
 
@@ -263,6 +306,7 @@ def publish_underlying(raw, out, underlying, date_from, date_to, prefer, force, 
                         and os.path.exists(minute_path(out_u, source, day))):
                     if prev.get("raw_missing"):
                         prev["raw_missing"] = False
+                    prev["derived"] = os.path.exists(os.path.join(path, DERIVED_FILE))
                     st["unchanged"] += 1
                     continue
                 try:
@@ -286,7 +330,8 @@ def publish_underlying(raw, out, underlying, date_from, date_to, prefer, force, 
                             checks[day] if checks.get(day, {}).get("status") != "pending" else None),
                         "zero_volume": {True: "with", False: "no"}.get(zero, ""),
                         "trim": fno.saved_trim(path), "expiry": expiry.isoformat() if expiry else "",
-                        "has_eod": eod is not None, "raw_missing": False}
+                        "has_eod": eod is not None, "raw_missing": False,
+                        "derived": os.path.exists(os.path.join(path, DERIVED_FILE))}
                     if eod is not None:
                         eod_changed.setdefault(day, {})[source] = eod
                     st["published"] += 1
@@ -429,6 +474,7 @@ def write_days(out_u, days, prefer):
             e = avail.get(s)
             row.update({f"{s}_available": e is not None, f"{s}_check": e["check"] if e else "",
                         f"{s}_zero_volume": e["zero_volume"] if e else "", f"{s}_trim": e["trim"] if e else "",
-                        f"{s}_contracts": e["contracts"] if e else ""})
+                        f"{s}_contracts": e["contracts"] if e else "",
+                        f"{s}_derived": bool(e.get("derived")) if e else ""})
         rows.append(row)
     write_rows_csv(os.path.join(out_u, "days.csv"), DAYS_COLUMNS, rows)

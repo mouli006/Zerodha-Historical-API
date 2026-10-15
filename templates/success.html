@@ -566,7 +566,18 @@
     </div>`;
   }
 
-  function FnoCard({ job, toast, onPoll, folder, setFolder, days, onBhav, keepZero, setKeepZero, trimBhav, setTrimBhav, und, setUnd }) {
+  // The F&O folder an F&O card works on: the .env base (FNO_RAW_KITE / FNO_RAW_DHAN) becomes its with_zero_volume or
+  // without_zero_volume store by the keep zero-volume switch (config.fno_target); any other folder is used as it is.
+  const normPath = p => (p || "").trim().replace(/[\\/]+$/, "").replace(/\//g, "\\").toLowerCase();
+  function storeOf(folder, keepZero) {
+    const S = boot.fno;
+    if (!S.base || normPath(folder) !== normPath(S.base)) return { isBase: false, store: folder };
+    const sep = S.base.includes("\\") || !S.base.includes("/") ? "\\" : "/";
+    return { isBase: true, store: S.base.trim().replace(/[\\/]+$/, "") + sep + S.variants[keepZero ? "with" : "without"] };
+  }
+
+  function FnoCard({ job, toast, onPoll, folder, store, isBase, setFolder, days, onBhav, keepZero, setKeepZero, trimBhav, setTrimBhav,
+                     deriveWithout, setDeriveWithout, und, setUnd }) {
     const F = { ...boot.fno, underlying: und };
     const X = exchOf(und);                                  // NSE or BSE: the bhavcopy this underlying is checked with
     const ex = EXAMPLE[und] || EXAMPLE.NIFTY;
@@ -589,10 +600,10 @@
     const loadWindow = useCallback(async () => {
       if (!FULL_PATH.test(folder.trim())) return;
       try {
-        const j = await (await fetch(`${B.urls.fnoWindow}?${new URLSearchParams({ folder, underlying: F.underlying })}`, { cache: "no-store" })).json();
+        const j = await (await fetch(`${B.urls.fnoWindow}?${new URLSearchParams({ folder, underlying: F.underlying, keep_zero: keepZero ? "1" : "0" })}`, { cache: "no-store" })).json();
         if (j.error) { setWinErr(j.error); setWin(null); } else { setWin(j); setWinErr(""); }
       } catch (e) { setWinErr("Couldn't reach the app. Check that python app.py is running."); }
-    }, [folder, und]);
+    }, [folder, und, keepZero]);
     useEffect(() => { const t = setTimeout(loadWindow, 600); return () => clearTimeout(t); }, [loadWindow]);
     useEffect(() => { if (job && !running) loadWindow(); }, [running]);
 
@@ -603,7 +614,7 @@
       : runDate && runDate <= now.date ? [runDate] : [];
     const checkBhav = async () => {
       setBusy("bhav");
-      for (const d of bhavDays) await bhavCheck({ folder, date: d }, toast);
+      for (const d of bhavDays) await bhavCheck({ folder: store, date: d }, toast);
       onBhav(); onPoll();
       setBusy("");
     };
@@ -626,7 +637,7 @@
     const start = async which => {
       setBusy(which);
       const body = new URLSearchParams({ underlying: F.underlying, speed, folder, keep_zero: keepZero ? "1" : "0",
-                                         trim_bhav: trimBhav ? "1" : "0" });
+                                         trim_bhav: trimBhav ? "1" : "0", derive: deriveWithout ? "1" : "0" });
       if (which === "missing") body.append("missing", "1");
       else if (isRange) { body.append("date_from", sel.from); body.append("date_to", sel.to); }
       else body.append("date", runDate);
@@ -705,6 +716,7 @@
           <button type="button" className="btn btn-ghost" disabled=${running || busy === "browse"} onClick=${browse}>
             ${busy === "browse" ? html`<span className="spinner"></span> Opening` : "Browse"}</button>
         </div>
+        ${isBase && html`<div className="hint">Saving to <code>${store}</code>: days with zero-volume contracts kept go to <code>${boot.fno.variants.with}</code>, days without them to <code>${boot.fno.variants.without}</code> (the switch below picks).</div>`}
         <div className="hint">${DHAN ? "" : "Separate from New download. "}Running a day again skips contracts that are already saved. The folder window may open behind the browser.</div>
       </div>
 
@@ -722,6 +734,11 @@
             <small>${`${B.name} can report a single trade as volume 0. ON keeps these files; the bhavcopy check marks any that ${X} says did not trade as EXTRA.`}</small></span>
           <span className="switch"><input type="checkbox" checked=${keepZero} disabled=${running} onChange=${e => setKeepZero(e.target.checked)} /><span></span></span>
         </label>
+        ${isBase && keepZero && html`<label className="toggle">
+          <span><b>Also save a without-zero-volume copy</b>
+            <small>${`After each finished day, the day minus its zero-volume files is written to ${boot.fno.variants.without}, unless that store already has the day (then they are only compared).`}</small></span>
+          <span className="switch"><input type="checkbox" checked=${deriveWithout} disabled=${running} onChange=${e => setDeriveWithout(e.target.checked)} /><span></span></span>
+        </label>`}
         <label className="toggle">
           <span><b>Download only contracts in the bhavcopy</b>
             <small>${`ON requests only the contracts in ${X}'s bhavcopy for the day, traded or not, so strikes listed later are not requested. Until ${X} publishes it (usually in the evening) the full list is used and run.log says why.`}</small></span>
@@ -817,7 +834,7 @@
   }
 
   // One row per saved Kite day with its bhavcopy check (backfill/bhav.py list_days); click to see differences
-  function BhavCard({ job, toast, onPoll, folder, days, onBhav, openDay, setOpenDay, checkAll, checkingAll, keepZero, und }) {
+  function BhavCard({ job, toast, onPoll, folder, rawFolder, days, onBhav, openDay, setOpenDay, checkAll, checkingAll, keepZero, und }) {
     const [busy, setBusy] = useState("");
     const [diff, setDiff] = useState(null);          // { date, rows, units, line } or { date, error }
     const running = !!job && job.state === "running";
@@ -850,7 +867,7 @@
     const redownload = async (date, contract) => {
       setBusy(contract);
       try {
-        const j = await (await fetch(U.redownload, { method: "POST", body: new URLSearchParams({ folder, date, contract, ...Q, keep_zero: keepZero ? "1" : "0" }) })).json();
+        const j = await (await fetch(U.redownload, { method: "POST", body: new URLSearchParams({ folder: rawFolder, date, contract, ...Q, keep_zero: keepZero ? "1" : "0" }) })).json();
         if (j.error) toast(j.error, "err");
         else toast(j.saved ? `${j.message} ${j.line}` : j.message, j.saved ? (j.status === "ok" ? "ok" : "info") : "err");
         await onBhav(); onPoll();
@@ -999,7 +1016,8 @@
       ["Saving to", (job.out_dirs || []).length ? html`${job.folder}${job.out_dirs.map(d => html`<br key=${d} />↳ ${d}`)}` : job.folder],
       ["File format", isFno ? "CSV, Accelpix layout" : { csv: "CSV", parquet: "Parquet" }[job.format] || "Parquet"],
       ...(isFno ? [["Zero-volume contracts", job.keep_zero ? "Kept (ON)" : "Skipped (OFF)"],
-                   ["Contracts", job.trim_to_bhav ? "Bhavcopy only (ON)" : "Full list (OFF)"]] : []),
+                   ["Contracts", job.trim_to_bhav ? "Bhavcopy only (ON)" : "Full list (OFF)"],
+                   ...(job.derive_without ? [["Without-zero-volume copy", "Saved after each finished day"]] : [])] : []),
       ["Pass", job.pass ? (job.pass > 1 ? `${job.pass} (retrying failed ${isFno ? "contracts" : "chunks"})` : "1") : "Not started"],
     ] : [];
     const current = rates.length ? rates[rates.length - 1] : 0;
@@ -1144,6 +1162,8 @@
     const [fnoFolder, setFnoFolder] = useState(boot.fno.folder || boot.form.folder);   // F&O and bhavcopy cards (.env FNO_RAW_*), separate from New download
     const [keepZero, setKeepZero] = useState(!!boot.fno.keep_zero_volume);   // default from config.keep_zero_volume()
     const [trimBhav, setTrimBhav] = useState(!!boot.fno.trim_to_bhav);       // default from config.trim_to_bhav()
+    const [deriveWithout, setDeriveWithout] = useState(!!boot.fno.derive_without);   // default from config.derive_without()
+    const { isBase, store: fnoStore } = storeOf(fnoFolder, keepZero);         // the store the F&O and bhavcopy cards read
     // NIFTY | SENSEX on the F&O and bhavcopy cards; remembered in this browser
     const [und, setUndState] = useState(() => {
       let v = "";
@@ -1188,19 +1208,19 @@
 
     // Bhavcopy check of every saved Kite day in the F&O folder (backfill/bhav.py list_days / banners)
     const loadBhav = useCallback(async () => {
-      if (!FULL_PATH.test(fnoFolder.trim())) { setBhav({ days: [], banners: { check: [], minor: [], pending_old: [] } }); return; }
+      if (!FULL_PATH.test(fnoStore.trim())) { setBhav({ days: [], banners: { check: [], minor: [], pending_old: [] } }); return; }
       try {
-        const j = await (await fetch(`${U.bhavStatus}?${new URLSearchParams({ folder: fnoFolder, ...Q })}`, { cache: "no-store" })).json();
+        const j = await (await fetch(`${U.bhavStatus}?${new URLSearchParams({ folder: fnoStore, ...Q })}`, { cache: "no-store" })).json();
         if (!j.error) setBhav(j);
       } catch (e) {}
-    }, [fnoFolder, und]);
+    }, [fnoStore, und]);
     useEffect(() => { setOpenDay(""); setBhav({ days: [], banners: { check: [], minor: [], pending_old: [] } }); }, [und]);
     useEffect(() => { const t = setTimeout(loadBhav, 600); return () => clearTimeout(t); }, [loadBhav]);
     const jobRunning = !!job && job.state === "running";
     useEffect(() => { if (job && !jobRunning) loadBhav(); }, [jobRunning]);
     const checkAll = async () => {
       setCheckingAll(true);
-      await bhavCheck({ folder: fnoFolder, missing: "1" }, toast);
+      await bhavCheck({ folder: fnoStore, missing: "1" }, toast);
       await loadBhav(); poll();
       setCheckingAll(false);
     };
@@ -1238,9 +1258,10 @@
       <div className="grid">
         <div>
           ${!DHAN && html`<${Planner} job=${job} toast=${toast} onPoll=${poll} folder=${folder} setFolder=${setFolder} />`}
-          <${FnoCard} job=${job} toast=${toast} onPoll=${poll} folder=${fnoFolder} setFolder=${setFnoFolder} days=${bhav.days} onBhav=${loadBhav}
+          <${FnoCard} job=${job} toast=${toast} onPoll=${poll} folder=${fnoFolder} store=${fnoStore} isBase=${isBase}
+                     setFolder=${setFnoFolder} days=${bhav.days} onBhav=${loadBhav}
                      keepZero=${keepZero} setKeepZero=${setKeepZero} trimBhav=${trimBhav} setTrimBhav=${setTrimBhav}
-                     und=${und} setUnd=${setUnd} />
+                     deriveWithout=${deriveWithout} setDeriveWithout=${setDeriveWithout} und=${und} setUnd=${setUnd} />
         </div>
         <div>
           <${Live} job=${job} rates=${rates} toast=${toast} onPoll=${poll} />
@@ -1248,7 +1269,7 @@
         </div>
       </div>
       <div className="full-row">
-        <${BhavCard} job=${job} toast=${toast} onPoll=${poll} folder=${fnoFolder} days=${bhav.days} onBhav=${loadBhav}
+        <${BhavCard} job=${job} toast=${toast} onPoll=${poll} folder=${fnoStore} rawFolder=${fnoFolder} days=${bhav.days} onBhav=${loadBhav}
                      openDay=${openDay} setOpenDay=${setOpenDay} checkAll=${checkAll} checkingAll=${checkingAll} keepZero=${keepZero} und=${und} />
       </div>
       <${Toasts} items=${toasts} />

@@ -31,6 +31,23 @@ def trim_on(monkeypatch):
     set_trim(monkeypatch, True)
 
 
+def set_derive(monkeypatch, on):
+    """The "also save a without-zero-volume copy" setting as config.derive_without() and the routes/CLI see it."""
+    for mod in (config, dashboard, dhan, nifty_daily):
+        monkeypatch.setattr(mod, "derive_without", lambda: on)
+
+
+@pytest.fixture(autouse=True)
+def derive_off(monkeypatch):
+    """Never read from .env; tests that derive turn it on (derive_on) or pass derive_to / derive=1."""
+    set_derive(monkeypatch, False)
+
+
+@pytest.fixture
+def derive_on(monkeypatch):
+    set_derive(monkeypatch, True)
+
+
 def day_of(root, day):
     """The day folder of day in an F&O root (old or new name), or root/<day> when there is none yet."""
     found = fno.find_day_dir(str(root), str(day))
