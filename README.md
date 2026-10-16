@@ -462,6 +462,55 @@ off = load_fno_day("NIFTY", "2026-10-12", variant="without")  # the without-zero
 ```
 Every function takes `variant="with"` (default) or `"without"`: it reads `<root>\with_zero_volume` or `<root>\without_zero_volume`. Filters are applied while reading, so only the needed rows and columns are loaded. `root=` (the base) defaults to `FNO_BACKTEST_DIR`. A day or broker that is not published raises `FileNotFoundError`. `backfill/fno_loader.py` still reads the raw folders.
 
+## NSE equity bhavcopy (2015 -> today)
+`cm_bhav.py` downloads NSE's official end-of-day file for the cash market (the "CM bhavcopy") for every trading day since 2015. It needs **no broker**: no Kite or Dhan login. The files come from NSE's public archive. This store is the exchange's own record; Kite and Dhan daily equity data will later be checked against it. It is separate from everything F&O, and it does not change the Kite equity candle download. Run it by hand:
+
+```
+python cm_bhav.py 2026-10-16                          # one day
+python cm_bhav.py --from 2015-01-01 --to 2026-10-16   # a range (weekdays only)
+python cm_bhav.py --missing                           # every weekday from 2015-01-01 to today not done yet
+python cm_bhav.py --offline                           # no downloads: re-read every zip in raw\ and rebuild the yearly files
+options: --folder PATH, --sleep 1.5 (seconds between requests), --force (download again), --no-browser
+```
+
+The folder is `EQUITY_DATA_DIR` in `.env` (e.g. `D:\Data\NSE_equity`), else `KITE_DATA_DIR`, else `./data`. `nse_reference.py` uses the same folder, so all equity data lives in one place:
+
+```
+<EQUITY_DATA_DIR>\NSE_CM_bhav\
+├── raw\<YYYY>\<zip as downloaded>    never changed after download
+├── <YYYY>.parquet                    one file per year, every series
+├── days.csv                          one row per weekday checked
+├── holidays.log                      weekdays NSE has no file for
+├── cm_bhav.log                       run log
+├── cm_bhav_progress.sqlite           this downloader's own progress
+└── reference\                        nse_reference.py (delistings, suspensions, mergers)
+```
+
+- **Two formats.** Up to early July 2024 NSE published `cmDDMONYYYYbhav.csv.zip`. After that it publishes the UDiFF file `BhavCopy_NSE_CM_0_0_0_<YYYYMMDD>_F_0000.csv.zip`. For 1-12 July 2024 the UDiFF file is tried first and the old one after a 404. `days.csv` says which format each day used, and the report shows the switch date.
+- **Yearly parquet columns:** `date, symbol, series, isin, open, high, low, close, last, prev_close, volume, turnover, trades, fin_id, format`.
+  - `close` is NSE's official closing price, which differs from `last` (the last traded price) on most rows.
+  - `turnover` is rounded to 2 decimals.
+  - `fin_id` is blank for old-format days.
+  - `format` is `old` or `udiff`.
+  - All series are kept: EQ, BE, BZ, SME (SM, ST), bonds, gold bonds and so on. Filter them when you read the file. Only securities that traded are in the file.
+  - Read a year with `pandas.read_parquet(r"D:\Data\NSE_equity\NSE_CM_bhav\2024.parquet")`.
+- **Checks on every file:**
+  - the expected columns (an unknown or missing column fails the day and names the file);
+  - one date, equal to the day asked for;
+  - no duplicate symbol + series;
+  - prices above 0, and high >= low.
+
+  A day that fails is marked `failed` with the reason, and the other days go on.
+- **Holidays.** Only a 404 from NSE makes a past weekday a holiday. It is written to `holidays.log` and not asked again (unless `--force`).
+  - A web page instead of the zip (NSE blocking the script) counts as **failed**, not as a holiday.
+  - The report shows the holidays per year and flags any year with more than 18 weekday holidays (NSE usually has 12-16), listing the dates so you can check them.
+- **Today** is downloaded only after 19:00 IST, when NSE publishes. Before that, or while NSE still answers 404, today is `pending`.
+- **Downloads.** NSE's home page is opened first, and requests are at least 1.5 s apart (`--sleep`), with 3 tries each. If NSE blocks the script, headless Chrome takes over, as for `nse_reference.py`.
+  - A zip already in `raw\` is never downloaded again.
+  - When a download fails, the URL and the exact file name to save it under in `raw\<YYYY>\` are printed. Download it in a browser, save it there, and run again.
+- **Resuming.** Every day is recorded as soon as it is done, so a stopped run carries on where it stopped. Only one run at a time is allowed (a `.lock` in `NSE_CM_bhav\`).
+- **Report and exit codes.** Each run ends with a report: per year, the trading days, holidays, failed and pending days, rows, and EQ/BE/BZ stocks per day (min / median / max). Exit codes: 0 all done, 1 some days failed, 2 bad arguments or another run is going.
+
 ## NSE delisting and merger reference
 `nse_reference.py` collects which NSE stocks were delisted, suspended or merged away since 2015, so backtests can account for stocks that no longer trade. It needs no Kite or Dhan login and is run by hand:
 
@@ -470,7 +519,7 @@ playwright install chromium      # once, for the fallback browser (after pip ins
 python nse_reference.py          # options: --folder PATH, --from 2015-01-01, --only voluntary,compulsory,circulars,suspensions, --offline, --no-browser
 ```
 
-Files go to `<data folder>/NSE_CM_bhav/reference/` (the data folder is the dashboard's last save folder, or `./data`):
+Files go to `<data folder>/NSE_CM_bhav/reference/` (the data folder is `EQUITY_DATA_DIR` in `.env`, else the dashboard's last save folder, or `./data`):
 
 | File | From | Columns |
 |---|---|---|

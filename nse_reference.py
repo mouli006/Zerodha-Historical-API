@@ -1,5 +1,5 @@
 """NSE delisting, suspension and merger reference data, 2015 to today, into
-<data folder>/NSE_CM_bhav/reference/ (data folder = the dashboard's KITE_DATA_DIR or ./data).
+<data folder>/NSE_CM_bhav/reference/ (data folder = .env EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data).
 
     python nse_reference.py [--folder PATH] [--from YYYY-MM-DD] [--only PART,...] [--offline] [--no-browser]
 
@@ -18,7 +18,7 @@ from datetime import date
 
 from backfill.nse_ref.run import PARTS, START, collect
 from backfill.storage import check_folder
-from config import data_dir
+from config import equity_data_dir as data_dir   # EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data
 
 
 class Parser(argparse.ArgumentParser):
@@ -31,7 +31,7 @@ class Parser(argparse.ArgumentParser):
 def main(argv=None):
     p = Parser(description="Download NSE delisting, suspension and merger information into "
                            "<data folder>/NSE_CM_bhav/reference/.")
-    p.add_argument("--folder", help="data folder, default the dashboard's (KITE_DATA_DIR) or ./data")
+    p.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
     p.add_argument("--from", dest="since", default=START.isoformat(), help="first date, default 2015-01-01")
     p.add_argument("--only", help=f"comma-separated parts: {','.join(PARTS)} (default all)")
     p.add_argument("--offline", action="store_true", help="no downloads: rebuild the CSVs from reference/raw/")

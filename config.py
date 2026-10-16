@@ -50,6 +50,13 @@ def data_dir():
     return load_env().get("KITE_DATA_DIR") or DEFAULT_DATA_DIR
 
 
+def equity_data_dir(env=None):
+    """The equity data folder (NSE bhavcopy store and NSE reference, both under NSE_CM_bhav/): .env EQUITY_DATA_DIR,
+    else data_dir() (KITE_DATA_DIR or <project>/data). env: an already loaded .env."""
+    env = load_env() if env is None else env
+    return env.get("EQUITY_DATA_DIR") or env.get("KITE_DATA_DIR") or DEFAULT_DATA_DIR
+
+
 # F&O folders (backfill/fno_store.py): the raw download folder per source and the backtest store. Optional;
 # without FNO_RAW_<SOURCE> the F&O cards and CLIs use KITE_DATA_DIR as before.
 FNO_RAW_KEYS = {"kite": "FNO_RAW_KITE", "dhan": "FNO_RAW_DHAN"}
