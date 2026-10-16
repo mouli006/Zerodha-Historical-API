@@ -498,9 +498,10 @@ The folder is `EQUITY_DATA_DIR` in `.env` (e.g. `D:\Data\NSE_equity`), else `KIT
   - the expected columns (an unknown or missing column fails the day and names the file);
   - one date, equal to the day asked for;
   - no duplicate symbol + series;
-  - prices above 0, and high >= low.
+  - prices above 0, and high >= low;
+  - every price filled in. The one exception is a blank last price outside EQ/BE/BZ: NSE leaves `LastPric` empty on a few debt rows (e.g. series NT and AT in July 2024). It is stored as empty (null), and the day's `note` in `days.csv` counts those rows.
 
-  A day that fails is marked `failed` with the reason, and the other days go on.
+  A day that fails is marked `failed` with the reason, and the other days go on. A file that failed the checks is listed apart from failed downloads: it is already in `raw\`, so there is nothing to download.
 - **Holidays.** Only a 404 from NSE makes a past weekday a holiday. It is written to `holidays.log` and not asked again (unless `--force`).
   - A web page instead of the zip (NSE blocking the script) counts as **failed**, not as a holiday.
   - The report shows the holidays per year and flags any year with more than 18 weekday holidays (NSE usually has 12-16), listing the dates so you can check them.

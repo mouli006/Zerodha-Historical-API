@@ -214,7 +214,8 @@ def _few(items, n=5):
 
 
 def parse_zip(path, day, fmt):
-    """The day's rows in COLUMNS (every series kept), validated; BadFile naming the file on any problem."""
+    """The day's rows in COLUMNS (every series kept), validated; BadFile naming the file on any problem.
+    A blank last price is allowed (stored as null) only outside MAIN_SERIES; blank_last_note() describes them."""
     name = os.path.basename(path)
     src = SOURCES[fmt]
     try:
@@ -271,6 +272,9 @@ def parse_zip(path, day, fmt):
         sym = f"{g['symbol']} {g['series']}"
         row = {"date": day, "symbol": g["symbol"], "series": g["series"], "isin": g["isin"]}
         for k in PRICES:
+            if k == "last" and not g[k] and g["series"] not in MAIN_SERIES:
+                row[k] = float("nan")   # NSE leaves it blank on a few debt rows (e.g. NT, AT in July 2024)
+                continue
             row[k] = _num(g[k], "float", name, sym, cols[k])
         row["volume"] = _num(g["volume"], "int", name, sym, cols["volume"])
         row["turnover"] = round(_num(g["turnover"], "float", name, sym, cols["turnover"]), 2)
@@ -290,6 +294,15 @@ def parse_zip(path, day, fmt):
         raise BadFile(f"{name}: {len(inverted)} row(s) with high < low: {_few(inverted)}")
     df = pd.DataFrame(out, columns=COLUMNS)
     return df.sort_values(["symbol", "series"], kind="stable").reset_index(drop=True)
+
+
+def blank_last_note(df):
+    """days.csv note for rows whose last price NSE left blank, or ""."""
+    blank = df[df["last"].isna()]
+    if blank.empty:
+        return ""
+    series = ", ".join(sorted(set(blank["series"])))
+    return f"{len(blank)} row(s) with a blank last price (series {series}), stored as null"
 
 
 def eq_be_bz(df):
@@ -511,6 +524,7 @@ def process_day(store, con, day, client, force, now, rlog):
         set_day(con, day, "failed", fmt, rel, url, None, None, stamp, str(e))
         rlog(f"{day} failed: {e}")
         return "failed", [(day, url, path, str(e))]
+    note = "; ".join(x for x in (note, blank_last_note(df)) if x)
     set_day(con, day, "ok", fmt, rel, url, len(df), eq_be_bz(df), stamp, note)
     rlog(f"{day} ok ({fmt}, {len(df):,} rows, {eq_be_bz(df):,} EQ/BE/BZ{', ' + kind if kind == 'downloaded' else ', from raw/'})")
     return "ok", []

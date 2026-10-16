@@ -11,6 +11,7 @@ No broker: the files come from NSE's public archive.
 Exit codes: 0 all done (today before 19:00 IST is pending, not a failure), 1 some days failed (each is listed with
 its URL and the raw/ path to save it under by hand), 2 bad arguments or another cm_bhav.py run holds the lock."""
 import argparse
+import os
 import sys
 from datetime import date
 
@@ -86,11 +87,17 @@ def main(argv=None, now=None, client=None):
         print("Parquet rebuilt: " + ", ".join(str(y) for y in s["years"]))
     print()
     print(s["report"])
-    if s["failures"]:
-        print(f"\n{len(s['failures'])} download(s) failed. Download in a browser, save under the name shown, "
+    bad = [f for f in s["failures"] if os.path.exists(f[2])]   # downloaded, but failed the checks
+    missing = [f for f in s["failures"] if not os.path.exists(f[2])]
+    if missing:
+        print(f"\n{len(missing)} download(s) failed. Download in a browser, save under the name shown, "
               "and run again:", file=sys.stderr)
-        for day, url, path, error in s["failures"]:
+        for day, url, path, error in missing:
             print(f"  {day}: {url}\n      -> {path}   ({error})", file=sys.stderr)
+    if bad:
+        print(f"\n{len(bad)} file(s) failed the checks (the zip is in raw\\; nothing to download):", file=sys.stderr)
+        for day, url, path, error in bad:
+            print(f"  {day}: {error}", file=sys.stderr)
     return 1 if c["failed"] else 0
 
 

@@ -478,3 +478,38 @@ def test_nse_reference_default_folder_follows_equity_data_dir(monkeypatch):
     assert nse_reference.data_dir() == r"D:\kite"
     monkeypatch.setattr(config, "load_env", lambda: {})
     assert nse_reference.data_dir() == config.DEFAULT_DATA_DIR
+
+
+def _blank_last(text, symbol, series):
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        f = line.split(",")
+        if len(f) > 18 and f[7] == symbol and f[8] == series:
+            f[18] = ""   # LastPric
+            lines[i] = ",".join(f)
+    return "\n".join(lines) + "\n"
+
+
+def test_blank_last_price_allowed_only_outside_eq_be_bz(tmp_path):
+    # July 2024: NSE left LastPric blank on one debt row a day (975IHFL28 NT, IBHFZC25B AT)
+    day = date(2026, 10, 12)
+    text = _blank_last(new_text(day), "SGBJUN28", "GB")
+    res, s = run(tmp_path, [day], {cm_bhav.url_for(day, "udiff"): Resp(200, file_for(day, "udiff", text))})
+    status, fmt, note = db_rows(tmp_path)["2026-10-12"]
+    assert status == "ok" and note == "1 row(s) with a blank last price (series GB), stored as null"
+    t = pq.read_table(store(tmp_path, "2026.parquet")).to_pandas()
+    assert t[t.symbol == "SGBJUN28"]["last"].isna().all() and t["last"].notna().sum() == 19
+    p = tmp_path / NEW_FIX
+    p.write_bytes(zip_bytes("x.csv", _blank_last(fixture_text(NEW_FIX), "20MICRONS", "EQ")))
+    with pytest.raises(BadFile, match="20MICRONS EQ: LastPric is not a number"):
+        parse_zip(str(p), NEW_DAY, "udiff")
+
+
+def test_cli_lists_a_file_that_failed_the_checks_apart_from_downloads(tmp_path, capsys):
+    day = date(2026, 10, 15)
+    bad = file_for(day, "udiff", _edit_new(new_text(day), "inverted"))
+    c, _ = client({cm_bhav.url_for(day, "udiff"): Resp(200, bad)})
+    assert cli.main(["2026-10-15", "--folder", str(tmp_path)], now=NOW, client=c) == 1
+    err = capsys.readouterr().err
+    assert "1 file(s) failed the checks" in err and "high < low: 20MICRONS EQ" in err
+    assert "download(s) failed" not in err
