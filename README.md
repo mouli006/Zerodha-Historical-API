@@ -553,6 +553,20 @@ python security_master.py check          # re-run the known-case checks on the b
 
 Files go to `<data folder>/security_master/`: `securities.csv` (one row per company: first/last date, every symbol and ISIN, last close, trading days since last seen), `symbol_history.csv` (one row per period with the same symbol, ISIN and series), `events.csv` (LISTED, RENAME, ISIN_CHANGE with the closes either side, SERIES_CHANGE, GAP), `review.csv` (cases it will not link by itself: symbol and ISIN changing on the same day with a matching price, or a symbol coming back with a new ISIN) and `build_report.txt` (totals and checks of known cases such as AMARAJABAT -> ARE&M and the TATASTEEL split). `securities.csv` also has `instrument_kind` (STOCK, ETF for fund ISINs starting INF, RIGHTS for `-RE` rights entitlements); ETFs and rights are never paired in the review. The parquet copies of the first two are what backtests read. It refuses to run while a `cm_bhav.py` download is going. Exit codes: 0 done, 1 not run or a known case not found (`check`), 2 bad arguments or another run is going.
 
+## Split and bonus adjustments
+`adjustments.py` works out split, bonus and consolidation factors for every company in the security master, from the saved equity bhavcopy only (no Kite, Dhan or NSE request). NSE's previous close is not adjusted on an ex-date, so a split shows up only as a price jump. A jump is applied only when it is confirmed: by the company's ISIN change in the security master, or by NSE's corporate-actions list that you download yourself. Dividends are not adjusted, and the bhavcopy prices are never changed.
+
+```
+python adjustments.py build          # full rebuild; options: --folder PATH, --tol 0.25, --snap-tol 0.03, --min-price 5
+python adjustments.py show RELIANCE  # events and the raw vs adjusted close around each ex-date
+python adjustments.py check          # known cases (TATASTEEL, RELIANCE bonus, ...) and errors in manual_factors.csv
+```
+
+- **Corporate actions:** on nseindia.com open Companies listing -> Corporate filings -> Corporate actions, Equity tab. Pick one year at a time (From / To), click "Download (.csv)" and save each file unchanged in `<data folder>/adjustments/input/`. Bonuses, face-value splits and consolidations are read from the Purpose column; everything else is ignored.
+- **Your own corrections:** `<data folder>/adjustments/manual_factors.csv` (created once, never overwritten): `security_id,ex_date,action,factor,note` with ADD, REMOVE or SET (for example to approve a price jump from `review.csv`).
+- **Files:** `events.csv` (every price jump and confirmed event), `factors.csv/.parquet` (per company, the factor per period; divide a price by it to put it on today's scale), `review.csv` (jumps nobody confirmed, corporate actions with no price jump, input problems), `links.csv` and `build_report.txt`.
+- Build the security master again first after new bhavcopy days (the build refuses while it is older). Adjusted prices use splits known only later: use them for charts and returns, and raw prices for "the price on that day". Exit codes: 0 done, 1 not run or `check` failed, 2 bad arguments or another run is going.
+
 ## Credentials
 Your API keys, secrets and access tokens (Kite and Dhan) are stored only in a local `.env` file, which the app creates when you sign in. It is gitignored and never committed. `.env.example` shows the format.
 
