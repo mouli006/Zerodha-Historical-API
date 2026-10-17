@@ -33,7 +33,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import requests
 
-from backfill.fno import LockBusy, RunLock  # noqa: F401 - LockBusy is re-exported for the CLI
+from backfill.locks import LockBusy, RunLock  # noqa: F401 - LockBusy is re-exported for the CLI
 from backfill.nse_ref.fetch import Blocked, FetchError, NotFound, NseClient, Throttle, write_bytes
 
 IST = ZoneInfo("Asia/Kolkata")

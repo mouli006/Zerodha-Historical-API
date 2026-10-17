@@ -15,6 +15,7 @@ A local Flask app that signs in to Zerodha Kite Connect and downloads historical
    pip install -r requirements.txt
    python app.py
    ```
+   The versions in `requirements.txt` are pinned. To update a package: `pip install -U <pkg>`, run `pytest`, then put the new version in `requirements.txt`.
 2. In the Kite developer console, set your app's redirect URL to exactly:
    ```
    http://127.0.0.1:5000/callback
