@@ -337,7 +337,8 @@ KNOWN_ROWS = (
     + [row for k, s in enumerate(sm.KNOWN_ISIN_CHANGES)
        for row in trade(s, f"INE{k:03d}X01011", r(0, 10), close=1000.0)
        + trade(s, f"INE{k:03d}X01029", r(10, 20), close=100.0, prev=100.0)]
-    + trade("RELIANCE", "INE002A01018", r(0, 20)) + trade("HDFCBANK", "INE040A01034", r(0, 20))
+    + trade("RELIANCE", "INE002A01018", r(0, 20))
+    + trade("HDFCBANK", "INE040A01026", r(0, 6), close=1000.0) + trade("HDFCBANK", "INE040A01034", r(6, 20), close=500.0)
     + trade("HDFC", "INE001A01036", r(0, 12)) + trade("MINDTREE", "INE018I01017", r(0, 15))
 )
 
@@ -352,8 +353,9 @@ def test_known_checks_and_cli(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "Known-case checks: all found" in out and "NOT FOUND" not in out
     assert "[found] AMARAJABAT -> ARE&M" in out and "ratios 10.0 / 10.0" in out
+    assert f"HDFCBANK INE040A01034: S000010, INE040A01034 since {DAYS[6]} (earlier INE040A01026)" in out
     report = open(os.path.join(f, "security_master", "build_report.txt"), encoding="utf-8").read()
-    assert "ISIN_CHANGE events: 6" in report and "RENAME events: 3" in report and "securities: 13" in report
+    assert "ISIN_CHANGE events: 7" in report and "RENAME events: 3" in report and "securities: 13" in report
     assert cli.main(["check", "--folder", f]) == 0
     assert "all found" in capsys.readouterr().out
     assert cli.main(["show", "ARE&M", "--folder", f]) == 0
@@ -381,3 +383,45 @@ def test_cli_errors_and_default_folder(tmp_path, monkeypatch, capsys):
     assert cli.main(["build"]) == 0
     assert os.path.isfile(os.path.join(f, "security_master", "securities.parquet"))
     assert cli.main(["show", "AAA"]) == 0
+
+
+def test_bonus_check_fails_after_a_later_isin_change(tmp_path, monkeypatch):
+    monkeypatch.setattr(sm, "KNOWN_BONUSES", {"BONCO": "INE000021029"})
+    build(tmp_path, trade("BONCO", "INE000021011", r(0, 5)) + trade("BONCO", "INE000021029", r(5, 10))
+          + trade("BONCO", "INE000021037", r(10, 15)))
+    lines, ok = sm.check(str(tmp_path))
+    assert not ok and any("[NOT FOUND] BONCO INE000021029; seen as S000001" in x for x in lines)
+    monkeypatch.setattr(sm, "KNOWN_BONUSES", {"BONCO": "INE000021037"})
+    lines, ok = sm.check(str(tmp_path))
+    assert any(f"[found] BONCO INE000021037: S000001, INE000021037 since {DAYS[10]}" in x for x in lines)
+
+
+def test_instrument_kind():
+    assert sm.instrument_kind(["INF204KB14I2"], ["NIFTYBEES"], ["EQ"]) == "ETF"
+    assert sm.instrument_kind(["INE123A20011"], ["ABC-RE"], ["EQ"]) == "RIGHTS"
+    assert sm.instrument_kind(["INE123A20011"], ["ABCRIGHTS"], ["RE"]) == "RIGHTS"
+    assert sm.instrument_kind(["INF204KB14I2"], ["ODD-RE"], ["RE"]) == "ETF"
+    assert sm.instrument_kind(["INE002A01018"], ["RELIANCE"], ["EQ", "BE"]) == "STOCK"
+
+
+def test_kinds_in_securities_review_and_universe(tmp_path):
+    build(tmp_path, trade("OLDA", "INE000022011", r(0, 10), close=100.0)
+          + trade("SOMEETF", "INF000022019", r(10, 20), close=100.0, prev=100.0)       # ETF: never paired
+          + trade("OLDB", "INE000022029", r(0, 10), close=60.0)
+          + trade("NEWB-RE", "INE000022037", r(10, 20), close=30.0, prev=30.0)        # rights: never paired
+          + trade("OLDC", "INE000022045", r(0, 10), close=40.0)
+          + trade("NEWC", "INE000022052", r(10, 20), close=40.0, prev=40.0))           # stock -> stock: listed
+    sec = read(tmp_path, "securities.csv").set_index("first_symbol")
+    assert list(read(tmp_path, "securities.csv").columns) == sm.SECURITY_COLUMNS
+    assert sec.loc["SOMEETF", "instrument_kind"] == "ETF" and sec.loc["NEWB-RE", "instrument_kind"] == "RIGHTS"
+    assert sec.loc["OLDA", "instrument_kind"] == "STOCK"
+    assert pq.read_table(os.path.join(str(tmp_path), "security_master", "securities.parquet")).column(
+        "instrument_kind").to_pylist() == list(read(tmp_path, "securities.csv")["instrument_kind"])
+    rv = read(tmp_path, "review.csv")
+    assert len(rv) == 1 and "OLDC" in rv.details[0] and "NEWC" in rv.details[0]
+    report = open(os.path.join(str(tmp_path), "security_master", "build_report.txt"), encoding="utf-8").read()
+    assert "securities per kind: STOCK 4, ETF 1, RIGHTS 1" in report
+    f = str(tmp_path)
+    assert list(sm.universe(DAYS[12], folder=f)["symbol"]) == ["NEWC"]
+    assert list(sm.universe(DAYS[12], kinds=("ETF",), folder=f)["symbol"]) == ["SOMEETF"]
+    assert sorted(sm.universe(DAYS[12], kinds=None, folder=f)["symbol"]) == ["NEWB-RE", "NEWC", "SOMEETF"]

@@ -42,9 +42,11 @@ def fixture_text(name):
 
 
 def zip_bytes(inner, text):
+    """A fixed entry date (not now), so the same content always gives the same bytes: byte comparisons then never
+    depend on the clock crossing a 2-second zip time step between two builds."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr(inner, text)
+        z.writestr(zipfile.ZipInfo(inner, date_time=(1980, 1, 1, 0, 0, 0)), text, compress_type=zipfile.ZIP_DEFLATED)
     return buf.getvalue()
 
 

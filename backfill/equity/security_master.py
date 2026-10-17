@@ -39,7 +39,9 @@ PRICE_DIVISORS = (1, 2, 3, 4, 5, 10)
 BHAV_COLUMNS = ["date", "symbol", "series", "isin", "open", "close", "prev_close"]
 
 SECURITY_COLUMNS = ["security_id", "first_date", "last_date", "trading_days", "first_symbol", "last_symbol",
-                    "last_isin", "last_series", "symbols", "isins", "series_seen", "last_close", "days_since_last"]
+                    "last_isin", "last_series", "symbols", "isins", "series_seen", "instrument_kind", "last_close",
+                    "days_since_last"]
+KINDS = ("STOCK", "ETF", "RIGHTS")
 HISTORY_COLUMNS = ["security_id", "symbol", "isin", "series", "from_date", "to_date", "trading_days"]
 EVENT_COLUMNS = ["date", "security_id", "type", "old_symbol", "new_symbol", "old_isin", "new_isin", "old_series",
                  "new_series", "old_close", "new_prev_close", "new_open", "ratio_prev_close", "ratio_open",
@@ -111,6 +113,20 @@ def check_conflicts(df):
     if lines:
         shown = "\n".join(lines[:50]) + (f"\n... and {len(lines) - 50} more" if len(lines) > 50 else "")
         raise ConflictError(f"{len(lines)} conflicts in the bhavcopy (nothing written):\n{shown}")
+
+
+def instrument_kind(isins, symbols, series):
+    """ETF for any fund ISIN (INF...), else RIGHTS for a rights entitlement (symbol ending -RE, or the RE series),
+    else STOCK."""
+    if any(i.startswith("INF") for i in isins):
+        return "ETF"
+    if any(sym.endswith("-RE") for sym in symbols) or "RE" in series:
+        return "RIGHTS"
+    return "STOCK"
+
+
+def kind_of(s):
+    return instrument_kind(s["isins"], s["symbols"], s["series_seen"])
 
 
 def ratio(a, b):
@@ -216,14 +232,16 @@ def link(df, link_gap=LINK_GAP, days=None):
 
 def review_both_changed(secs, days):
     """Rule 4: a security ending on day d and another starting on d or d+1 with another symbol and ISIN, whose first
-    prev_close is within PRICE_TOL of the old last close / k (k in PRICE_DIVISORS). Never linked, only listed."""
+    prev_close is within PRICE_TOL of the old last close / k (k in PRICE_DIVISORS). Never linked, only listed.
+    ETFs and rights entitlements are never paired (their prices match stocks by chance only)."""
     starts = {}
     for s in secs:
-        starts.setdefault(s["first_d"], []).append(s)
+        if kind_of(s) == "STOCK":
+            starts.setdefault(s["first_d"], []).append(s)
     rows = []
     for old in secs:
         d = old["last_d"]
-        if d == len(days) - 1 or not old["close"]:
+        if d == len(days) - 1 or not old["close"] or kind_of(old) != "STOCK":
             continue
         for new in starts.get(d, []) + starts.get(d + 1, []):
             if new is old or new["first_symbol"] == old["symbol"] or new["isins"][0] == old["isin"]:
@@ -247,7 +265,7 @@ def frames(secs, events, reviews, days):
     for s in secs:
         sec_rows.append([s["id"], days[s["first_d"]], days[s["last_d"]], s["days"], s["first_symbol"], s["symbol"],
                          s["isin"], s["series"], "|".join(s["symbols"]), "|".join(s["isins"]),
-                         "|".join(s["series_seen"]), s["close"], last - s["last_d"]])
+                         "|".join(s["series_seen"]), kind_of(s), s["close"], last - s["last_d"]])
         for sym, isin, ser, a, b, n in s["periods"]:
             hist_rows.append([s["id"], sym, isin, ser, days[a], days[b], n])
     securities = pd.DataFrame(sec_rows, columns=SECURITY_COLUMNS)
@@ -305,13 +323,22 @@ def known_checks(securities, events):
                                           f"{r.old_close:g}, new_prev_close {r.new_prev_close:g}, new_open "
                                           f"{r.new_open:g}, ratios {r.ratio_prev_close} / {r.ratio_open}"
                                           for r in hit.itertuples()))
-    lines.append("Bonuses (one ISIN, no ISIN change):")
+    lines.append("Bonuses (the ISIN is current, no ISIN change since it started):")
     for sym, isin in KNOWN_BONUSES.items():
         rows = securities[securities["symbols"].str.split("|").apply(lambda xs: sym in xs)]
-        good = [r for r in rows.itertuples() if r.isins == isin
-                and ev[(ev["security_id"] == r.security_id) & (ev["type"] == "ISIN_CHANGE")].empty]
-        mark(bool(good), f"{sym} {isin}" + "".join(f": {r.security_id}, {r.first_date} to {r.last_date}" for r in good)
-             + ("" if good else "".join(f"; seen as {r.security_id} with ISINs {r.isins}" for r in rows.itertuples())))
+        found = []
+        for r in rows.itertuples():
+            if r.last_isin != isin:
+                continue
+            changes = ev[(ev["security_id"] == r.security_id) & (ev["type"] == "ISIN_CHANGE")]
+            into = changes[changes["new_isin"] == isin]
+            since = into["date"].iloc[-1] if not into.empty else str(r.first_date)
+            if changes[changes["date"] > since].empty:
+                earlier = [i for i in r.isins.split("|") if i != isin]
+                found.append(f": {r.security_id}, {isin} since {since}"
+                             + (f" (earlier {', '.join(earlier)})" if earlier else "") + f", to {r.last_date}")
+        mark(bool(found), f"{sym} {isin}" + "".join(found)
+             + ("" if found else "".join(f"; seen as {r.security_id} with ISINs {r.isins}" for r in rows.itertuples())))
     lines.append("Ended securities (last date):")
     for sym, expected in KNOWN_ENDED.items():
         rows = securities[(securities["last_symbol"] == sym) & (securities["days_since_last"] > 0)]
@@ -331,6 +358,8 @@ def report_text(securities, events, reviews, info, checks):
     counts = events["type"].value_counts()
     lines += [f"  {t} events: {int(counts.get(t, 0)):,}" for t in EVENT_TYPES]
     rk = reviews["kind"].value_counts()
+    kinds = securities["instrument_kind"].value_counts()
+    lines.append("  securities per kind: " + ", ".join(f"{k} {int(kinds.get(k, 0)):,}" for k in KINDS))
     lines.append(f"  review rows: {len(reviews):,}"
                  + "".join(f" ({k}: {int(rk.get(k, 0)):,})" for k in ("both_changed?", "symbol_reused?")))
     first = pd.to_datetime(securities["first_date"]).dt.year.value_counts()
@@ -398,7 +427,8 @@ def load_master(folder=None):
             info = json.load(f)
         _CACHE[key] = {"securities": securities, "history": history, "info": info,
                        "symbol": intervals(history, "symbol"), "isin": intervals(history, "isin"),
-                       "isin_owner": {i: r.security_id for r in securities.itertuples() for i in r.isins.split("|")}}
+                       "isin_owner": {i: r.security_id for r in securities.itertuples() for i in r.isins.split("|")},
+                       "kind": dict(zip(securities["security_id"], securities["instrument_kind"]))}
     return _CACHE[key]
 
 
@@ -478,15 +508,19 @@ def history(security_id, start=None, end=None, folder=None):
     return df.sort_values("date", kind="stable").reset_index(drop=True)
 
 
-def universe(on_date, series=SERIES, folder=None):
-    """Bhavcopy rows of the securities that traded on on_date in series, with security_id (unknown ISINs dropped)."""
+def universe(on_date, series=SERIES, kinds=("STOCK",), folder=None):
+    """Bhavcopy rows of the securities that traded on on_date in series, with security_id (unknown ISINs dropped),
+    only securities whose instrument_kind is in kinds (None: every kind)."""
     m = load_master(folder)
     day = as_date(on_date)
     df = _read_years(folder, [("date", "==", day), ("series", "in", list(series))], day, day)
     if df.empty:
         return df
     df.insert(0, "security_id", df["isin"].map(m["isin_owner"]))
-    return df.dropna(subset=["security_id"]).sort_values("security_id", kind="stable").reset_index(drop=True)
+    df = df.dropna(subset=["security_id"])
+    if kinds is not None:
+        df = df[df["security_id"].map(m["kind"]).isin(list(kinds))]
+    return df.sort_values("security_id", kind="stable").reset_index(drop=True)
 
 
 def check(folder=None):
