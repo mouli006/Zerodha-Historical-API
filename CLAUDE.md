@@ -33,6 +33,7 @@ A local Flask app ("Kite Backfill", one machine) that:
 - `fno_store.py`: the F&O stores (move-raw, split-stores, derive-without, compare-variants, publish, clear, restore, import). See docs/dev/fno_store.md.
 - `cm_bhav.py`: the NSE equity bhavcopy store. See docs/dev/equity_bhavcopy.md.
 - `nse_reference.py`: the NSE delisting / suspension / merger reference. See docs/dev/nse_reference.md.
+- `security_master.py`: build / show / check the security master (one `security_id` per company). See docs/dev/security_master.md.
 - Never run a CLI against real Kite or Dhan unless the user asks.
 
 ## Code map
@@ -56,6 +57,7 @@ Equity
 - `backfill/cm_bhav.py` (+ `cm_bhav.py`): NSE equity bhavcopy store.
 - `backfill/nse_ref/` (+ `nse_reference.py`): NSE reference lists.
 - `backfill/equity/`: home for new equity modules (security master, split/bonus factors, exits, index membership).
+- `backfill/equity/security_master.py` (+ `security_master.py`): security master from the bhavcopy parquet, and its loaders.
 - `backfill/instruments.py`, `storage.py`, `runner.py`: the Kite bulk candle download.
 
 Web
@@ -84,3 +86,4 @@ Web
 | F&O stores: with/without, derive, move-raw, publish, backtest, clear/restore, import | docs/dev/fno_store.md |
 | NSE equity bhavcopy store (`cm_bhav`) | docs/dev/equity_bhavcopy.md |
 | NSE delisting / suspension / merger reference | docs/dev/nse_reference.md |
+| security master (linking rules, events, review, loaders) | docs/dev/security_master.md |

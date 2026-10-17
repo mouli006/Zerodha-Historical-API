@@ -1,0 +1,43 @@
+# Security master
+
+One stable `security_id` per company, built only from the saved NSE equity bhavcopy parquet
+(`backfill/equity/security_master.py`, CLI `security_master.py`). No network, no broker; `NSE_CM_bhav\` is only read.
+It records the facts the later steps (split/bonus factors, exit list, index membership) need, and builds none of them.
+
+## Rules
+- **Input:** `<folder>\NSE_CM_bhav\<YYYY>.parquet` (`year_files()`: names `YYYY.parquet` only), columns `BHAV_COLUMNS` (`date, symbol, series, isin, open, close, prev_close`), series `SERIES` = EQ, BE, BZ (`--series`). The trading-day calendar is every date in the files whatever the series (`load_bhav()` -> (rows, days)); gaps and `days_since_last` count these days. `--folder` defaults to `config.equity_data_dir()`.
+- **Output:** `<folder>\security_master\` (not inside `NSE_CM_bhav`), rebuilt in full each time, every file atomic (`write_atomic`: `<file>.tmp` then `os.replace`), CSVs LF, ISO dates: `securities.csv/.parquet` (`SECURITY_COLUMNS`), `symbol_history.csv/.parquet` (`HISTORY_COLUMNS`; a period breaks when symbol, ISIN or series changes, a gap alone does not), `events.csv` (`EVENT_COLUMNS`), `review.csv` (`REVIEW_COLUMNS`), `build_report.txt`, `build_info.json` (series, link_gap, data range, rows, built_at IST; the loaders read the series from it) and `.lock`.
+- **Locks:** `build()` refuses (`BhavcopyBusy`, CLI exit 2) while `NSE_CM_bhav\.lock` is held, checked with `backfill.locks.held()`, which only opens the file for reading, locks and unlocks it, and never creates or writes it (`RunLock.acquire` would rewrite its owner text). The check is made at the start only: a download that starts mid-build rewrites year files atomically and the next build picks them up. Then it takes `RunLock(security_master\.lock)` (busy -> `LockBusy`, exit 2).
+- **Conflicts** (`check_conflicts`, before anything is written): one ISIN on two symbols the same day, or one symbol with two ISINs the same day, within the series in scope -> `ConflictError` listing them (first 50 + count), exit 1. None in the real data (checked 2026-10-17); if one ever shows up, ask the user before changing the rule.
+
+## Linking (`link()`, walk the trading days in date order)
+State per security: last symbol, ISIN, series, day, close; `isin_owner` (every ISIN ever seen); `symbol_owner` (symbol -> the security whose *current* symbol it is); `isin_last` (last day of each ISIN in the whole data). Per day, rows with a known ISIN first, then new ISINs sorted by (ISIN, symbol).
+1. Same ISIN as a known security -> same security, any gap. Another symbol -> `RENAME`; another series -> `SERIES_CHANGE`.
+2. New ISIN under the symbol of a known security whose old ISIN does not trade on this day or later (`isin_last < d`), last seen within `--link-gap` (`LINK_GAP` = 10) trading days and not today -> same security, `ISIN_CHANGE` (a split candidate) with `old_close` (last close under the old ISIN), `new_prev_close`, `new_open`, `ratio_prev_close` = old_close / new_prev_close and `ratio_open` = old_close / new_open (6 decimals, blank when dividing by 0). No factor is computed.
+3. Neither -> new security, `LISTED` (note "in data from first day" on the first day of the data).
+4. `review_both_changed()`: a security ending on day d (not the last data day) and another first seen on d or d+1 with another symbol and ISIN, whose first prev_close is within `PRICE_TOL` (0.5%) of the old last close / k, k in `PRICE_DIVISORS` (1, 2, 3, 4, 5, 10) -> `review.csv` `both_changed?`. Never linked.
+5. A known security's symbol with a new ISIN after more than `--link-gap` trading days, or while the old ISIN still trades -> new security (LISTED) plus `review.csv` `symbol_reused?` with the reason.
+7. Absent more than `GAP_DAYS` (20) trading days and then trading again (rule 1 or 2) -> `GAP` with `gap_days` and note "absent <first> to <last>".
+- `security_id` = `S` + 6 digits in order of first appearance, ties by ISIN then symbol (the walk order), so a rebuild over the same data gives the same ids and appending days never changes the ids of securities already seen. Caveat: rule 2 looks ahead (the old ISIN must not trade again), so an old ISIN that reappears in new data could change a link (not an id).
+- Exits are not classified here (that is the exit-list step).
+
+## Real data notes (first build, 2026-10-17)
+- On an ISIN change NSE's `prev_close` for the new ISIN is the old ISIN's unadjusted last close, so `ratio_prev_close` is 1.0 there; `ratio_open` shows the split (KOTAKBANK 5.0, DRREDDY 4.9, NAUKRI 5.0, BAJFINANCE 2025 9.8).
+- TATASTEEL (2022-07-29) and IRCTC (2021-10-29): the old ISIN already traded at the split price on the ex-date, and the new ISIN starts the day after, so neither ratio shows the split. The factor step must take the split date from elsewhere (prices within the old ISIN or the corporate-action list), not from the ISIN change alone.
+- HDFCBANK has two ISINs (the 2019 face-value split, INE040A01026 -> INE040A01034), so the "bonus, one ISIN" known check reports it as not found; the 2025 bonus itself kept INE040A01034.
+
+## Known-case checks (`known_checks()`, in `build_report.txt` and `check`)
+`KNOWN_RENAMES` (a RENAME event old -> new), `KNOWN_ISIN_CHANGES` (an ISIN_CHANGE event for the symbol, with date and both ratios), `KNOWN_BONUSES` (the symbol's security has exactly that one ISIN and no ISIN_CHANGE), `KNOWN_ENDED` (a security with that last symbol not seen on the last data day, last date within `ENDED_TOL_DAYS` = 7 calendar days of the expected one). Plus totals: securities, events per type, review rows per kind, securities per first year / last year. A miss is reported, never fixed by changing a rule: ask the user. `build` exits 0 even with a miss (the report lists it); `check` exits 1.
+
+## Loaders (for later steps; read the built files, cached until they change, `NotBuilt` when missing)
+- `security_id_for(symbol_or_isin, on_date, folder=None)`: point in time. `intervals()`: a symbol (or ISIN) of a security is valid from the first day of its run of periods until that security's next period with another value starts, or until another security takes the value over (symbol reuse); open-ended after the last. Old symbol before the rename date, new after; None before the listing or for an unknown name.
+- `lookup(symbol_or_isin)`: every security that ever had it (used by `show`).
+- `history(security_id, start=None, end=None, folder=None)`: all that security's bhavcopy rows (every column) across its ISINs, in the built series, sorted by date, with a `security_id` column first. Raw prices. Unknown id -> `KeyError`.
+- `universe(on_date, series=("EQ","BE","BZ"), folder=None)`: the bhavcopy rows of that date in `series` with `security_id`; ISINs not in the master (other series) are dropped.
+- `check(folder)`: the known-case checks on the built files.
+
+## CLI (`security_master.py`)
+`build [--folder PATH] [--series EQ,BE,BZ] [--link-gap 10]` (prints the report), `show SYMBOL|ISIN [--folder]` (per security: summary, symbol history, events, review rows), `check [--folder]`. `--folder` must be absolute. Exit codes: 0 done; 1 conflict, no bhavcopy files, not built yet, `show` found nothing, or `check` with a known case not found; 2 argparse errors, `LockBusy`, `BhavcopyBusy`. Run by hand; no cron.
+
+## Tests
+`tests/test_security_master.py`: synthetic yearly parquet in `tmp_path` (`write_store` adds an out-of-scope N1 row on every day, like the real bhavcopy's calendar), `config.load_env` stubbed. Rename, split ratios, bonus, EQ -> BE -> EQ, GAP only past 20 days, listing, symbol reuse (gap and old ISIN still trading), `--link-gap`, both changed (review only), conflicts (nothing written), id stability (rebuild, later year), point in time, history, universe, `--series`, the bhavcopy store's bytes unchanged, `locks.held`, both locks, known checks (with `KNOWN_ENDED` patched) and CLI exit codes.

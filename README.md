@@ -542,6 +542,17 @@ Every file also has `source_file` (the saved file the row came from), `needs_rev
 - **Swap ratios:** NSE's suspension circulars almost never give the new company or the swap ratio. Add them to `reference/manual_mergers.csv` (`old_symbol,new_company,new_symbol,swap_ratio,scheme_type,exit_expected,note`; created with an HDFC example). Every run fills `mergers.csv` from it and clears `needs_review` on those rows. `scheme_type` (MERGER, DEMERGER, CAPITAL_REDUCTION, OTHER, or parts joined with `+`) and `exit_expected` (Y/N) are optional: when filled they replace the parsed values (a value the script doesn't understand is ignored and the row stays `needs_review=Y`). `note` is for you (why the row is there) and isn't copied into `mergers.csv`; an older file with only the first four columns still works.
 - **Backup:** `reference/manual_mergers.csv` in this repo is the backup of these hand-made merger overrides. The script reads only the copy in the data folder (`<data folder>/NSE_CM_bhav/reference/`). If that copy is lost, copy the repo file back there before running. After editing the data folder's copy, copy it to the repo again and commit it. The CSVs are rebuilt on every run, so put corrections there, not in the CSVs.
 
+## Security master
+`security_master.py` gives every NSE company one stable `security_id` (`S000001`, ...) across renames (same ISIN, new symbol), face-value splits (same symbol, new ISIN), bonuses, EQ <-> BE/BZ moves and trading gaps. It is built only from the saved equity bhavcopy above (no Kite, Dhan or NSE request) and is run by hand:
+
+```
+python security_master.py build          # full rebuild; options: --folder PATH, --series EQ,BE,BZ, --link-gap 10
+python security_master.py show RELIANCE  # one company's whole history, by any symbol or ISIN it ever had
+python security_master.py check          # re-run the known-case checks on the built files
+```
+
+Files go to `<data folder>/security_master/`: `securities.csv` (one row per company: first/last date, every symbol and ISIN, last close, trading days since last seen), `symbol_history.csv` (one row per period with the same symbol, ISIN and series), `events.csv` (LISTED, RENAME, ISIN_CHANGE with the closes either side, SERIES_CHANGE, GAP), `review.csv` (cases it will not link by itself: symbol and ISIN changing on the same day with a matching price, or a symbol coming back with a new ISIN) and `build_report.txt` (totals and checks of known cases such as AMARAJABAT -> ARE&M and the TATASTEEL split). The parquet copies of the first two are what backtests read. It refuses to run while a `cm_bhav.py` download is going. Exit codes: 0 done, 1 not run or a known case not found (`check`), 2 bad arguments or another run is going.
+
 ## Credentials
 Your API keys, secrets and access tokens (Kite and Dhan) are stored only in a local `.env` file, which the app creates when you sign in. It is gitignored and never committed. `.env.example` shows the format.
 
