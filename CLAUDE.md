@@ -35,6 +35,7 @@ A local Flask app ("Kite Backfill", one machine) that:
 - `nse_reference.py`: the NSE delisting / suspension / merger reference. See docs/dev/nse_reference.md.
 - `security_master.py`: build / show / check the security master (one `security_id` per company). See docs/dev/security_master.md.
 - `adjustments.py`: build / show / check split / bonus factors (price move confirmed by ISIN change or NSE CSV), fetch-actions (NSE corporate actions). See docs/dev/adjustments.md.
+- `exits.py`: build / show / check the exit list (status, exit reason, suggested treatment) and listing kinds. See docs/dev/exits.md.
 - Never run a CLI against real Kite or Dhan unless the user asks.
 
 ## Code map
@@ -60,6 +61,7 @@ Equity
 - `backfill/equity/`: home for new equity modules (security master, split/bonus factors, exits, index membership).
 - `backfill/equity/security_master.py` (+ `security_master.py`): security master from the bhavcopy parquet, and its loaders.
 - `backfill/equity/adjustments.py` / `corp_actions.py` (+ `adjustments.py`): split / bonus factors, `factor_on`, `adjusted_history`; NSE corporate-actions download.
+- `backfill/equity/exits.py` (+ `exits.py`): exit list, listing kinds, `exit_info`, `exits_between`, `status_on`, `listing_info`.
 - `backfill/instruments.py`, `storage.py`, `runner.py`: the Kite bulk candle download.
 
 Web
@@ -90,3 +92,4 @@ Web
 | NSE delisting / suspension / merger reference | docs/dev/nse_reference.md |
 | security master (linking rules, events, review, loaders) | docs/dev/security_master.md |
 | split / bonus factors (detection, confirmation, manual overrides, loaders) | docs/dev/adjustments.md |
+| exit list and listing kinds (reasons, priority, treatments, loaders) | docs/dev/exits.md |

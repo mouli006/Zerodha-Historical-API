@@ -568,6 +568,21 @@ python adjustments.py check          # known cases (TATASTEEL, RELIANCE bonus, .
 - **Files:** `events.csv` (every price jump and confirmed event), `factors.csv/.parquet` (per company, the factor per period; divide a price by it to put it on today's scale), `review.csv` (jumps nobody confirmed, corporate actions with no price jump, input problems), `links.csv` and `build_report.txt`.
 - Build the security master again first after new bhavcopy days (the build refuses while it is older). Adjusted prices use splits known only later: use them for charts and returns, and raw prices for "the price on that day". Exit codes: 0 done, 1 not run or `check` failed, 2 bad arguments or another run is going.
 
+## Exit list and listing types
+`exits.py` says, for every company in the security master, whether it still trades (ACTIVE, DORMANT, EXITED), why each exited one left and how each one first appeared. It reads only the saved bhavcopy, the security master, the adjustment factors and the NSE reference lists (no Kite, Dhan or NSE request):
+
+```
+python exits.py build        # full rebuild; options: --folder PATH, --active-days 20, --exit-days 60, --batch-min 20, --start-days 20
+python exits.py show HDFC    # status, listing kind and the exit row of every company that had this symbol or ISIN
+python exits.py check        # known cases (HDFC -> HDFCBANK, MINDTREE -> LTI, the 2026 batch admissions, ...)
+```
+
+- **Why it left:** MERGER (with the acquirer's `security_id` and the swap ratio when known), VOLUNTARY_DELISTING, COMPULSORY_DELISTING, LIQUIDATION, MOVED_TO_SME, RELISTED (came back under a new ISIN), SUSPENDED, RIGHTS_ENDED, ETF_ENDED or UNKNOWN, matched from the NSE reference lists and the bhavcopy by symbol, ISIN and date.
+- **What a backtest could do:** `suggested_treatment` CONVERT (into the acquirer's shares), CASH_AT_LAST, WRITE_DOWN or REVIEW, with the raw and adjusted last close and distress hints (price change, days in BE/BZ, turnover drop). This is only a suggestion: your backtest decides what an exited holding is worth.
+- **How it arrived:** `listing_kind` IN_DATA_FROM_START, SME_MIGRATION, RELISTING, BATCH_ADMISSION (a day when NSE admitted many companies at once, e.g. 2026-04-20 and 2026-08-17) or NEW_LISTING. A batch admission or SME migration start date is not an IPO date.
+- **Merger facts** (acquirer, swap ratio) come only from `mergers.csv` and your `manual_mergers.csv` (see the NSE reference above); add a row there and re-run `nse_reference.py --offline`, then `exits.py build`.
+- **Files** in `<data folder>/exits/`: `exits.csv/.parquet`, `status.csv/.parquet`, `listings.csv`, `review.csv` (large unknown exits, conflicting matches, acquirers not found, list rows that matched nothing) and `build_report.txt`. Build the security master and the adjustments again first after new bhavcopy days (the build refuses while they are older). Exit codes: 0 done, 1 not run or `check` failed, 2 bad arguments or another run is going.
+
 ## Credentials
 Your API keys, secrets and access tokens (Kite and Dhan) are stored only in a local `.env` file, which the app creates when you sign in. It is gitignored and never committed. `.env.example` shows the format.
 
