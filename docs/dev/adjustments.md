@@ -40,8 +40,16 @@ are computed when loading. Dividends are not adjusted.
     (otherwise a 1:10 bonus would match any quiet day). Day choice: the exact date first, then the closest
     match, then the nearest day. This search ignores `--tol`, so a clear 1:10 bonus is found.
     - Factor, `kind` and `ratio_label` come from the corporate action.
-    - No move -> review `ca_no_move` (the suspect case). Six small bonuses (1:10, 1:5) are there because their
-      move cannot be told from noise.
+    - When that search finds nothing (`fallback()`), the security's row on the CSV ex-date (or its next trading
+      day) is checked:
+      - `csv_exact_date`: the move there (ratio or close move) goes the right way, is within `EXACT_DATE_TOL`
+        (0.25) of the factor and is at least `EXACT_DATE_MIN` (1.3), or at most 1/1.3 for a consolidation. This
+        covers stocks that rally on the ex-date, e.g. VSTIND 10:1 = 11 with a move of 9.39. A move like that on
+        another day is not accepted.
+      - `csv_small`: otherwise a factor between 1 and `SMALL_FACTOR` (1.3), i.e. a bonus of 1:4 or smaller, is
+        applied there without price evidence. Its 5–20% drop is lost in the day's noise (MUTHOOTCAP 1:10 shows
+        no move at all).
+    - Still nothing (or no trading on or after the ex-date) -> review `ca_no_move` (the suspect case).
   - Unconfirmed candidates -> `applied=N`, review `price_only`, with the suggested ratio.
 - **Corporate-actions input:** every `*.csv` in `adjustments\input\` (from `fetch-actions`, or NSE's own CSV
   saved by hand), duplicates dropped; an empty or missing folder is fine. Headers are matched loosely (letters only, upper case): SYMBOL, PURPOSE and EX-DATE are
@@ -102,8 +110,18 @@ applied, and the close before / factor next to the open and close on the ex-date
 - Without the corporate-actions CSV, only DRREDDY, NAUKRI, KOTAKBANK 2026 and BAJFINANCE 2025 are confirmed (by
   their ISIN change). With the CSV, all are confirmed (2026-10-17).
 - BAJFINANCE 2016-09 is 10: NSE lists "Bonus 1:1 / Face Value Split From Rs 10 To Rs 2".
-- First full build (2026-10-17): 942 price candidates; 167 confirmed by an ISIN change, 803 by the CSV (165 by
-  both); 805 applied in 608 securities; 179 price_only and 20 ca_no_move in review.
+- Full build (2026-10-17): 942 price candidates; 167 confirmed by an ISIN change, 803 by the CSV (165 by both),
+  7 by `csv_exact_date`, 8 by `csv_small`; 819 applied in 617 securities. Review: 173 price_only and 5
+  ca_no_move.
+- The 5 `ca_no_move` rows are left for `manual_factors.csv`:
+  - DVL 2021-08-05: bonus 1:2, no move.
+  - AHLEAST 2022-10-06: NSE's prev_close is adjusted by 1.5, but the price fell 1.9–2x (probably a second
+    action the same day).
+  - AXITA 2023-12-22: 1.33 with a move of 1.20, under the 1.3 minimum.
+  - VERTOZ 2025-06-25: suspended across the consolidation; the new ISIN came back after 12 trading days as a new
+    security.
+  - SUMEETINDS 2025-10-03: the CSV carries the old ISIN from before the 2024 suspension, which points to the
+    ended security.
 - A miss is reported, never fixed by changing a rule. `build` exits 0, and `check` exits 1.
 
 ## CLI (`adjustments.py`)
@@ -154,7 +172,9 @@ applied, and the close before / factor next to the open and close on the ex-date
 - purpose and date parsing, input errors, the empty folder;
 - the locks, the stale master, inputs byte for byte unchanged;
 - known cases and the CLI;
-- `--ca-tol` (an open 6% off still matches), debenture bonuses and future ex-dates skipped.
+- `--ca-tol` (an open 6% off still matches), debenture bonuses and future ex-dates skipped;
+- `csv_exact_date` (VSTIND-like 9.4 for 11 on the ex-date; not two days later; not under 1.3 or the wrong way);
+- `csv_small` (1:10 and 1:4 with a flat price, the next trading day, no trading after the ex-date).
 
 `tests/test_corp_actions.py`: fixtures in `tests/fixtures/corp_actions/`: `2024_sample.json` (4 rows of the real
 answer), `sample.csv` (real rows: TATASTEEL, RELIANCE, BAJFINANCE, MINDACORP, NTPC, TVSMOTOR, a dividend, a GS row)

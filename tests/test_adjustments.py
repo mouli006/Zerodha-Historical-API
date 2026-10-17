@@ -457,10 +457,11 @@ def test_ca_tol_matches_an_open_well_off_the_factor(tmp_path):
     rows = trade("OFF", "INE000021011", r(0, 20), close=1000.0) + trade("OFF", "INE000021011", r(20, 40), close=212.8,
                                                                          prev=1000.0, opn=212.8)
     ca = [("OFF", "Face Value Split (Sub-Division) - From Rs 10/- Per Share To Rs 2/- Per Share", DAYS[20])]
-    build(tmp_path, rows, ca=ca, ca_tol=0.03)
-    assert list(read(tmp_path, "review.csv")["kind"]) == ["price_only", "ca_no_move"]
+    build(tmp_path, rows, ca=ca, ca_tol=0.03)                 # outside 3%: only the exact-date rule accepts it
+    assert read(tmp_path, "review.csv").empty and events(tmp_path, "OFF").confirmed_by[0] == "csv_exact_date"
     adj.build(str(tmp_path), log=lambda *_: None)                            # default ca-tol 0.10
     e = events(tmp_path, "OFF")
+    assert e.confirmed_by[0] == "corp_action"
     assert (e.applied[0], e.factor[0], e.kind[0], e.ratio_label[0]) == ("Y", "5.0", "SPLIT_OR_BONUS",
                                                                         "split Rs 10 -> Rs 2")
     assert read(tmp_path, "review.csv").empty
@@ -480,3 +481,55 @@ def test_cli_ca_tol_argument():
         with pytest.raises(SystemExit) as e:
             cli.main(["build", "--ca-tol", bad])
         assert e.value.code == 2
+
+
+def test_exact_date_accepts_a_smaller_move_on_the_ex_date(tmp_path):
+    # VSTIND-like: bonus 10:1 (factor 11), the price falls only 9.4x on the ex-date (the stock rallied that day)
+    rows = split("VST", "INE000023011", 20, 4456.45, 474.07)
+    build(tmp_path, rows, ca=[("VST", "Bonus 10:1", DAYS[20])])
+    e = events(tmp_path, "VST")
+    assert (e.ex_date[0], e.applied[0], e.factor[0], e.confirmed_by[0], e.kind[0]) == \
+        (str(DAYS[20]), "Y", "11.0", "csv_exact_date", "SPLIT_OR_BONUS")
+    assert "move 9.4 on the ex-date accepted" in e.note[0]
+    assert not (read(tmp_path, "review.csv")["kind"] == "ca_no_move").any()
+    assert factors(tmp_path)[0][2] == 11.0
+
+
+def test_exact_date_rule_only_on_the_ex_date(tmp_path):
+    # the same 9.4x move two trading days after the CSV ex-date: outside --ca-tol, and not on the ex-date
+    build(tmp_path, split("VS2", "INE000024011", 22, 4456.45, 474.07), ca=[("VS2", "Bonus 10:1", DAYS[20])])
+    e = events(tmp_path, "VS2")
+    assert (e.ex_date[0], e.applied[0]) == (str(DAYS[22]), "N")
+    assert sorted(read(tmp_path, "review.csv")["kind"]) == ["ca_no_move", "price_only"]
+
+
+def test_exact_date_needs_a_big_move_the_right_way(tmp_path):
+    rows = (split("SML", "INE000025011", 20, 125.0, 100.0)            # 1.25 for factor 1.5: under 1.3
+            + split("WRG", "INE000026011", 20, 100.0, 140.0))         # price up for a bonus: wrong way
+    build(tmp_path, rows, ca=[("SML", "Bonus 1:2", DAYS[20]), ("WRG", "Bonus 1:2", DAYS[20])])
+    assert (events(tmp_path)["applied"] == "Y").sum() == 0
+    rv = read(tmp_path, "review.csv")
+    assert sorted(rv.loc[rv["kind"] == "ca_no_move", "symbol"]) == ["SML", "WRG"]
+
+
+def test_small_factor_applied_without_price_evidence(tmp_path):
+    rows = (trade("TEN", "INE000027011", r(0, 40), close=100.0)
+            + trade("QTR", "INE000028011", r(0, 40), close=50.0)
+            + trade("SKP", "INE000029011", r(0, 15), close=80.0) + trade("SKP", "INE000029011", r(18, 40), close=80.0)
+            + trade("END", "INE000030011", r(0, 10), close=60.0))
+    ca = [("TEN", "Bonus 1:10", DAYS[20]), ("QTR", "Bonus 1:4", DAYS[25]), ("SKP", "Bonus 1:5", DAYS[16]),
+          ("END", "Bonus 1:10", DAYS[20])]
+    build(tmp_path, rows, ca=ca)
+    ev = events(tmp_path).set_index("symbol")
+    assert (ev.loc["TEN", "ex_date"], ev.loc["TEN", "applied"], ev.loc["TEN", "factor"], ev.loc["TEN", "confirmed_by"],
+            ev.loc["TEN", "source"]) == (str(DAYS[20]), "Y", "1.1", "csv_small", "corp_action")
+    assert "applied without price evidence (factor < 1.3)" in ev.loc["TEN", "note"]
+    assert (ev.loc["QTR", "confirmed_by"], ev.loc["QTR", "factor"]) == ("csv_small", "1.25")
+    # SKP did not trade on the ex-date: its next trading day
+    assert (ev.loc["SKP", "ex_date"], ev.loc["SKP", "confirmed_by"]) == (str(DAYS[18]), "csv_small")
+    assert f"corporate action ex-date {DAYS[16]}" in ev.loc["SKP", "note"]
+    assert "END" not in ev.index                                     # no trading on or after the ex-date
+    rv = read(tmp_path, "review.csv")
+    assert list(rv["kind"]) == ["ca_no_move"] and rv.symbol[0] == "END"
+    assert factors(tmp_path, sid_of(tmp_path, "TEN")) == [(str(DAYS[0]), str(DAYS[19]), 1.1),
+                                                          (str(DAYS[20]), str(DAYS[39]), 1.0)]

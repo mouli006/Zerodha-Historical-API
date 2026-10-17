@@ -39,6 +39,9 @@ MANUAL = "manual_factors.csv"
 TOL = 0.25               # price candidate: |close(p) / open(d) - 1| above this (NSE price bands are 20% at most)
 SNAP_TOL = 0.03          # a ratio snaps to RATIOS within 3% (the opening move is not exact, e.g. 9.76 for 10)
 CA_TOL = 0.10            # a corporate action matches a price move within 10% of its factor (MINDACORP opened 4.7% off)
+EXACT_DATE_TOL = 0.25    # on the CSV ex-date itself: a move within 25% of the factor (the stock may rally that day) ...
+EXACT_DATE_MIN = 1.3     # ... in the right direction and at least 1.3 (or at most 1/1.3), so it is not noise
+SMALL_FACTOR = 1.3       # a corporate action below this factor is applied on its ex-date without price evidence
 MIN_PRICE = 5.0          # price candidates need close(p) >= this (tick noise on penny stocks)
 KINDS = ("STOCK",)
 ISIN_WINDOW = 10         # trading days between an event and an ISIN change of the same security
@@ -361,6 +364,27 @@ def event_from_row(x, i):
     return row
 
 
+def fallback(x, rows, ex, factor):
+    """(row, confirmed_by, note) when the price search found no match: the security's row on the CSV ex-date, or its
+    next trading day. csv_exact_date: the move there goes the right way, is within EXACT_DATE_TOL of the factor and at
+    least EXACT_DATE_MIN (1/EXACT_DATE_MIN for a consolidation). csv_small: else a factor below SMALL_FACTOR is
+    applied there without price evidence. (None, None, None) when neither applies."""
+    later = [j for j in rows if x.at[j, "date"] >= ex]
+    if not later:
+        return None, None, None
+    j = min(later, key=lambda k: x.at[k, "date"])
+    for v in (x.at[j, "ratio"], x.at[j, "close_move"]):
+        if v != v or not v:
+            continue
+        right_way = v > 1 if factor > 1 else v < 1
+        big = v >= EXACT_DATE_MIN if factor > 1 else v <= 1 / EXACT_DATE_MIN
+        if right_way and big and abs(v / factor - 1) <= EXACT_DATE_TOL:
+            return j, "csv_exact_date", f"move {v:.4g} on the ex-date accepted (within {EXACT_DATE_TOL:.0%})"
+    if 1 < factor < SMALL_FACTOR:
+        return j, "csv_small", f"applied without price evidence (factor < {SMALL_FACTOR:g})"
+    return None, None, None
+
+
 def _round(v):
     return None if v is None or pd.isna(v) else round(float(v), 6)
 
@@ -401,6 +425,7 @@ def detect(x, days, m, changes, ca, manual, tol=TOL, snap_tol=SNAP_TOL, min_pric
 
     # (b) corporate actions
     rows_of = x[has].groupby("security_id").groups
+    all_rows = x.groupby("security_id").groups
     series = set(m["info"]["series"])
     groups, skipped = {}, {"no action": 0, "other series": 0, "other kind": 0, "after the data": 0}
     for r in ca.itertuples():
@@ -442,12 +467,12 @@ def detect(x, days, m, changes, ca, manual, tol=TOL, snap_tol=SNAP_TOL, min_pric
         factor = math.prod(f for _, f in g["actions"])
         what = " + ".join(lbl for lbl, _ in g["actions"])
         purpose = " / ".join(g["purposes"])
-        if sid not in rows_of:
+        if sid not in all_rows:
             reviews.append(review("ca_unknown", sid, ex, g["symbol"], f"no price rows of this security; {purpose}"))
             continue
         target = bisect_left(days, ex)
         best = None
-        for j in rows_of[sid]:
+        for j in rows_of.get(sid, []):
             dist = int(x.at[j, "di"]) - target
             if abs(dist) > CA_WINDOW:
                 continue
@@ -460,11 +485,15 @@ def detect(x, days, m, changes, ca, manual, tol=TOL, snap_tol=SNAP_TOL, min_pric
             key = (dist != 0, err, abs(dist))
             if best is None or key < best[0]:
                 best = (key, j)
+        how, note = "corp_action", None
         if best is None:
-            reviews.append(review("ca_no_move", sid, ex, g["symbol"],
-                                  f"{what} = {factor:g}: no price move of {factor:g} within {CA_WINDOW} trading "
-                                  f"days; {purpose}"))
-            continue
+            j, how, note = fallback(x, all_rows[sid], ex, factor)
+            if j is None:
+                reviews.append(review("ca_no_move", sid, ex, g["symbol"],
+                                      f"{what} = {factor:g}: no price move of {factor:g} within {CA_WINDOW} trading "
+                                      f"days; {purpose}"))
+                continue
+            best = (None, j)
         j = best[1]
         key = (sid, x.at[j, "date"])
         e = events.get(key)
@@ -475,7 +504,9 @@ def detect(x, days, m, changes, ca, manual, tol=TOL, snap_tol=SNAP_TOL, min_pric
             events[key] = e
         e["ca_ex_date"], e["ca_purpose"] = ex, purpose
         e["ratio_label"], e["kind"] = what, kind_of(factor)      # the corporate action names the event
-        confirm(e, "corp_action", factor, None if ex == e["ex_date"] else f"corporate action ex-date {ex}")
+        if ex != e["ex_date"]:
+            note = f"{note}; corporate action ex-date {ex}" if note else f"corporate action ex-date {ex}"
+        confirm(e, how, factor, note)
 
     # manual overrides
     known = set(m["kind"])
@@ -687,6 +718,8 @@ def report_text(info, meas, ev, rv, lk, skipped, ca_rows, checks):
           f"  confirmed by (b) corporate action: {int(conf.str.contains('corp_action').sum()):,} "
           f"(of which found below the price threshold: {int((ev['source'] == 'corp_action').sum()):,})",
           f"  confirmed by both: {int((conf.str.contains('isin_change') & conf.str.contains('corp_action')).sum()):,}",
+          f"  applied on the exact ex-date (csv_exact_date): {int(conf.str.contains('csv_exact_date').sum()):,}; "
+          f"without price evidence (csv_small, factor < {SMALL_FACTOR:g}): {int(conf.str.contains('csv_small').sum()):,}",
           f"  manual: {int(conf.str.contains('manual').sum()):,}",
           f"  unconfirmed price candidates (not applied, review price_only): {int((rv['kind'] == 'price_only').sum()):,}",
           f"  removed by manual: {int(ev['note'].fillna('').str.contains('removed by').sum()):,}",
