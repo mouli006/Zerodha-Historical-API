@@ -402,6 +402,17 @@ def test_instrument_kind():
     assert sm.instrument_kind(["INE123A20011"], ["ABCRIGHTS"], ["RE"]) == "RIGHTS"
     assert sm.instrument_kind(["INF204KB14I2"], ["ODD-RE"], ["RE"]) == "ETF"
     assert sm.instrument_kind(["INE002A01018"], ["RELIANCE"], ["EQ", "BE"]) == "STOCK"
+    # numbered rights entitlements (LLOYDS-RE1, HCC-RE1 in the real data)
+    assert sm.instrument_kind(["INE123A20011"], ["ABC-RE1"], ["BE"]) == "RIGHTS"
+    assert sm.instrument_kind(["INE123A20011"], ["ABC-RE12"], ["EQ"]) == "RIGHTS"
+    assert sm.instrument_kind(["INE123A01011"], ["ABCRE1"], ["EQ"]) == "STOCK"
+    assert sm.instrument_kind(["INE123A01011"], ["ABC-REIT"], ["EQ"]) == "STOCK"
+
+
+def test_numbered_rights_built_as_rights(tmp_path):
+    build(tmp_path, trade("X-RE1", "INE000022060", r(0, 5), close=2.0) + trade("XCO", "INE000022078", r(0, 20)))
+    sec = read(tmp_path, "securities.csv").set_index("first_symbol")
+    assert sec.loc["X-RE1", "instrument_kind"] == "RIGHTS" and sec.loc["XCO", "instrument_kind"] == "STOCK"
 
 
 def test_kinds_in_securities_review_and_universe(tmp_path):

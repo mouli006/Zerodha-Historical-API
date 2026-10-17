@@ -112,6 +112,7 @@ def rows_all():
     rows += trade("SMEUP", "INE021A01011", r(0, 80), series="SM") + trade("SMEUP", "INE021A01011", r(90, N))
     rows += trade("RELI", "INE030A01011", r(0, 41)) + trade("RELI", "INE030A01029", r(120, N))
     rows += trade("ABC-RE", "INE040A01011", r(10, 31))
+    rows += trade("XYZ-RE1", "INE041A01011", r(10, 31))
     rows += trade("ETFX", "INF050A01011", r(0, 41))
     rows += falling() + split_co()
     rows += trade("QUIET", "INE080A01011", r(0, 41))                         # suspension cancelled: UNKNOWN
@@ -420,6 +421,99 @@ def test_priority_and_conflict(built):
     assert len(c) == 1 and c["details"].iloc[0].startswith("chose MERGER")
 
 
+def late_rows():
+    return rows_all() + sum((trade(s, f"INE2{k:02d}A01011", r(0, 41)) for k, s in
+                             enumerate(("LIQV", "LIQC", "LIQS", "VOLFAR", "SUSFAR", "COMPC", "VOLIBC"))), [])
+
+
+def late_refs():
+    """Rows far after the last date (day 40): liquidation and compulsory ones match, the others do not."""
+    refs = ref_rows()
+    far = str(DAYS[150])
+    refs["voluntary_delisting.csv"] += [
+        {"list": "delisted", "symbol": "LIQV", "board": "Main Board", "delisting_date": far,
+         "delisting_type": "Delisting - Liquidation"},
+        {"list": "delisted", "symbol": "VOLFAR", "board": "Main Board", "delisting_date": far,
+         "delisting_type": "Voluntary Delisting"},
+        {"list": "delisted", "symbol": "VOLIBC", "board": "Main Board", "delisting_date": str(DAYS[45]),
+         "delisting_type": "Voluntary Delisting"}]
+    refs["delisting_circulars.csv"] += [
+        {"circular_no": "D2", "delisting_type": "ibc", "symbol": "LIQC", "effective_date": "2022-06-01"},
+        {"circular_no": "D3", "delisting_type": "compulsory", "symbol": "COMPC", "effective_date": far},
+        {"circular_no": "D4", "delisting_type": "ibc", "symbol": "VOLIBC", "effective_date": str(DAYS[60])}]
+    refs["suspensions.csv"] += [
+        {"circular_no": "S10", "status": "SUSPENDED", "symbol": "LIQS", "effective_date": far,
+         "reason": "IBC / resolution plan", "exit_expected": "Y"},
+        {"circular_no": "S11", "status": "SUSPENDED", "symbol": "SUSFAR", "effective_date": str(DAYS[70]),
+         "reason": "non-compliance with listing rules", "exit_expected": "Y"}]
+    return refs
+
+
+@pytest.fixture(scope="module")
+def late(tmp_path_factory):
+    mp = pytest.MonkeyPatch()
+    mp.setattr(config, "load_env", lambda: {})
+    f = prepare(tmp_path_factory.mktemp("late"), rows=late_rows(), refs=late_refs())
+    result = run(f)
+    yield f, result
+    mp.undo()
+
+
+def test_liquidation_and_compulsory_match_any_later_date(late):
+    f, _ = late
+    for sym, source in (("LIQV", "voluntary_delisting.csv"), ("LIQC", "delisting_circulars.csv"),
+                        ("LIQS", "suspensions.csv")):
+        x = exit_of(f, sym)
+        assert x.reason == "LIQUIDATION" and x.reason_source.startswith(source), sym
+        assert int(x.reason_distance) >= 110
+    x = exit_of(f, "COMPC")
+    assert x.reason == "COMPULSORY_DELISTING" and x.reason_distance == "110"
+
+
+def test_voluntary_and_ordinary_suspension_keep_their_windows(late):
+    f, _ = late
+    assert exit_of(f, "VOLFAR").reason == "UNKNOWN"     # voluntary: 0..60 only
+    assert exit_of(f, "SUSFAR").reason == "UNKNOWN"     # ordinary suspension: 0..10 only
+    u = read(f, "review.csv")
+    u = u[u["kind"] == "unmatched_reference"]["details"]
+    assert u.str.contains(r"date outside the window: \S+ last \S+ \(\+110 trading days\)").any()
+
+
+def test_liquidation_beats_voluntary(late):
+    f, _ = late
+    x = exit_of(f, "VOLIBC")
+    assert x.reason == "LIQUIDATION" and x.reason_source.startswith("delisting_circulars.csv")
+    assert "also VOLUNTARY_DELISTING voluntary_delisting.csv" in x.note
+    assert x.suggested_treatment == "WRITE_DOWN"
+    rv = read(f, "review.csv")
+    c = rv[(rv["kind"] == "conflict") & (rv["symbol"] == "VOLIBC")]
+    assert len(c) == 1 and c["details"].iloc[0].startswith("chose LIQUIDATION")
+
+
+def test_pick_liquidation_over_voluntary():
+    vol = ex.match("S1", "VOLUNTARY_DELISTING", "voluntary_delisting.csv", 1, DAYS[5], 5)
+    liq = ex.match("S1", "LIQUIDATION", "suspensions.csv", 2, DAYS[90], 90)
+    assert ex.pick([vol, liq]) is liq
+    merger = ex.match("S1", "MERGER", "mergers.csv", 3, DAYS[1], 1)
+    assert ex.pick([vol, liq, merger]) is merger       # only the voluntary choice gives way
+
+
+@pytest.mark.parametrize("day, expected", [(100, "LIQUIDATION"), (130, "RELISTED")])
+def test_no_match_on_or_after_a_relisting(tmp_path, day, expected):
+    """RELI stops on day 40 and comes back under a new ISIN on day 120: a liquidation circular for RELI dated on or
+    after day 120 belongs to the new security, never to the old one."""
+    refs = ref_rows()
+    refs["delisting_circulars.csv"].append({"circular_no": "D9", "delisting_type": "liquidation", "symbol": "RELI",
+                                            "effective_date": str(DAYS[day])})
+    f = prepare(tmp_path, refs=refs)
+    run(f)
+    x = exit_of(f, "RELI")
+    assert x.reason == expected and x.relisted_as == sm.lookup("RELI", f)[1]
+    if expected == "RELISTED":
+        u = read(f, "review.csv")["details"]
+        assert u.str.contains(f"after relisting as {x.relisted_as} on {DAYS[120]}").any()
+
+
 def test_pick_order():
     m = [ex.match("S1", "SUSPENDED", "suspensions.csv", 1, DAYS[1], 1),
          ex.match("S1", "LIQUIDATION", "delisting_circulars.csv", 2, DAYS[9], 9),
@@ -450,18 +544,21 @@ def test_relisted_and_relisting(built):
 
 def test_rights_and_etf_ended(built):
     f, _ = built
-    assert exit_of(f, "ABC-RE").reason == "RIGHTS_ENDED"
+    for sym in ("ABC-RE", "XYZ-RE1"):                   # numbered rights entitlements are RIGHTS too
+        x = exit_of(f, sym)
+        assert (x.reason, x.instrument_kind, x.suggested_treatment) == ("RIGHTS_ENDED", "RIGHTS", "NOT_APPLICABLE")
     x = exit_of(f, "ETFX")
-    assert x.reason == "ETF_ENDED" and x.instrument_kind == "ETF" and x.suggested_treatment == "REVIEW"
+    assert x.reason == "ETF_ENDED" and x.instrument_kind == "ETF" and x.suggested_treatment == "NOT_APPLICABLE"
 
 
 def test_unmatched_reference_rows_go_to_review(built):
-    f, _ = built
+    f, result = built
     rv = read(f, "review.csv")
     u = rv[rv["kind"] == "unmatched_reference"]
-    assert u["details"].str.contains("voluntary_delisting.csv row 3: no exited security with NOSUCH / "
-                                     "INE999X01011").any()
-    assert u["details"].str.contains("delisting_circulars.csv row 1: no exited security with LATECIRC").any()
+    # symbols / ISINs that never trade in the store are only counted in the report
+    assert not u["details"].str.contains("NOSUCH|LATECIRC").any()
+    assert ("never appears in the bhavcopy (not in review.csv): delisting_circulars.csv 1, "
+            "voluntary_delisting.csv 1") in result["report"]
     assert u["details"].str.contains("compulsory_delisting.csv row 2").any()     # ACTIVE1 still trades
     assert u["details"].str.contains("suspensions.csv row 7").any()              # exit expected, none seen
     assert not u["details"].str.contains("suspensions.csv row 8").any()          # DORM: no exit expected
@@ -520,8 +617,10 @@ def test_treatment_table():
     for reason in ("LIQUIDATION", "COMPULSORY_DELISTING"):
         assert ex.treatment(reason, None, "", False) == "WRITE_DOWN"
     assert ex.treatment("UNKNOWN", None, "", True) == "WRITE_DOWN"
-    for reason in ("UNKNOWN", "SUSPENDED", "RIGHTS_ENDED", "ETF_ENDED"):
+    for reason in ("UNKNOWN", "SUSPENDED"):
         assert ex.treatment(reason, None, "", False) == "REVIEW"
+    for reason in ("RIGHTS_ENDED", "ETF_ENDED"):
+        assert ex.treatment(reason, None, "", True) == "NOT_APPLICABLE"
 
 
 def test_exits_columns(built):

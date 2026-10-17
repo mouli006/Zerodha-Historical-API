@@ -18,6 +18,7 @@ coming back with a new ISIN, are never linked: they go to review.csv. Exits, spl
 are later steps."""
 import json
 import os
+import re
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
@@ -115,12 +116,15 @@ def check_conflicts(df):
         raise ConflictError(f"{len(lines)} conflicts in the bhavcopy (nothing written):\n{shown}")
 
 
+RIGHTS_SYMBOL = re.compile(r"-RE\d*$")   # rights entitlements: ABC-RE, ABC-RE1, ABC-RE2, ...
+
+
 def instrument_kind(isins, symbols, series):
-    """ETF for any fund ISIN (INF...), else RIGHTS for a rights entitlement (symbol ending -RE, or the RE series),
-    else STOCK."""
+    """ETF for any fund ISIN (INF...), else RIGHTS for a rights entitlement (symbol ending -RE with optional digits,
+    or the RE series), else STOCK."""
     if any(i.startswith("INF") for i in isins):
         return "ETF"
-    if any(sym.endswith("-RE") for sym in symbols) or "RE" in series:
+    if any(RIGHTS_SYMBOL.search(sym) for sym in symbols) or "RE" in series:
         return "RIGHTS"
     return "STOCK"
 

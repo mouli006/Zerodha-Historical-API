@@ -40,6 +40,7 @@ START_DAYS = 20          # first seen within the first 20 trading days of the da
 MERGER_WINDOW = 10       # mergers: last_trading_date within +-10 trading days of the last date
 DELIST_WINDOW = 60       # delistings: 0 to 60 trading days after the last date
 SUSPEND_WINDOW = 10      # suspensions: 0 to 10 trading days after the last date
+ANY_LATER = ("LIQUIDATION", "COMPULSORY_DELISTING")   # these match any date after the last date (orders come late)
 NEAR_LAST = 60           # symbols used in the last 60 trading days of a security are matched against the lists
 DISTRESS_WINDOW = 60     # distress hints over the last 60 trading days
 YEAR_DAYS = 250          # ... against the 250 trading days before them (turnover)
@@ -52,7 +53,7 @@ SME_SERIES = ("SM", "ST")
 STATUSES = ["ACTIVE", "DORMANT", "EXITED"]
 REASONS = ["MERGER", "VOLUNTARY_DELISTING", "COMPULSORY_DELISTING", "LIQUIDATION", "MOVED_TO_SME", "RELISTED",
            "SUSPENDED", "RIGHTS_ENDED", "ETF_ENDED", "UNKNOWN"]          # in priority order
-TREATMENTS = ["CONVERT", "CASH_AT_LAST", "WRITE_DOWN", "REVIEW"]
+TREATMENTS = ["CONVERT", "CASH_AT_LAST", "WRITE_DOWN", "REVIEW", "NOT_APPLICABLE"]
 LISTING_KINDS = ["IN_DATA_FROM_START", "SME_MIGRATION", "RELISTING", "BATCH_ADMISSION", "NEW_LISTING"]
 REVIEW_KINDS = ["unknown_large", "conflict", "unresolved_acquirer", "unmatched_reference"]
 # matches from two of these groups for one security are a conflict (SUSPENDED, RIGHTS / ETF fit with anything)
@@ -181,15 +182,19 @@ def read_reference(folder):
 
 
 def read_store(folder, master_series, isins):
-    """(days, rows, sme, later): the trading days (every date in the files, every series); the rows of the given
-    ISINs in the master's series (date, isin, series, close, turnover); every SM / ST row (date, isin, series);
-    the rows of the given ISINs in any other series (date, isin, series)."""
+    """(days, rows, sme, later, seen): the trading days (every date in the files, every series); the rows of the
+    given ISINs in the master's series (date, isin, series, close, turnover); every SM / ST row (date, isin,
+    series); the rows of the given ISINs in any other series (date, isin, series); every symbol and ISIN in the
+    files, any series."""
     files = sm.year_files(store_dir(folder))
     wanted = pa.array(sorted(isins), type=pa.string())
-    days, rows, sme, later = set(), [], [], []
+    days, rows, sme, later, seen = set(), [], [], [], set()
     for f in files:
-        t = pq.read_table(f, columns=["date", "isin", "series", "close", "turnover"])
+        t = pq.read_table(f, columns=["date", "symbol", "isin", "series", "close", "turnover"])
         days.update(t.column("date").unique().to_pylist())
+        for c in ("symbol", "isin"):
+            seen.update(str(v).upper() for v in t.column(c).unique().to_pylist() if v)
+        t = t.drop_columns(["symbol"])
         mine = pc.is_in(t.column("isin"), value_set=wanted)
         in_master = pc.is_in(t.column("series"), value_set=pa.array(list(master_series)))
         in_sme = pc.is_in(t.column("series"), value_set=pa.array(list(SME_SERIES)))
@@ -200,7 +205,7 @@ def read_store(folder, master_series, isins):
     def frame(parts, cols):
         return pa.concat_tables(parts).to_pandas() if parts else pd.DataFrame(columns=cols)
     return (sorted(days), frame(rows, ["date", "isin", "series", "close", "turnover"]),
-            frame(sme, ["date", "isin", "series"]), frame(later, ["date", "isin", "series"]))
+            frame(sme, ["date", "isin", "series"]), frame(later, ["date", "isin", "series"]), seen)
 
 
 # ---- trading-day arithmetic ----
@@ -281,7 +286,8 @@ def reference_matches(refs, exited, cal, isin_owner):
 
     def try_row(name, i, keys, day, lo, hi, reason, **extra):
         """Match row i of list `name` (keys = its symbols / ISINs) to exited securities with day in [lo, hi]
-        trading days of their last date (hi None: any later day). Unmatched rows are kept with the reason."""
+        trading days of their last date (hi None: any later day), never on or after the first date of a later
+        security with the same symbol (a relisting). Unmatched rows are kept with the reason."""
         sids = []
         for k in keys:
             if not k:
@@ -292,18 +298,23 @@ def reference_matches(refs, exited, cal, isin_owner):
         hit = False
         near = []
         for sid in dict.fromkeys(sids):
-            dist = cal.distance(exited[sid]["last_date"], day)
-            if lo <= dist and (hi is None or dist <= hi):
+            e = exited[sid]
+            dist = cal.distance(e["last_date"], day)
+            relist = e.get("relist")
+            if relist and day >= relist[1]:
+                near.append(f"{sid} last {e['last_date']} ({dist:+d} trading days), after relisting as "
+                            f"{relist[0]} on {relist[1]}")
+            elif lo <= dist and (hi is None or dist <= hi):
                 matches.append(match(sid, reason, name, i, day, dist, **extra))
                 hit = True
             else:
-                near.append(f"{sid} last {exited[sid]['last_date']} ({dist:+d} trading days)")
+                near.append(f"{sid} last {e['last_date']} ({dist:+d} trading days)")
         if not hit:
             known = [k for k in keys if k]
             why = ("date outside the window: " + "; ".join(near)) if near else \
                 f"no exited security with {' / '.join(known)}"
             unmatched.append({"file": name, "row": i, "date": day, "symbol": known[0] if known else "",
-                              "why": why})
+                              "why": why, "keys": known})
 
     mg = refs["mergers.csv"]
     manual = {r.old_symbol.upper(): r for r in refs["manual_mergers.csv"].itertuples() if r.old_symbol}
@@ -332,7 +343,7 @@ def reference_matches(refs, exited, cal, isin_owner):
         sids = [sid for sid in by_symbol.get(sym, [])]
         if not sids:
             unmatched.append({"file": "manual_mergers.csv", "row": i, "date": None, "symbol": sym,
-                              "why": "no exited security with this symbol"})
+                              "why": "no exited security with this symbol", "keys": [sym]})
             continue
         sid = max(sids, key=lambda s: exited[s]["last_date"])
         matches.append(match(sid, "MERGER", "manual_mergers.csv", i, None, None, new_symbol=r.new_symbol,
@@ -354,7 +365,7 @@ def reference_matches(refs, exited, cal, isin_owner):
         if "compulsory" in kind:
             try_row("voluntary_delisting.csv", i, keys, day, 0, None, "COMPULSORY_DELISTING")
         elif "liquidation" in kind:
-            try_row("voluntary_delisting.csv", i, keys, day, 0, DELIST_WINDOW, "LIQUIDATION")
+            try_row("voluntary_delisting.csv", i, keys, day, 0, None, "LIQUIDATION")
         elif "voluntary" in kind:
             try_row("voluntary_delisting.csv", i, keys, day, 0, DELIST_WINDOW, "VOLUNTARY_DELISTING")
         else:
@@ -370,8 +381,10 @@ def reference_matches(refs, exited, cal, isin_owner):
         if day is None or not r.symbol:
             skip("delisting_circulars.csv: no symbol or date")
             continue
-        try_row("delisting_circulars.csv", i, [r.symbol.upper()], day, 0, DELIST_WINDOW,
-                CIRCULAR_REASON.get(kind), extra_note=f"circular {r.circular_no} ({kind or 'no type'})")
+        reason = CIRCULAR_REASON.get(kind)
+        try_row("delisting_circulars.csv", i, [r.symbol.upper()], day, 0,
+                None if reason in ANY_LATER else DELIST_WINDOW, reason,
+                extra_note=f"circular {r.circular_no} ({kind or 'no type'})")
 
     for i, r in enumerate(refs["compulsory_delisting.csv"].itertuples(), 1):
         day = parse_day(r.order_date)
@@ -401,8 +414,8 @@ def reference_matches(refs, exited, cal, isin_owner):
         # the classified reason decides; the free text only when it is blank (NCLT also approves capital reductions)
         reason = "LIQUIDATION" if LIQUIDATION_RX.search(r.reason or r.reason_text) else "SUSPENDED"
         n = len(unmatched)
-        try_row("suspensions.csv", i, [r.symbol.upper()], day, 0, SUSPEND_WINDOW, reason,
-                extra_note=f"suspension: {r.reason or 'no reason'}")
+        try_row("suspensions.csv", i, [r.symbol.upper()], day, 0, None if reason in ANY_LATER else SUSPEND_WINDOW,
+                reason, extra_note=f"suspension: {r.reason or 'no reason'}")
         if len(unmatched) > n:
             u = unmatched.pop()       # a suspension that matches no exit is normal (trading came back) ...
             if getattr(r, "exit_expected", "").upper() == "Y":
@@ -410,11 +423,9 @@ def reference_matches(refs, exited, cal, isin_owner):
     return matches, unmatched, skipped
 
 
-def data_matches(exited, cal, sme, later, sm_review, securities, history):
-    """MOVED_TO_SME, RELISTED, RIGHTS_ENDED / ETF_ENDED and other later series, from the bhavcopy and the master."""
-    matches, notes = [], {}
-    sme_by_isin = {i: g for i, g in sme.groupby("isin")} if not sme.empty else {}
-    later_by_isin = {i: g for i, g in later.groupby("isin")} if not later.empty else {}
+def relistings(exited, sm_review, securities, history):
+    """{security_id: (new security_id, its first date, source)}: the earliest later security (first date after
+    this one's last date) of a symbol_reused? row of the master, or holding one of its near symbols."""
     reused = {}
     for i, r in enumerate(sm_review.itertuples(), 1):
         if r.kind == "symbol_reused?":
@@ -423,6 +434,27 @@ def data_matches(exited, cal, sme, later, sm_review, securities, history):
     holders = {}
     for sym, sid in zip(history["symbol"], history["security_id"]):
         holders.setdefault(sym, set()).add(sid)
+    out = {}
+    for sid, e in exited.items():
+        found = {}
+        for new, i in reused.get(sid, []):
+            found[new] = f"security_master review.csv row {i}"
+        for sym in e["near"]:
+            for other in holders.get(sym, ()):
+                if other != sid and other not in found and first[other] > e["last_date"]:
+                    found[other] = f"security_master symbol {sym}"
+        if found:
+            new = min(found, key=lambda s: (first[s], s))
+            out[sid] = (new, first[new], found[new])
+    return out
+
+
+def data_matches(exited, cal, sme, later):
+    """MOVED_TO_SME, RELISTED (exited[sid]["relist"]), RIGHTS_ENDED / ETF_ENDED and other later series, from the
+    bhavcopy and the master."""
+    matches, notes = [], {}
+    sme_by_isin = {i: g for i, g in sme.groupby("isin")} if not sme.empty else {}
+    later_by_isin = {i: g for i, g in later.groupby("isin")} if not later.empty else {}
     for sid, e in exited.items():
         last = e["last_date"]
         for isin in e["isins"]:
@@ -440,17 +472,9 @@ def data_matches(exited, cal, sme, later, sm_review, securities, history):
                 for series, part in after.groupby("series"):
                     notes.setdefault(sid, []).append(f"{isin} trades later in series {series} from "
                                                      f"{min(part['date'])}")
-        found = {}
-        for new, i in reused.get(sid, []):
-            found[new] = f"security_master review.csv row {i}"
-        for sym in e["near"]:
-            for other in holders.get(sym, ()):
-                if other != sid and other not in found and first[other] > last:
-                    found[other] = f"security_master symbol {sym}"
-        if found:
-            new = min(found, key=lambda s: (first[s], s))
-            d = first[new]
-            matches.append(match(sid, "RELISTED", found[new], None, d, cal.distance(last, d), relisted_as=new))
+        if e.get("relist"):
+            new, d, source = e["relist"]
+            matches.append(match(sid, "RELISTED", source, None, d, cal.distance(last, d), relisted_as=new))
         if e["kind"] == "RIGHTS":
             matches.append(match(sid, "RIGHTS_ENDED", "instrument_kind", None, None, None))
         elif e["kind"] == "ETF":
@@ -459,12 +483,20 @@ def data_matches(exited, cal, sme, later, sm_review, securities, history):
 
 
 def pick(ms):
-    """The match that decides the reason: the first reason in REASONS, then the closest date."""
+    """The match that decides the reason: the first reason in REASONS, then the closest date; except that a
+    LIQUIDATION match beats a VOLUNTARY_DELISTING one (an IBC / liquidation case listed as delisted)."""
     ms = [m for m in ms if m["reason"]]
     if not ms:
         return None
-    return min(ms, key=lambda m: (REASONS.index(m["reason"]), abs(m["distance"]) if m["distance"] is not None
-                                  else 10 ** 6, m["source"], m["row"] or 0))
+
+    def key(m):
+        return (REASONS.index(m["reason"]), abs(m["distance"]) if m["distance"] is not None else 10 ** 6,
+                m["source"], m["row"] or 0)
+    chosen = min(ms, key=key)
+    liquidation = [m for m in ms if m["reason"] == "LIQUIDATION"]
+    if chosen["reason"] == "VOLUNTARY_DELISTING" and liquidation:
+        chosen = min(liquidation, key=key)
+    return chosen
 
 
 def source_text(m):
@@ -541,6 +573,8 @@ def treatment(reason, acquirer, swap, hint):
         return "CASH_AT_LAST"
     if reason in ("LIQUIDATION", "COMPULSORY_DELISTING") or (reason == "UNKNOWN" and hint):
         return "WRITE_DOWN"
+    if reason in ("RIGHTS_ENDED", "ETF_ENDED"):
+        return "NOT_APPLICABLE"
     return "REVIEW"
 
 
@@ -593,7 +627,7 @@ def build_frames(folder, active_days, exit_days, batch_min, start_days, log=prin
     ex = secs[secs["status"] == "EXITED"]
     isins = {i for x in ex["isins"] for i in x.split("|")}
     log(f"Reading {store_dir(folder)} (every series)")
-    days, rows, sme, later = read_store(folder, m["info"]["series"], isins)
+    days, rows, sme, later, seen = read_store(folder, m["info"]["series"], isins)
     cal = Calendar(days)
 
     exited = {}
@@ -601,9 +635,16 @@ def build_frames(folder, active_days, exit_days, batch_min, start_days, log=prin
         last = sm.as_date(r.last_date)
         exited[r.security_id] = {"last_date": last, "isins": r.isins.split("|"), "kind": r.instrument_kind,
                                  "near": near_symbols(r.security_id, history, cal, last) | {r.last_symbol}}
+    for sid, relist in relistings(exited, sm_review, secs, history).items():
+        exited[sid]["relist"] = relist
     log(f"Matching {len(exited):,} exited securities against the reference lists")
     ref_m, unmatched, skipped = reference_matches(refs, exited, cal, m["isin_owner"])
-    data_m, later_notes = data_matches(exited, cal, sme, later, sm_review, secs, history)
+    never = {}                # rows naming a symbol / ISIN that never trades in the store: counted, not reviewed
+    for x in unmatched:
+        if not any(k in seen for k in x["keys"]):
+            never[x["file"]] = never.get(x["file"], 0) + 1
+    unmatched = [x for x in unmatched if any(k in seen for k in x["keys"])]
+    data_m, later_notes = data_matches(exited, cal, sme, later)
     by_sid = {}
     for x in ref_m + data_m:
         by_sid.setdefault(x["security_id"], []).append(x)
@@ -699,7 +740,7 @@ def build_frames(folder, active_days, exit_days, batch_min, start_days, log=prin
     rv["_k"] = rv["kind"].map(REVIEW_KINDS.index)
     rv = rv.sort_values(["_k"], kind="stable").drop(columns="_k").reset_index(drop=True)
     return {"exits": exits, "status": status, "listings": listings, "review": rv, "days": days, "batch": batch,
-            "tail": tail, "headers": headers, "skipped": skipped, "secs": secs, "refs": refs,
+            "tail": tail, "headers": headers, "skipped": skipped, "never": never, "secs": secs, "refs": refs,
             "master_info": m["info"]}
 
 
@@ -811,6 +852,8 @@ def report_text(info, f, checks):
     for name, cols in f["headers"].items():
         L.append(f"  {name} ({len(f['refs'][name]):,} rows): {', '.join(cols) if cols else 'missing (no rows)'}")
     L.append("  rows not considered: " + (", ".join(f"{k} {v:,}" for k, v in sorted(f["skipped"].items())) or "none"))
+    L.append("  rows matching no exit whose symbol / ISIN never appears in the bhavcopy (not in review.csv): "
+             + (", ".join(f"{k} {v:,}" for k, v in sorted(f["never"].items())) or "none"))
     sc = status["status"].value_counts()
     L += ["", "Status (every security):"] + [f"  {s}: {int(sc.get(s, 0)):,}" for s in STATUSES]
     kinds = f["secs"].set_index("security_id")["instrument_kind"]

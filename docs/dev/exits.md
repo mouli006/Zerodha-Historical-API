@@ -34,13 +34,21 @@ missing.
 |---|---|---|---|---|
 | `mergers.csv` | `exit_expected` not N | `last_trading_date`, else `suspended_from`, else `record_date` | ±10 (`MERGER_WINDOW`) | MERGER |
 | `manual_mergers.csv` | fills blank `new_symbol` / `new_company` / `swap_ratio` of a `mergers.csv` row; a symbol with no `mergers.csv` row matches the latest exited security with that symbol (no date, note "manual, no date") | – | – | MERGER |
-| `voluntary_delisting.csv` | list `delisted`, board Main Board (SME / ITP / proposed skipped and counted) | `delisting_date` | Voluntary: 0..60; Liquidation: 0..60; Compulsory: any later day | by `delisting_type` |
-| `delisting_circulars.csv` | not `withdrawal` | `effective_date`, else `circular_date` | 0..60 (`DELIST_WINDOW`) | voluntary, compulsory, liquidation / ibc -> LIQUIDATION; other / on hold: note only |
+| `voluntary_delisting.csv` | list `delisted`, board Main Board (SME / ITP / proposed skipped and counted) | `delisting_date` | Voluntary: 0..60; Liquidation and Compulsory: any later day | by `delisting_type` |
+| `delisting_circulars.csv` | not `withdrawal` | `effective_date`, else `circular_date` | voluntary, other / on hold: 0..60 (`DELIST_WINDOW`); compulsory, liquidation / ibc: any later day | voluntary, compulsory, liquidation / ibc -> LIQUIDATION; other / on hold: note only |
 | `compulsory_delisting.csv` | all | `order_date` | any later day (orders come years later) | COMPULSORY_DELISTING |
-| `suspensions.csv` | SUSPENDED / CONTINUED; CANCELLED rows and the rows they cancel (`cancels_circular`) dropped | `effective_date`, else `circular_date` | 0..10 (`SUSPEND_WINDOW`) | LIQUIDATION when `reason` (else `reason_text` if `reason` is blank) matches `LIQUIDATION_RX` (liquidation / winding up / IBC / NCLT / insolvency); else SUSPENDED |
+| `suspensions.csv` | SUSPENDED / CONTINUED; CANCELLED rows and the rows they cancel (`cancels_circular`) dropped | `effective_date`, else `circular_date` | SUSPENDED: 0..10 (`SUSPEND_WINDOW`); LIQUIDATION: any later day | LIQUIDATION when `reason` (else `reason_text` if `reason` is blank) matches `LIQUIDATION_RX` (liquidation / winding up / IBC / NCLT / insolvency); else SUSPENDED |
 
 The classified `reason` decides for suspensions, because the free text of a capital-reduction circular also
 names the NCLT (SUMEETINDS 2024).
+
+**Any later day** (`ANY_LATER`): every LIQUIDATION match, whatever the list, and every COMPULSORY_DELISTING match
+(compulsory orders, compulsory circulars, the compulsory rows of the voluntary list). Liquidation and compulsory
+delistings often take effect years after trading stopped.
+
+**Relisting cap:** a reference date on or after the first date of a later security with one of the exited
+security's near symbols (its `relistings()` entry, the same one that gives RELISTED) never matches the old
+security. The unmatched reason says "after relisting as S... on d".
 
 **From the data:**
 - `MOVED_TO_SME`: one of its ISINs trades later in SM / ST.
@@ -51,6 +59,9 @@ names the NCLT (SUMEETINDS 2024).
 
 **Priority** (`REASONS`): MERGER, VOLUNTARY_DELISTING, COMPULSORY_DELISTING, LIQUIDATION, MOVED_TO_SME,
 RELISTED, SUSPENDED, RIGHTS_ENDED, ETF_ENDED, UNKNOWN.
+- One exception: when VOLUNTARY_DELISTING would win and a LIQUIDATION match exists, LIQUIDATION wins (an IBC /
+  liquidation company listed as delisted, e.g. NATNLSTEEL, EDL, SANGHVIFOR). The voluntary match stays in the note
+  and in the conflict review row.
 - Within one reason, the smallest |distance| wins.
 - Every other match is listed in `note` ("also ...").
 - Matches from two of the `CONFLICT_GROUP` groups (merger / voluntary / write-down / SME / relisted), or two
@@ -86,7 +97,8 @@ RELISTED, SUSPENDED, RIGHTS_ENDED, ETF_ENDED, UNKNOWN.
   - `CASH_AT_LAST`: MERGER without a ratio (with or without an acquirer), VOLUNTARY_DELISTING, MOVED_TO_SME,
     RELISTED.
   - `WRITE_DOWN`: LIQUIDATION, COMPULSORY_DELISTING, UNKNOWN with a distress hint.
-  - `REVIEW`: anything else (incl. a MERGER with a ratio but no acquirer, SUSPENDED, RIGHTS_ENDED, ETF_ENDED).
+  - `NOT_APPLICABLE`: RIGHTS_ENDED, ETF_ENDED (a rights entitlement ends by design; an ETF is not a company).
+  - `REVIEW`: anything else (incl. a MERGER with a ratio but no acquirer, SUSPENDED).
 - **This is only a suggestion. The backtest decides the actual value of an exited holding.**
 
 ## Part 4: listing kinds (first appearance), in this order
@@ -111,6 +123,8 @@ A BATCH_ADMISSION or SME_MIGRATION start date is **not an IPO date**: strategies
   - `unmatched_reference`: list rows that fit no exited security, with why: no exited security with that
     symbol / ISIN, or a date outside the window (with the distance). Suspensions only when the circular expected
     an exit (`exit_expected` Y): a suspension that ends with trading resuming is normal.
+  - Rows whose symbol (and ISIN) never appears in the bhavcopy, in any series, are not in review: they are only
+    counted per file in the report.
 - `calendar.csv` (the trading days, for `status_on`), `build_info.json`, `build_report.txt`:
   - the reference headers and the rows not considered;
   - counts per status / reason / treatment / listing kind;
@@ -168,8 +182,10 @@ Covers:
   named by its later symbol; unresolved; exit_expected N;
 - voluntary by ISIN; compulsory years later; liquidation from the reason and from the text; capital reduction
   with NCLT text; suspension; a cancelled suspension; priority and conflict;
-- MOVED_TO_SME; RELISTED / RELISTING; RIGHTS / ETF;
-- unmatched reference rows;
+- liquidation (all three lists) and compulsory circulars far later; voluntary and ordinary suspensions keep their
+  windows; no match on or after a relisting; liquidation over voluntary;
+- MOVED_TO_SME; RELISTED / RELISTING; RIGHTS (incl. `-RE1`) / ETF with NOT_APPLICABLE;
+- unmatched reference rows, and rows naming a symbol that never trades (counted only);
 - distress hints, adjusted closes (a split is not distress), `last_close_adj` with a patched factor; every
   treatment;
 - the listing kinds, start window, batch day and `--batch-min`;
