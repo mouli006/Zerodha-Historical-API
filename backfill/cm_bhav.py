@@ -60,14 +60,14 @@ SOURCES = {
     "old": {"url": "https://nsearchives.nseindia.com/content/historical/EQUITIES/{yyyy}/{mon}/{name}",
             "name": "cm{dd}{mon}{yyyy}bhav.csv.zip",
             "name_re": r"cm(?P<dd>\d{2})(?P<mon>[A-Z]{3})(?P<yyyy>\d{4})bhav\.csv\.zip",
-            "header": OLD_HEADER, "trailing_empty": True, "date": ("TIMESTAMP", "%d-%b-%Y"),
+            "header": OLD_HEADER, "trailing_empty": True, "date": ("TIMESTAMP", ("%d-%b-%Y", "%d-%b-%y")),
             "columns": {"symbol": "SYMBOL", "series": "SERIES", "isin": "ISIN", "open": "OPEN", "high": "HIGH",
                         "low": "LOW", "close": "CLOSE", "last": "LAST", "prev_close": "PREVCLOSE",
                         "volume": "TOTTRDQTY", "turnover": "TOTTRDVAL", "trades": "TOTALTRADES", "fin_id": None}},
     "udiff": {"url": "https://nsearchives.nseindia.com/content/cm/{name}",
               "name": "BhavCopy_NSE_CM_0_0_0_{ymd}_F_0000.csv.zip",
               "name_re": r"BhavCopy_NSE_CM_0_0_0_(?P<ymd>\d{8})_F_0000\.csv\.zip",
-              "header": UDIFF_HEADER, "trailing_empty": False, "date": ("TradDt", "%Y-%m-%d"),
+              "header": UDIFF_HEADER, "trailing_empty": False, "date": ("TradDt", ("%Y-%m-%d",)),
               "fixed": {"Sgmt": "CM", "FinInstrmTp": "STK"},
               "columns": {"symbol": "TckrSymb", "series": "SctySrs", "isin": "ISIN", "open": "OpnPric",
                           "high": "HghPric", "low": "LwPric", "close": "ClsPric", "last": "LastPric",
@@ -255,14 +255,18 @@ def parse_zip(path, day, fmt):
         other = sorted({r[idx[col]].strip() for r in data} - {value})
         if other:
             raise BadFile(f"{name}: {col} must be {value}, found {other}")
-    dcol, dfmt = src["date"]
+    dcol, dfmts = src["date"]
     dates = set()
     for r in data:
         v = r[idx[dcol]].strip()
-        try:
-            dates.add(datetime.strptime(v.title() if dfmt.startswith("%d-%b") else v, dfmt).date())
-        except ValueError:
-            raise BadFile(f"{name}: bad {dcol} {v!r}") from None
+        for dfmt in dfmts:   # old files mostly say 03-MAR-2021, some 13-Jul-20 (e.g. 2020-07-13)
+            try:
+                dates.add(datetime.strptime(v.title() if dfmt.startswith("%d-%b") else v, dfmt).date())
+                break
+            except ValueError:
+                pass
+        else:
+            raise BadFile(f"{name}: bad {dcol} {v!r}")
     if dates != {day}:
         raise BadFile(f"{name}: dates {sorted(d.isoformat() for d in dates)} in the file, expected {day}")
     cols = src["columns"]

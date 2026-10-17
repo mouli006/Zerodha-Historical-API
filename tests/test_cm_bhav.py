@@ -181,6 +181,24 @@ def test_old_format_trailing_empty_column(tmp_path):
     assert len(parse_zip(str(p), OLD_DAY, "old")) == 18
 
 
+@pytest.mark.parametrize("stamp", ["03-Mar-21", "03-mar-21", "03-MAR-21"])
+def test_old_format_two_digit_year(tmp_path, stamp):
+    p = tmp_path / OLD_FIX
+    p.write_bytes(zip_bytes("x.csv", fixture_text(OLD_FIX).replace("03-MAR-2021", stamp)))
+    df = parse_zip(str(p), OLD_DAY, "old")
+    assert len(df) == 18 and set(df["date"]) == {OLD_DAY}
+    # the date must still be the requested day
+    with pytest.raises(BadFile, match="expected 2021-03-04"):
+        parse_zip(str(p), date(2021, 3, 4), "old")
+
+
+def test_old_format_bad_timestamp(tmp_path):
+    p = tmp_path / OLD_FIX
+    p.write_bytes(zip_bytes("x.csv", fixture_text(OLD_FIX).replace("03-MAR-2021", "03-Mar-1x", 1)))
+    with pytest.raises(BadFile, match="bad TIMESTAMP '03-Mar-1x'"):
+        parse_zip(str(p), OLD_DAY, "old")
+
+
 def test_turnover_is_rounded_to_2_decimals(tmp_path):
     text = fixture_text(NEW_FIX).replace(",12175822.04,", ",12175822.040000001,")
     assert "12175822.040000001" in text
