@@ -42,15 +42,16 @@ STEPS = [
 ]
 STEP_NAMES = [s[0] for s in STEPS]
 
+N = r"(\d(?:[\d,]*\d)?)"     # a number as the CLIs print it (1,234), never a trailing comma
 # key numbers: (regex, format) on the last matching line of the step's output; "-" when nothing matches
 NUMBERS = {
-    "reference": [(r"Downloaded ([\d,]+) new file\(s\)", "downloads {0}")],
-    "bhavcopy": [(r"This run: ok ([\d,]+), holidays ([\d,]+), failed ([\d,]+), pending ([\d,]+)",
+    "reference": [(r"Downloaded " + N + r" new file\(s\)", "downloads {0}")],
+    "bhavcopy": [(r"This run: ok " + N + r", holidays " + N + r", failed " + N + r", pending " + N,
                   "ok {0}, holiday {1}, failed {2}, pending {3}")],
-    "master": [(r"^  securities: ([\d,]+)", "securities {0}")],
-    "actions": [(r"^saved ([\d,]+), skipped ([\d,]+), failed ([\d,]+)", "saved {0}, skipped {1}, failed {2}")],
-    "adjustments": [(r"^  applied: ([\d,]+) \(", "applied {0}")],
-    "exits": [(r"^  EXITED: ([\d,]+)", "exited {0}"), (r"^Review rows: ([\d,]+)", "review {0}")],
+    "master": [(r"^  securities: " + N, "securities {0}")],
+    "actions": [(r"^saved " + N + r", skipped " + N + r", failed " + N, "saved {0}, skipped {1}, failed {2}")],
+    "adjustments": [(r"^  applied: " + N + r" \(", "applied {0}")],
+    "exits": [(r"^  EXITED: " + N, "exited {0}"), (r"^Review rows: " + N, "review {0}")],
 }
 CHECK_LINE = re.compile(r"^(Check: (?:ok|FAILED)|Known-case checks: (?:all found|SOME NOT FOUND))\s*$", re.M)
 

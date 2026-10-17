@@ -320,8 +320,8 @@ def test_log_and_summary(folder, monkeypatch):
     assert "This run: ok 1, holidays 0" in log and "----- exit 0, " in log
     assert log.rstrip().endswith("===== exit 0")
     assert row(screen, "bhavcopy").split(" | ")[1].strip() == "OK"
-    assert "ok 1, holiday 0, failed 0, pending 1" in row(screen, "bhavcopy")
-    assert "securities 3,702; check ok" in row(screen, "master")
+    assert row(screen, "bhavcopy").endswith("| ok 1, holiday 0, failed 0, pending 1")   # no trailing comma
+    assert row(screen, "master").endswith("| securities 3,702; check ok")
     assert "saved 1, skipped 11, failed 0" in row(screen, "actions")
     assert "applied 822; check ok" in row(screen, "adjustments")
     assert "exited 714; review 271; check ok" in row(screen, "exits")
