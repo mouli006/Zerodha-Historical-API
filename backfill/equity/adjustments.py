@@ -551,10 +551,17 @@ def detect(x, days, m, changes, ca, manual, tol=TOL, snap_tol=SNAP_TOL, min_pric
             events[key] = e
         elif action == "SET":
             confirm(events[key], "manual", factor, note)
+            events[key]["kind"] = kind_of(factor)
         else:
             e = events[key]
             e["applied"] = "N"
             e["note"] = f"{e['note']}; removed by {note}" if e["note"] else f"removed by {note}"
+
+    # a ca_no_move settled by a manual row (same day, same security or symbol: the CSV may name an older ISIN)
+    settled = {(e["security_id"], e["ex_date"]) for e in events.values() if e["applied"] == "Y"} | \
+              {(e["symbol"], e["ex_date"]) for e in events.values() if e["applied"] == "Y" and e["symbol"]}
+    reviews = [rv for rv in reviews if rv["kind"] != "ca_no_move"
+               or ((rv["security_id"], rv["date"]) not in settled and (rv["symbol"], rv["date"]) not in settled)]
 
     # nearest ISIN change, review of the unconfirmed
     index = {d: i for i, d in enumerate(days)}

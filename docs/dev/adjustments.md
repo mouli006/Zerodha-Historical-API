@@ -72,8 +72,18 @@ are computed when loading. Dividends are not adjusted.
   comments): created once with `MANUAL_TEMPLATE` and never overwritten.
   - ADD: a new applied event (source manual). An existing event on that date is an error ("use SET").
   - REMOVE: the event stays in events.csv with `applied=N` and the note "removed by manual".
-  - SET: new factor, applied.
+  - SET: new factor, applied; the kind follows the factor.
   - Errors go to review `manual_error` and make `check` exit 1.
+  - A `ca_no_move` row is dropped from review once an applied event exists on that date for the same security
+    or the same symbol (the CSV can name an older ISIN, as for SUMEETINDS).
+  - **Backup:** the build reads only the data-folder copy. `reference/manual_factors.csv` in the repo is its
+    backup (force-added, since `*.csv` is gitignored), like `reference/manual_mergers.csv`. If the data copy is
+    lost, copy the repo file back; after editing the data copy, copy it to the repo again and commit.
+  - Rows so far (2026-10-17):
+    - AXITA 2023-12-22: ADD 1.3333 (bonus 1:3, a 1.20 move is under the exact-date minimum).
+    - AHLEAST 2022-10-06: SET 1.5 (bonus 1:2; NSE's prev_close is adjusted by 1.5, the price fell further).
+    - SUMEETINDS S003034 2025-10-03: SET 5 (split 10->2; the CSV row had the pre-suspension ISIN).
+    - DVL 2021-08-05, VERTOZ 2025-06-25 and MONNETISPA 2018-08-29 are left unapplied on purpose.
 - **Cumulative factors:** per security, the applied events in date order. A period runs from the ex-date to the
   security's trading day before the next ex-date. factor = product of all later factors, and the latest period
   is 1. Every security of the master has at least one row.
@@ -111,9 +121,9 @@ applied, and the close before / factor next to the open and close on the ex-date
   their ISIN change). With the CSV, all are confirmed (2026-10-17).
 - BAJFINANCE 2016-09 is 10: NSE lists "Bonus 1:1 / Face Value Split From Rs 10 To Rs 2".
 - Full build (2026-10-17): 942 price candidates; 167 confirmed by an ISIN change, 803 by the CSV (165 by both),
-  7 by `csv_exact_date`, 8 by `csv_small`; 819 applied in 617 securities. Review: 173 price_only and 5
-  ca_no_move.
-- The 5 `ca_no_move` rows are left for `manual_factors.csv`:
+  7 by `csv_exact_date`, 8 by `csv_small`, 3 manual; 822 applied in 619 securities. Review: 171 price_only,
+  2 ca_no_move (DVL, VERTOZ), 1 ca_unparsed (MONNETISPA).
+- The 5 `ca_no_move` rows before the manual rows (AXITA, AHLEAST and SUMEETINDS are now settled by `manual_factors.csv`):
   - DVL 2021-08-05: bonus 1:2, no move.
   - AHLEAST 2022-10-06: NSE's prev_close is adjusted by 1.5, but the price fell 1.9–2x (probably a second
     action the same day).

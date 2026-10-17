@@ -533,3 +533,29 @@ def test_small_factor_applied_without_price_evidence(tmp_path):
     assert list(rv["kind"]) == ["ca_no_move"] and rv.symbol[0] == "END"
     assert factors(tmp_path, sid_of(tmp_path, "TEN")) == [(str(DAYS[0]), str(DAYS[19]), 1.1),
                                                           (str(DAYS[20]), str(DAYS[39]), 1.0)]
+
+
+def test_manual_row_settles_ca_no_move(tmp_path):
+    f = str(tmp_path)
+    write_store(f, trade("FLT", "INE000031011", r(0, 40), close=100.0) + trade("KEEP", "INE000032011", r(0, 40)))
+    sm.build(f, log=lambda *_: None)
+    write_ca(f, [("FLT", "Bonus 1:1", DAYS[20]), ("KEEP", "Bonus 1:1", DAYS[20])])
+    adj.build(f, log=lambda *_: None)
+    assert list(read(tmp_path, "review.csv")["kind"]) == ["ca_no_move", "ca_no_move"]
+    write_manual(f, [(sid_of(tmp_path, "FLT"), DAYS[20], "ADD", 2, "checked")])
+    adj.build(f, log=lambda *_: None)
+    rv = read(tmp_path, "review.csv")
+    assert list(rv["symbol"]) == ["KEEP"]                                   # FLT settled, KEEP still listed
+    assert events(tmp_path, "FLT").applied[0] == "Y"
+
+
+def test_manual_set_takes_the_kind_from_the_factor(tmp_path):
+    f = str(tmp_path)
+    write_store(f, split("ODD", "INE000033011", 20, 1000.0, 1600.0))        # 0.625: not a known ratio (OTHER)
+    sm.build(f, log=lambda *_: None)
+    adj.build(f, log=lambda *_: None)
+    assert events(tmp_path, "ODD").kind[0] == "OTHER"
+    write_manual(f, [(sid_of(tmp_path, "ODD"), DAYS[20], "SET", 0.5, "")])
+    adj.build(f, log=lambda *_: None)
+    e = events(tmp_path, "ODD")
+    assert (e.kind[0], e.applied[0], e.factor[0]) == ("CONSOLIDATION", "Y", "0.5")
