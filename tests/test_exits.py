@@ -423,7 +423,8 @@ def test_priority_and_conflict(built):
 
 def late_rows():
     return rows_all() + sum((trade(s, f"INE2{k:02d}A01011", r(0, 41)) for k, s in
-                             enumerate(("LIQV", "LIQC", "LIQS", "VOLFAR", "SUSFAR", "COMPC", "VOLIBC"))), [])
+                             enumerate(("LIQV", "LIQC", "LIQS", "VOLFAR", "SUSFAR", "COMPC", "VOLIBC",
+                                        "VOLLATE"))), [])
 
 
 def late_refs():
@@ -436,6 +437,8 @@ def late_refs():
         {"list": "delisted", "symbol": "VOLFAR", "board": "Main Board", "delisting_date": far,
          "delisting_type": "Voluntary Delisting"},
         {"list": "delisted", "symbol": "VOLIBC", "board": "Main Board", "delisting_date": str(DAYS[45]),
+         "delisting_type": "Voluntary Delisting"},
+        {"list": "delisted", "symbol": "VOLLATE", "board": "Main Board", "delisting_date": str(DAYS[45]),
          "delisting_type": "Voluntary Delisting"}]
     refs["delisting_circulars.csv"] += [
         {"circular_no": "D2", "delisting_type": "ibc", "symbol": "LIQC", "effective_date": "2022-06-01"},
@@ -445,7 +448,9 @@ def late_refs():
         {"circular_no": "S10", "status": "SUSPENDED", "symbol": "LIQS", "effective_date": far,
          "reason": "IBC / resolution plan", "exit_expected": "Y"},
         {"circular_no": "S11", "status": "SUSPENDED", "symbol": "SUSFAR", "effective_date": str(DAYS[70]),
-         "reason": "non-compliance with listing rules", "exit_expected": "Y"}]
+         "reason": "non-compliance with listing rules", "exit_expected": "Y"},
+        {"circular_no": "S12", "status": "SUSPENDED", "symbol": "VOLLATE", "effective_date": far,
+         "reason": "liquidation", "exit_expected": "Y"}]
     return refs
 
 
@@ -487,15 +492,37 @@ def test_liquidation_beats_voluntary(late):
     assert x.suggested_treatment == "WRITE_DOWN"
     rv = read(f, "review.csv")
     c = rv[(rv["kind"] == "conflict") & (rv["symbol"] == "VOLIBC")]
-    assert len(c) == 1 and c["details"].iloc[0].startswith("chose LIQUIDATION")
+    assert len(c) == 1 and c["details"].iloc[0].startswith("chose LIQUIDATION: liquidation")
+    assert "part of the insolvency" in c["details"].iloc[0]
+
+
+def test_liquidation_long_after_voluntary_leaves_voluntary(late):
+    f, _ = late
+    x = exit_of(f, "VOLLATE")                            # voluntary day 45, liquidation suspension day 150
+    assert x.reason == "VOLUNTARY_DELISTING" and x.suggested_treatment == "CASH_AT_LAST"
+    assert "also LIQUIDATION suspensions.csv" in x.note
+    rv = read(f, "review.csv")
+    c = rv[(rv["kind"] == "conflict") & (rv["symbol"] == "VOLLATE")]
+    assert len(c) == 1
+    assert c["details"].iloc[0].startswith("chose VOLUNTARY_DELISTING: liquidation")
+    assert "is 105 trading days after the voluntary delisting" in c["details"].iloc[0]
+    assert "shareholders paid out first" in c["details"].iloc[0]
 
 
 def test_pick_liquidation_over_voluntary():
     vol = ex.match("S1", "VOLUNTARY_DELISTING", "voluntary_delisting.csv", 1, DAYS[5], 5)
-    liq = ex.match("S1", "LIQUIDATION", "suspensions.csv", 2, DAYS[90], 90)
-    assert ex.pick([vol, liq]) is liq
+
+    def liq(dist, row=2):
+        return ex.match("S1", "LIQUIDATION", "suspensions.csv", row, DAYS[dist], dist)
+    at, past, before = liq(5 + 60), liq(5 + 61), liq(1)
+    chosen, why = ex.pick_with_why([vol, at])            # exactly 60 trading days after: part of the insolvency
+    assert chosen is at and "part of the insolvency" in why
+    chosen, why = ex.pick_with_why([vol, past])          # 61 after: shareholders were paid out first
+    assert chosen is vol and "is 61 trading days after the voluntary delisting" in why
+    assert ex.pick([vol, before]) is before              # liquidation before the delisting
+    assert ex.pick([vol, past, at]) is at                # one within the window is enough
     merger = ex.match("S1", "MERGER", "mergers.csv", 3, DAYS[1], 1)
-    assert ex.pick([vol, liq, merger]) is merger       # only the voluntary choice gives way
+    assert ex.pick_with_why([vol, at, merger]) == (merger, "")   # only the voluntary choice gives way
 
 
 @pytest.mark.parametrize("day, expected", [(100, "LIQUIDATION"), (130, "RELISTED")])

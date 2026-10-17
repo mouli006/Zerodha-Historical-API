@@ -59,9 +59,12 @@ security. The unmatched reason says "after relisting as S... on d".
 
 **Priority** (`REASONS`): MERGER, VOLUNTARY_DELISTING, COMPULSORY_DELISTING, LIQUIDATION, MOVED_TO_SME,
 RELISTED, SUSPENDED, RIGHTS_ENDED, ETF_ENDED, UNKNOWN.
-- One exception: when VOLUNTARY_DELISTING would win and a LIQUIDATION match exists, LIQUIDATION wins (an IBC /
-  liquidation company listed as delisted, e.g. NATNLSTEEL, EDL, SANGHVIFOR). The voluntary match stays in the note
-  and in the conflict review row.
+- One exception (`pick_with_why`): when VOLUNTARY_DELISTING would win and a LIQUIDATION match is dated on or
+  before the voluntary delisting date + `LIQUIDATION_AFTER_VOLUNTARY` (60) trading days, LIQUIDATION wins: the
+  delisting was part of the insolvency (e.g. NATNLSTEEL, EDL, SANGHVIFOR). A liquidation dated later leaves
+  VOLUNTARY_DELISTING (shareholders were paid out first).
+  - The other match stays in the note.
+  - The conflict review row says which was chosen and why ("chose X: ...").
 - Within one reason, the smallest |distance| wins.
 - Every other match is listed in `note` ("also ...").
 - Matches from two of the `CONFLICT_GROUP` groups (merger / voluntary / write-down / SME / relisted), or two
@@ -183,7 +186,8 @@ Covers:
 - voluntary by ISIN; compulsory years later; liquidation from the reason and from the text; capital reduction
   with NCLT text; suspension; a cancelled suspension; priority and conflict;
 - liquidation (all three lists) and compulsory circulars far later; voluntary and ordinary suspensions keep their
-  windows; no match on or after a relisting; liquidation over voluntary;
+  windows; no match on or after a relisting; liquidation over voluntary within 60 trading days of it (and the
+  boundary), voluntary kept when the liquidation comes later;
 - MOVED_TO_SME; RELISTED / RELISTING; RIGHTS (incl. `-RE1`) / ETF with NOT_APPLICABLE;
 - unmatched reference rows, and rows naming a symbol that never trades (counted only);
 - distress hints, adjusted closes (a split is not distress), `last_close_adj` with a patched factor; every

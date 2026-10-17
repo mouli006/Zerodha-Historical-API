@@ -41,6 +41,7 @@ MERGER_WINDOW = 10       # mergers: last_trading_date within +-10 trading days o
 DELIST_WINDOW = 60       # delistings: 0 to 60 trading days after the last date
 SUSPEND_WINDOW = 10      # suspensions: 0 to 10 trading days after the last date
 ANY_LATER = ("LIQUIDATION", "COMPULSORY_DELISTING")   # these match any date after the last date (orders come late)
+LIQUIDATION_AFTER_VOLUNTARY = 60   # a liquidation up to 60 trading days after a voluntary delisting wins over it
 NEAR_LAST = 60           # symbols used in the last 60 trading days of a security are matched against the lists
 DISTRESS_WINDOW = 60     # distress hints over the last 60 trading days
 YEAR_DAYS = 250          # ... against the 250 trading days before them (turnover)
@@ -482,21 +483,36 @@ def data_matches(exited, cal, sme, later):
     return matches, notes
 
 
-def pick(ms):
-    """The match that decides the reason: the first reason in REASONS, then the closest date; except that a
-    LIQUIDATION match beats a VOLUNTARY_DELISTING one (an IBC / liquidation case listed as delisted)."""
+def pick_with_why(ms):
+    """(match, why): the match that decides the reason, the first reason in REASONS, then the closest date; except
+    that a LIQUIDATION match dated on or before the voluntary delisting + LIQUIDATION_AFTER_VOLUNTARY trading days
+    beats the VOLUNTARY_DELISTING one (the delisting was part of the insolvency). A later liquidation leaves the
+    voluntary delisting (shareholders were paid out first). why is "" unless that choice was made."""
     ms = [m for m in ms if m["reason"]]
     if not ms:
-        return None
+        return None, ""
 
     def key(m):
         return (REASONS.index(m["reason"]), abs(m["distance"]) if m["distance"] is not None else 10 ** 6,
                 m["source"], m["row"] or 0)
     chosen = min(ms, key=key)
     liquidation = [m for m in ms if m["reason"] == "LIQUIDATION"]
-    if chosen["reason"] == "VOLUNTARY_DELISTING" and liquidation:
-        chosen = min(liquidation, key=key)
-    return chosen
+    if chosen["reason"] != "VOLUNTARY_DELISTING" or not liquidation:
+        return chosen, ""
+    vol = chosen
+    within = [m for m in liquidation if m["distance"] <= vol["distance"] + LIQUIDATION_AFTER_VOLUNTARY]
+    if within:
+        liq = min(within, key=key)
+        return liq, (f"liquidation {liq['date']} ({source_text(liq)}) on or before the voluntary delisting "
+                     f"{vol['date']} + {LIQUIDATION_AFTER_VOLUNTARY} trading days: part of the insolvency")
+    liq = min(liquidation, key=key)
+    return vol, (f"liquidation {liq['date']} ({source_text(liq)}) is {liq['distance'] - vol['distance']} trading "
+                 f"days after the voluntary delisting {vol['date']} (more than {LIQUIDATION_AFTER_VOLUNTARY}): "
+                 "shareholders paid out first")
+
+
+def pick(ms):
+    return pick_with_why(ms)[0]
 
 
 def source_text(m):
@@ -657,7 +673,7 @@ def build_frames(folder, active_days, exit_days, batch_min, start_days, log=prin
     for r in ex.itertuples():
         sid, last = r.security_id, exited[r.security_id]["last_date"]
         ms = by_sid.get(sid, [])
-        chosen = pick(ms)
+        chosen, why_chosen = pick_with_why(ms)
         reason = chosen["reason"] if chosen else "UNKNOWN"
         notes = []
         in_periods = sid in periods
@@ -685,7 +701,8 @@ def build_frames(folder, active_days, exit_days, batch_min, start_days, log=prin
         acquirers = {(x.get("new_symbol") or x.get("new_company") or "").upper() for x in ms if x["reason"] == "MERGER"}
         if len(groups) > 1 or len(acquirers - {""}) > 1:
             reviews.append({"kind": "conflict", "security_id": sid, "date": last, "symbol": r.last_symbol,
-                            "details": f"chose {reason}; " + "; ".join(describe(x) for x in ms if x["reason"])})
+                            "details": f"chose {reason}" + (f": {why_chosen}" if why_chosen else "") + "; "
+                            + "; ".join(describe(x) for x in ms if x["reason"])})
         if chosen and chosen.get("extra_note"):
             notes.append(chosen["extra_note"])
         notes += [f"also {describe(x)}" for x in ms if x is not chosen]
