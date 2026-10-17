@@ -35,19 +35,28 @@ are computed when loading. Dividends are not adjusted.
     trading days whose `ratio_open` is within snap-tol of the snapped value. Factor = the snapped value.
   - (b) `corp_action`: the NSE corporate-actions CSV (below). Rows of one security and ex-date are combined, and
     their factors multiplied (a bonus 4:1 and a split 2→1 make 10). The security's rows within `CA_WINDOW` (3)
-    trading days of the ex-date are searched for a ratio or close move within snap-tol of the factor: the exact
-    date first, then the closest match, then the nearest day. This search ignores `--tol`, so a 1:10 bonus is
-    found. Factor = the corporate-action factor. No move -> review `ca_no_move` (the suspect case).
+    trading days of the ex-date are searched for a ratio or close move within `--ca-tol` (`CA_TOL` 0.10; the
+    open can be several % off, e.g. MINDACORP 9.53 for 10) of the factor **and** closer to the factor than to 1
+    (otherwise a 1:10 bonus would match any quiet day). Day choice: the exact date first, then the closest
+    match, then the nearest day. This search ignores `--tol`, so a clear 1:10 bonus is found.
+    - Factor, `kind` and `ratio_label` come from the corporate action.
+    - No move -> review `ca_no_move` (the suspect case). Six small bonuses (1:10, 1:5) are there because their
+      move cannot be told from noise.
   - Unconfirmed candidates -> `applied=N`, review `price_only`, with the suggested ratio.
-- **Corporate-actions input:** every `*.csv` in `adjustments\input\`, duplicates dropped; an empty or missing
-  folder is fine. Headers are matched loosely (letters only, upper case): SYMBOL, PURPOSE and EX-DATE are
+- **Corporate-actions input:** every `*.csv` in `adjustments\input\` (from `fetch-actions`, or NSE's own CSV
+  saved by hand), duplicates dropped; an empty or missing folder is fine. Headers are matched loosely (letters only, upper case): SYMBOL, PURPOSE and EX-DATE are
   required, ISIN and SERIES are optional. A missing column -> `CorpActionError`, exit 1. PURPOSE is parsed by
   `parse_purpose()`:
   - `BONUS a:b` -> (a+b)/b.
   - `SPLIT` / `SUB-DIVISION ... FROM RS x ... TO RS y` -> x/y.
   - `CONSOLIDATION ... FROM RS x TO RS y` -> x/y.
-  - Dividends and other actions are ignored. A text naming one of these words that cannot be parsed, or an
-    unreadable date -> `ca_unparsed`.
+  - Each part (separated by `/`, not `/-`) is parsed on its own. A split's FROM is optional ("Face Value Split
+    Rs 10 To Rs 1").
+  - Dividends, other actions and bonuses of debentures / NCRPS / NCDs / preference shares (NTPC 2015,
+    BRITANNIA, TVSMOTOR 2025) are ignored.
+  - A part naming bonus / split / consolidation that cannot be parsed, or an unreadable date -> `ca_unparsed`
+    (one real case: MONNETISPA's capital reduction + consolidation).
+  - Ex-dates after the last bhavcopy day are skipped and counted ("after the data").
   - Rows of another series, or of another instrument kind, are skipped and counted.
   - The security is found by ISIN, else by `security_id_for(symbol, ex_date)` (then a week earlier). Not found ->
     `ca_unknown`.
@@ -91,21 +100,40 @@ TATASTEEL 2022-07, IRCTC 2021-10, DRREDDY 2024-10, NAUKRI 2025-05, KOTAKBANK 202
 2025-06, HDFCBANK 2019-09 and 2025, RELIANCE 2017-09 and 2024-10. Each line shows the event, whether it is
 applied, and the close before / factor next to the open and close on the ex-date.
 - Without the corporate-actions CSV, only DRREDDY, NAUKRI, KOTAKBANK 2026 and BAJFINANCE 2025 are confirmed (by
-  their ISIN change).
-- The data shows BAJFINANCE 2016-09 as a move of about 9.87, not 5.
+  their ISIN change). With the CSV, all are confirmed (2026-10-17).
+- BAJFINANCE 2016-09 is 10: NSE lists "Bonus 1:1 / Face Value Split From Rs 10 To Rs 2".
+- First full build (2026-10-17): 942 price candidates; 167 confirmed by an ISIN change, 803 by the CSV (165 by
+  both); 805 applied in 608 securities; 179 price_only and 20 ca_no_move in review.
 - A miss is reported, never fixed by changing a rule. `build` exits 0, and `check` exits 1.
 
 ## CLI (`adjustments.py`)
-`build [--folder] [--tol 0.25] [--snap-tol 0.03] [--min-price 5] [--kinds STOCK]`, `show SYMBOL|ISIN`, `check`.
-Exit codes: 0 done; 1 not built / stale master / bad input CSV / show found nothing / check failed; 2 argparse,
-lock busy.
+- `build [--folder] [--tol 0.25] [--snap-tol 0.03] [--ca-tol 0.10] [--min-price 5] [--kinds STOCK]`
+- `show SYMBOL|ISIN`
+- `check`
+- `fetch-actions [--from 2015] [--to <this year>] [--force] [--no-browser]`: the only command that uses the
+  network.
+- Exit codes: 0 done; 1 not built / stale master / bad input CSV / show found nothing / check failed /
+  fetch-actions missed a year; 2 argparse, lock busy.
 
-## NSE corporate-actions CSV (saved by hand)
-nseindia.com -> Companies listing -> Corporate filings -> Corporate actions
-(`https://www.nseindia.com/companies-listing/corporate-filings-actions`), Equity tab. Set From / To one year at a
-time and click "Download (.csv)". Save each file unchanged in `adjustments\input\`. Expected columns: SYMBOL, COMPANY
-NAME, SERIES, PURPOSE, FACE VALUE, EX-DATE, RECORD DATE, BOOK CLOSURE START / END DATE (not yet checked against a
-real file).
+## NSE corporate actions (`fetch-actions`, `backfill/equity/corp_actions.py`)
+- **Source:** the JSON API behind the page `https://www.nseindia.com/companies-listing/corporate-filings-actions`
+  (Equity tab), checked 2026-10-17:
+  `https://www.nseindia.com/api/corporates-corporateActions?index=equities&from_date=01-01-YYYY&to_date=31-12-YYYY`.
+  - It returns a list of rows with keys `symbol, comp, series, subject, faceVal, exDate, recDate, bcStartDate,
+    bcEndDate, isin` (plus `ind, ndStartDate, ndEndDate, caBroadcastDate`, unused).
+  - Every series is included (EQ, GS, IV, RR, ...).
+  - `&csv=true` gives the same rows as NSE's CSV, but without the ISIN, so the JSON is used.
+- **Files:** `to_csv()` writes `adjustments\input\corporate_actions_<YYYY>.csv` with NSE's CSV column names
+  (`SYMBOL, COMPANY NAME, SERIES, PURPOSE, FACE VALUE, EX-DATE, RECORD DATE, BOOK CLOSURE START DATE, BOOK CLOSURE
+  END DATE`) plus `ISIN`. An unexpected shape -> `FetchError` naming the keys.
+- **Client:** `backfill.nse_ref.fetch.NseClient` (home page cookies, `GAP` 2 s between requests, headless Chromium
+  after a block; `--no-browser` turns that off). One request per calendar year; each file is written atomically.
+- **Skip / force:** a past year already saved is skipped unless `--force`; the current year (IST) is always
+  fetched again.
+- **Lock:** takes `adjustments\.lock`, so it never runs alongside a build.
+- **Failures:** a failed year is listed with the page, the From / To dates to choose and the file to save NSE's
+  "Download (.csv)" as (the build reads that CSV too); exit 1.
+- **First run (2026-10-17):** 2015..2026, 1,854 to 2,692 rows a year, no block.
 
 ## Tests
 `tests/test_adjustments.py`: a synthetic store in tmp_path and a master built with `sm.build`. Covers:
@@ -125,4 +153,17 @@ real file).
 - two cumulative events, `factor_on`, `adjusted_history`;
 - purpose and date parsing, input errors, the empty folder;
 - the locks, the stale master, inputs byte for byte unchanged;
-- known cases and the CLI.
+- known cases and the CLI;
+- `--ca-tol` (an open 6% off still matches), debenture bonuses and future ex-dates skipped.
+
+`tests/test_corp_actions.py`: fixtures in `tests/fixtures/corp_actions/`: `2024_sample.json` (4 rows of the real
+answer), `sample.csv` (real rows: TATASTEEL, RELIANCE, BAJFINANCE, MINDACORP, NTPC, TVSMOTOR, a dividend, a GS row)
+and `blocked.html`. Fake session / browser and an autouse guard against any request or browser launch. Covers:
+- the URL and the JSON -> CSV conversion (and the bad shapes);
+- the saved file read by the build;
+- the real purposes parsed to their factors;
+- skip / force / current year;
+- the browser fallback;
+- the drop-in message when blocked;
+- the lock;
+- the CLI codes.

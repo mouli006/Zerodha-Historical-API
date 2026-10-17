@@ -38,6 +38,7 @@ INPUT = "input"
 MANUAL = "manual_factors.csv"
 TOL = 0.25               # price candidate: |close(p) / open(d) - 1| above this (NSE price bands are 20% at most)
 SNAP_TOL = 0.03          # a ratio snaps to RATIOS within 3% (the opening move is not exact, e.g. 9.76 for 10)
+CA_TOL = 0.10            # a corporate action matches a price move within 10% of its factor (MINDACORP opened 4.7% off)
 MIN_PRICE = 5.0          # price candidates need close(p) >= this (tick noise on penny stocks)
 KINDS = ("STOCK",)
 ISIN_WINDOW = 10         # trading days between an event and an ISIN change of the same security
@@ -67,7 +68,7 @@ EVENT_KINDS = ["SPLIT_OR_BONUS", "CONSOLIDATION", "OTHER"]
 # miss is never fixed by changing a rule.
 KNOWN_ADJUSTMENTS = [("TATASTEEL", "2022-07-01", "2022-08-31", 10), ("IRCTC", "2021-10-01", "2021-11-30", 5),
                      ("DRREDDY", "2024-10-01", "2024-11-30", 5), ("NAUKRI", "2025-05-01", "2025-05-31", 5),
-                     ("KOTAKBANK", "2026-01-01", "2026-01-31", 5), ("BAJFINANCE", "2016-09-01", "2016-09-30", 5),
+                     ("KOTAKBANK", "2026-01-01", "2026-01-31", 5), ("BAJFINANCE", "2016-09-01", "2016-09-30", 10),
                      ("BAJFINANCE", "2025-06-01", "2025-06-30", 10), ("HDFCBANK", "2019-09-01", "2019-09-30", 2),
                      ("HDFCBANK", "2025-01-01", "2025-12-31", 2), ("RELIANCE", "2017-09-01", "2017-09-30", 2),
                      ("RELIANCE", "2024-10-01", "2024-10-31", 2)]
@@ -151,28 +152,37 @@ def close_to(value, target, tol):
 
 BONUS_RE = re.compile(r"BONUS\D{0,30}?(\d+)\s*:\s*(\d+)", re.I)
 RS = r"(?:RS|RE|INR|RUPEES?)\.?\s*([\d.]+)"
-SPLIT_RE = re.compile(r"(?:SPLIT|SUB\s*-?\s*DIVISION).*?FROM\s*" + RS + r".*?TO\s*" + RS, re.I)
+SPLIT_RE = re.compile(r"(?:SPLIT|SUB\s*-?\s*DIVISION).*?(?:FROM\s*)?" + RS + r".*?TO\s*" + RS, re.I)  # FROM optional
 CONSOLIDATION_RE = re.compile(r"CONSOLIDATION.*?FROM\s*" + RS + r".*?TO\s*" + RS, re.I)
+PART_SPLIT = re.compile(r"/(?!-)")
+NOT_EQUITY = re.compile(r"DEBENTURE|NCRPS|NCDS?|PREFERENCE|PREF", re.I)
 ACTION_WORDS = re.compile(r"BONUS|SPLIT|SUB\s*-?\s*DIVISION|CONSOLIDATION", re.I)
 DATE_FORMATS = ("%d-%b-%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d-%b-%y", "%d %b %Y")
 
 
 def parse_purpose(text):
-    """(actions, unparsed): actions = [(label, factor)] for the bonuses, splits and consolidations in the text;
-    unparsed is True when the text names one of them but none could be read. Dividends etc. give ([], False)."""
-    actions = []
-    for a, b in BONUS_RE.findall(text):
-        if int(a) > 0 and int(b) > 0:
-            actions.append((f"bonus {int(a)}:{int(b)}", (int(a) + int(b)) / int(b)))
-    for pattern, word in ((SPLIT_RE, "split"), (CONSOLIDATION_RE, "consolidation")):
-        for x, y in pattern.findall(text):
-            try:
-                fx, fy = float(x.rstrip(".")), float(y.rstrip("."))
-            except ValueError:
-                continue
-            if fx > 0 and fy > 0 and fx != fy:
-                actions.append((f"{word} Rs {fx:g} -> Rs {fy:g}", fx / fy))
-    return actions, (not actions and bool(ACTION_WORDS.search(text)))
+    """(actions, unparsed): actions = [(label, factor)] for the bonuses, splits and consolidations in the text, read
+    part by part (parts are separated by '/', not '/-'); unparsed is True when a part names one of them but cannot be
+    read. Dividends, and bonuses of debentures / NCRPS / preference shares (not equity), are ignored."""
+    actions, unparsed = [], False
+    for part in PART_SPLIT.split(text):
+        if NOT_EQUITY.search(part):
+            continue
+        found = []
+        for a, b in BONUS_RE.findall(part):
+            if int(a) > 0 and int(b) > 0:
+                found.append((f"bonus {int(a)}:{int(b)}", (int(a) + int(b)) / int(b)))
+        for pattern, word in ((SPLIT_RE, "split"), (CONSOLIDATION_RE, "consolidation")):
+            for x, y in pattern.findall(part):
+                try:
+                    fx, fy = float(x.rstrip(".")), float(y.rstrip("."))
+                except ValueError:
+                    continue
+                if fx > 0 and fy > 0 and fx != fy:
+                    found.append((f"{word} Rs {fx:g} -> Rs {fy:g}", fx / fy))
+        unparsed |= not found and bool(ACTION_WORDS.search(part))
+        actions += found
+    return actions, unparsed
 
 
 def parse_date(text):
@@ -373,7 +383,7 @@ def confirm(e, how, factor, note=None):
 
 
 def detect(x, days, m, changes, ca, manual, tol=TOL, snap_tol=SNAP_TOL, min_price=MIN_PRICE, kinds=KINDS,
-           folder=None, log=print):
+           folder=None, log=print, ca_tol=CA_TOL):
     """Events and review rows (lists of dicts) from the price rows, ISIN changes, corporate actions and manual rows."""
     events, reviews = {}, []
     has = x["ratio"].notna()
@@ -392,7 +402,7 @@ def detect(x, days, m, changes, ca, manual, tol=TOL, snap_tol=SNAP_TOL, min_pric
     # (b) corporate actions
     rows_of = x[has].groupby("security_id").groups
     series = set(m["info"]["series"])
-    groups, skipped = {}, {"no action": 0, "other series": 0, "other kind": 0}
+    groups, skipped = {}, {"no action": 0, "other series": 0, "other kind": 0, "after the data": 0}
     for r in ca.itertuples():
         actions, unparsed = parse_purpose(r.purpose)
         try:
@@ -406,6 +416,9 @@ def detect(x, days, m, changes, ca, manual, tol=TOL, snap_tol=SNAP_TOL, min_pric
             continue
         if not actions or ex is None:
             skipped["no action"] += 1
+            continue
+        if ex > days[-1]:
+            skipped["after the data"] += 1
             continue
         if r.series and r.series not in series:
             skipped["other series"] += 1
@@ -438,9 +451,12 @@ def detect(x, days, m, changes, ca, manual, tol=TOL, snap_tol=SNAP_TOL, min_pric
             dist = int(x.at[j, "di"]) - target
             if abs(dist) > CA_WINDOW:
                 continue
-            err = min(abs(math.log(x.at[j, "ratio"] / factor)), abs(math.log(x.at[j, "close_move"] / factor)))
-            if err > math.log1p(snap_tol):
+            # within ca_tol of the factor, and closer to it than to "no move" (else a 1.1 matches any quiet day)
+            moves = [v for v in (x.at[j, "ratio"], x.at[j, "close_move"])
+                     if abs(v / factor - 1) <= ca_tol and abs(math.log(v / factor)) < abs(math.log(v))]
+            if not moves:
                 continue
+            err = min(abs(math.log(v / factor)) for v in moves)
             key = (dist != 0, err, abs(dist))
             if best is None or key < best[0]:
                 best = (key, j)
@@ -456,12 +472,9 @@ def detect(x, days, m, changes, ca, manual, tol=TOL, snap_tol=SNAP_TOL, min_pric
             e = event_from_row(x, j)
             set_snap(e, snap_tol)
             e["source"] = "corp_action"
-            if e["kind"] == "OTHER":
-                e["kind"] = kind_of(factor)
             events[key] = e
         e["ca_ex_date"], e["ca_purpose"] = ex, purpose
-        if not e["ratio_label"]:
-            e["ratio_label"] = what
+        e["ratio_label"], e["kind"] = what, kind_of(factor)      # the corporate action names the event
         confirm(e, "corp_action", factor, None if ex == e["ex_date"] else f"corporate action ex-date {ex}")
 
     # manual overrides
@@ -644,7 +657,8 @@ def known_checks(ev, periods, folder=None):
 def report_text(info, meas, ev, rv, lk, skipped, ca_rows, checks):
     L = ["Adjustment factors build", f"Built: {info['built_at']}",
          f"Data: {info['first_date']} to {info['last_date']}, {info['trading_days']} trading days; kinds "
-         f"{','.join(info['kinds'])}; tol {info['tol']}, snap-tol {info['snap_tol']}, min price {info['min_price']}",
+         f"{','.join(info['kinds'])}; tol {info['tol']}, snap-tol {info['snap_tol']}, ca-tol {info['ca_tol']}, "
+         f"min price {info['min_price']}",
          f"Security master built {info['master_built_at']}", "",
          "Part 1: close(previous trading day of the security) / prev_close(d)",
          f"  security-days with a previous day: {meas['days']:,}",
@@ -692,7 +706,8 @@ def report_text(info, meas, ev, rv, lk, skipped, ca_rows, checks):
     return "\n".join(L) + "\n"
 
 
-def build(folder=None, tol=TOL, snap_tol=SNAP_TOL, min_price=MIN_PRICE, kinds=KINDS, now=None, log=print):
+def build(folder=None, tol=TOL, snap_tol=SNAP_TOL, min_price=MIN_PRICE, kinds=KINDS, now=None, log=print,
+          ca_tol=CA_TOL):
     """Full rebuild of <folder>/adjustments/. Refuses while the bhavcopy or security master lock is held
     (StoreBusy), when the master is missing (NotBuilt) or stale (MasterStale), or another build runs (LockBusy)."""
     folder = folder or equity_data_dir()
@@ -707,7 +722,8 @@ def build(folder=None, tol=TOL, snap_tol=SNAP_TOL, min_price=MIN_PRICE, kinds=KI
         x, days = price_rows(folder, m, kinds)
         meas = measure(x, days)
         changes = isin_changes(folder, m, days)
-        events, reviews, skipped = detect(x, days, m, changes, ca, manual, tol, snap_tol, min_price, kinds, folder, log)
+        events, reviews, skipped = detect(x, days, m, changes, ca, manual, tol, snap_tol, min_price, kinds, folder, log,
+                                          ca_tol)
         prev = {(s, d): p for s, d, p in zip(x["security_id"], x["date"], x["prev_day"]) if p == p and p is not None}
 
         def prev_of(sid, ex):
@@ -723,7 +739,8 @@ def build(folder=None, tol=TOL, snap_tol=SNAP_TOL, min_price=MIN_PRICE, kinds=KI
         rv = rv.sort_values(["_k", "date", "security_id"], kind="stable", na_position="first") \
             .drop(columns="_k").reset_index(drop=True)
         lk = links(events, changes, m, days)
-        info = {"kinds": list(kinds) if kinds else None, "tol": tol, "snap_tol": snap_tol, "min_price": min_price,
+        info = {"kinds": list(kinds) if kinds else None, "tol": tol, "snap_tol": snap_tol, "ca_tol": ca_tol,
+                "min_price": min_price,
                 "first_date": str(days[0]), "last_date": str(days[-1]), "trading_days": len(days),
                 "master_built_at": m["info"].get("built_at"),
                 "built_at": f"{(now or sm.now_ist()):%Y-%m-%d %H:%M:%S} IST"}

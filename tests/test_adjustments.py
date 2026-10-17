@@ -170,8 +170,8 @@ def test_split_and_bonus_on_one_day(tmp_path):
                                            "Per Share", DAYS[20]), ("BAJ", "Dividend - Rs 5 Per Share", DAYS[20])]
     build(tmp_path, split("BAJ", "INE000004011", 20, 9500.0, 976.0), ca=ca)
     e = events(tmp_path, "BAJ")
-    assert (e.applied[0], e.factor[0], e.ratio_label[0]) == ("Y", "10.0", adj.label_of(10))
-    assert "split 1:2 + bonus 4:1" in e.ratio_label[0] and "Bonus 4:1" in e.ca_purpose[0] and "Dividend" not in e.ca_purpose[0]
+    assert (e.applied[0], e.factor[0], e.ratio_label[0]) == ("Y", "10.0", "bonus 4:1 + split Rs 2 -> Rs 1")
+    assert e.snapped_to[0] == "10.0" and "Bonus 4:1" in e.ca_purpose[0] and "Dividend" not in e.ca_purpose[0]
 
 
 def test_consolidation(tmp_path):
@@ -450,3 +450,33 @@ def test_known_cases_and_cli(tmp_path, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "split 1:2 | bonus 1:1" in out and f"Around {DAYS[20]} (applied Y)" in out
     assert cli.main(["show", "NOPE"]) == 1
+
+
+def test_ca_tol_matches_an_open_well_off_the_factor(tmp_path):
+    # open 6% off a factor of 5: 1000 / 212.8 = 4.70, close the same; --snap-tol (3%) would not match it
+    rows = trade("OFF", "INE000021011", r(0, 20), close=1000.0) + trade("OFF", "INE000021011", r(20, 40), close=212.8,
+                                                                         prev=1000.0, opn=212.8)
+    ca = [("OFF", "Face Value Split (Sub-Division) - From Rs 10/- Per Share To Rs 2/- Per Share", DAYS[20])]
+    build(tmp_path, rows, ca=ca, ca_tol=0.03)
+    assert list(read(tmp_path, "review.csv")["kind"]) == ["price_only", "ca_no_move"]
+    adj.build(str(tmp_path), log=lambda *_: None)                            # default ca-tol 0.10
+    e = events(tmp_path, "OFF")
+    assert (e.applied[0], e.factor[0], e.kind[0], e.ratio_label[0]) == ("Y", "5.0", "SPLIT_OR_BONUS",
+                                                                        "split Rs 10 -> Rs 2")
+    assert read(tmp_path, "review.csv").empty
+    assert "ca-tol 0.1" in open(os.path.join(str(tmp_path), "adjustments", "build_report.txt")).read()
+
+
+def test_debenture_bonus_and_future_ex_date_skipped(tmp_path):
+    res = build(tmp_path, trade("DEB", "INE000022011", r(0, 40), close=100.0),
+                ca=[("DEB", "Scheme Of Arrangement - Bonus Debentures 1:1", DAYS[10]),
+                    ("DEB", "Bonus 1:1", DAYS[-1] + timedelta(days=30))])
+    assert events(tmp_path).empty and read(tmp_path, "review.csv").empty
+    assert "no action 1" in res["report"] and "after the data 1" in res["report"]
+
+
+def test_cli_ca_tol_argument():
+    for bad in ("0", "0.5"):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["build", "--ca-tol", bad])
+        assert e.value.code == 2

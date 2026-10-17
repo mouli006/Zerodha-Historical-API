@@ -34,7 +34,7 @@ A local Flask app ("Kite Backfill", one machine) that:
 - `cm_bhav.py`: the NSE equity bhavcopy store. See docs/dev/equity_bhavcopy.md.
 - `nse_reference.py`: the NSE delisting / suspension / merger reference. See docs/dev/nse_reference.md.
 - `security_master.py`: build / show / check the security master (one `security_id` per company). See docs/dev/security_master.md.
-- `adjustments.py`: build / show / check split / bonus factors (price move confirmed by ISIN change or NSE CSV). See docs/dev/adjustments.md.
+- `adjustments.py`: build / show / check split / bonus factors (price move confirmed by ISIN change or NSE CSV), fetch-actions (NSE corporate actions). See docs/dev/adjustments.md.
 - Never run a CLI against real Kite or Dhan unless the user asks.
 
 ## Code map
@@ -59,7 +59,7 @@ Equity
 - `backfill/nse_ref/` (+ `nse_reference.py`): NSE reference lists.
 - `backfill/equity/`: home for new equity modules (security master, split/bonus factors, exits, index membership).
 - `backfill/equity/security_master.py` (+ `security_master.py`): security master from the bhavcopy parquet, and its loaders.
-- `backfill/equity/adjustments.py` (+ `adjustments.py`): split / bonus factors, `factor_on`, `adjusted_history`.
+- `backfill/equity/adjustments.py` / `corp_actions.py` (+ `adjustments.py`): split / bonus factors, `factor_on`, `adjusted_history`; NSE corporate-actions download.
 - `backfill/instruments.py`, `storage.py`, `runner.py`: the Kite bulk candle download.
 
 Web
