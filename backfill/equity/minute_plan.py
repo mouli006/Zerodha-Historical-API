@@ -10,7 +10,7 @@ offline. Output: <folder>/equity_1min/plan/ (every file atomic):
     probe_progress.sqlite                 one row per probed security, committed after each (probe; resume)
     kite_day/<security_id>.parquet        the day candles the probe fetched, so gaps() works offline
     kite_vs_bhav.parquet                  every Kite day joined with the bhavcopy (ratio, differences)
-    kite_adjustment.csv                   periods where Kite's adjustment differs from our factors, with kind
+    kite_adjustment.csv                   additive periods (every other day converts with its own ratio)
     eod_mismatch.csv                      real EOD differences (information only)
     plan.csv / kite_gaps.csv / index_coverage.csv / build_report.txt / build_info.json
 <folder>/equity_1min/.lock: one tokens / probe / gaps run at a time (backfill.locks.RunLock).
@@ -49,13 +49,19 @@ LATER_DAYS = 5           # a first Kite day more than 5 trading days after the s
 PRICE_TOL = 0.02         # probe: Kite day close vs bhavcopy close on the last bhavcopy day (identical in Part 0)
 SPEED = 2.5              # requests per second
 MAX_SPEED = 3.0
-ADJ_TOL = 0.005          # Kite's daily factor (bhav close / Kite close) off ours by more than 0.5%: an adjustment period
-STEP_TOL = 0.003         # a new period where Kite's factor and its additive difference both step by more than 0.3%
-STABLE_ABS = 0.02        # additive period: the difference varies by at most max(0.02, 0.3% of the price)
-AGREE_SHARE = 0.9        # a period's kind needs O/H/L to agree on at least 90% of its days
-PRICE_ABS = 0.011        # EOD check: a price off by more than max(0.011 on Kite's scale, 0.05%) ...
-PRICE_REL = 0.0005
-VOLUME_TOL = 0.01        # ... or a volume off raw x our factor and raw x Kite's factor by more than 1%
+ADJ_TOL = 0.005          # information: days where Kite's factor (bhav close / Kite close) is off ours by more than 0.5%
+HALF_TICK = 0.025        # every price tolerance allows half of Kite's rounding unit per Kite price: 0.025 for 0.05 ...
+UNITS = [0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]   # ... or a coarser unit Kite rounds a stock's adjusted prices to:
+UNIT_SHARE = 0.8         # ... the largest one all four prices sit on for 80% of the days of a year and our factor
+SLOPE_RANGE = 0.02       # Kite's own multiplier M (raw = M x (Kite + d)) is measured on days whose Kite high-low range
+SLOPE_UNITS = 20         # ... is at least 2% of the close and 20 rounding units, as bhav range / Kite range, ...
+SLOPE_WINDOW = 63        # ... and taken as the median of the 63 measured days around each day, within our factor
+PRICE_REL = 0.0005       # EOD check: O/H/L off that day's conversion by more than 0.05% + half ticks is a mismatch
+STEP_TOL = 0.003         # an additive period splits where the difference moves by more than 0.3% + two half ticks ...
+STEP_DAYS = 3            # ... and stays at the new level for 3 days (shorter: a blip); 3 non-additive days end it
+ADD_MIN_DAYS = 3         # an additive period needs at least 3 additive days
+VOLUME_TOL = 0.01        # a volume off raw x our factor, raw x the price ratio and raw x Kite's volume factor ...
+VOLUME_WINDOW = 11       # ... (median of Kite volume / raw volume over the 11 days around it) by more than 1% + 1 share
 SESSION_SHARE = 0.5      # a date Kite lacks for more than half the probed stocks that traded ...
 SESSION_MIN = 10         # ... out of at least 10, is a market-wide missing session
 MINUTES_PER_DAY = 375
@@ -74,18 +80,21 @@ REFERENCE_NAMES = {"mergers.csv": ("old_symbol", "old_company"), "voluntary_deli
                    "suspensions.csv": ("symbol", "company")}
 
 TOKEN_COLUMNS = ["security_id", "isin", "symbol", "series", "kite_tradingsymbol", "instrument_token", "kite_name",
-                 "kite_last_price", "bhav_close", "match_status", "note"]
-PLAN_COLUMNS = ["security_id", "symbols", "isins", "status", "exit_reason", "match_status", "instrument_token",
-                "need_from", "need_to", "eod_first_day", "eod_missing_days", "eod_mismatch_days", "minute_first_day",
-                "download_eod", "download_minute", "eod_requests", "minute_requests", "est_minute_rows", "note"]
+                 "kite_last_price", "bhav_close", "match_status", "match_rule", "note"]
+PLAN_COLUMNS = ["security_id", "symbols", "isins", "status", "exit_reason", "match_status", "match_rule",
+                "instrument_token", "need_from", "need_to", "eod_first_day", "eod_missing_days", "eod_mismatch_days",
+                "minute_first_day", "download_eod", "download_minute", "eod_requests", "minute_requests",
+                "est_minute_rows", "note"]
 GAP_COLUMNS = ["data_missing", "security_id", "symbols", "isins", "company_name", "need_from", "need_to",
                "trading_days", "reason", "exit_note", "indices", "median_turnover", "priority", "note"]
-ADJUSTMENT_COLUMNS = ["security_id", "symbol", "from_date", "to_date", "days", "kite_vs_ours", "median_ratio",
-                      "median_adj_difference", "our_factor", "kind", "agree_multiplicative", "agree_additive"]
+ADJUSTMENT_COLUMNS = ["security_id", "symbol", "from_date", "to_date", "days", "additive_days", "kite_vs_ours",
+                      "median_ratio", "kite_multiplier", "median_kite_difference", "median_adj_difference",
+                      "our_factor", "kind"]
 MISMATCH_COLUMNS = ["security_id", "symbol", "date", "field", "kite", "bhav", "factor", "kind"]
 COVERAGE_COLUMNS = ["index", "date", "members", "with_eod", "with_minute", "without_eod", "without_minute"]
 FIELDS = ["open", "high", "low", "close", "volume"]
-KINDS = ["MULTIPLICATIVE", "ADDITIVE", "MIXED"]
+KINDS = ["MULTIPLICATIVE", "ADDITIVE"]   # per day: raw = Kite x ratio, or kite_multiplier x (Kite + kite_difference)
+TOP_MISMATCH = 10
 
 PART0_FINDINGS = """Part 0 findings (Kite, 2026-10-18; see docs/dev/equity_minute_plan.md):
 - Instrument list: no ISIN column; last_price is 0 on every row (the price check uses the probe's day candle).
@@ -94,7 +103,10 @@ PART0_FINDINGS = """Part 0 findings (Kite, 2026-10-18; see docs/dev/equity_minut
 - Day and minute data start on the same day for listings after 2015; no day-only or minute-only days were seen.
 - Kite has no candles for the weekday Muhurat sessions 2017-10-19 and 2018-11-07.
 - Kite adjusts for splits / bonuses (volume too) and also for demergers, some dividends, and additively
-  (TATASTEEL before 2024): see kite_adjustment.csv. Recent days without later actions match the bhavcopy exactly."""
+  (TATASTEEL before 2024): each day converts with its own ratio, kite_adjustment.csv lists the additive periods.
+  Recent days without later actions match the bhavcopy exactly.
+- A series switch (bhavcopy EQ, Kite only SYMBOL-BE, or the reverse) is the same stock: match_rule SERIES_SWITCH.
+- INFIBEAM -> CCAVENUE: Kite lists only CCAVENUE (token 4159745, name AVENUESAI); it returned no day candles."""
 
 
 class MinutePlanError(Exception):
@@ -276,8 +288,9 @@ def kite_client():
 
 def match_tokens(universe, instruments):
     """kite_tokens.csv rows for the ACTIVE securities: today's symbol and series on both sides. Kite names a
-    trade-to-trade stock SYMBOL-BE / SYMBOL-BZ; one candidate with the expected name is a match, none is NO_TOKEN,
-    anything else (two candidates, only another series' name) is REVIEW. Never guessed."""
+    trade-to-trade stock SYMBOL-BE / SYMBOL-BZ. One candidate with the expected name is a match (EXACT); one
+    candidate with the same symbol in another series is a match too (SERIES_SWITCH: Kite keeps one instrument per
+    stock, the probe's price check decides); none is NO_TOKEN; two or more are REVIEW. Never guessed."""
     by_base = {}
     for i in instruments:
         if i.get("segment") != "NSE":
@@ -294,52 +307,73 @@ def match_tokens(universe, instruments):
         expected = sym if series == "EQ" else f"{sym}-{series}"
         row = {"security_id": u["security_id"], "isin": u["isin"], "symbol": sym, "series": series,
                "kite_tradingsymbol": "", "instrument_token": "", "kite_name": "", "kite_last_price": "",
-               "bhav_close": u["last_close"], "match_status": "NO_TOKEN", "note": ""}
+               "bhav_close": u["last_close"], "match_status": "NO_TOKEN", "match_rule": "", "note": ""}
         cands = by_base.get(sym, [])
         if not cands:
             row["note"] = f"no {sym} / {sym}-BE / {sym}-BZ in Kite's list"
-        elif len(cands) == 1 and cands[0]["tradingsymbol"] == expected:
+        elif len(cands) == 1:
             c = cands[0]
+            exact = c["tradingsymbol"] == expected
             row.update(kite_tradingsymbol=c["tradingsymbol"], instrument_token=int(c["instrument_token"]),
                        kite_name=c.get("name") or "", kite_last_price=c.get("last_price"),
-                       match_status="MATCHED_UNCHECKED", note="price checked by probe")
+                       match_status="MATCHED_UNCHECKED", match_rule="EXACT" if exact else "SERIES_SWITCH",
+                       note="price checked by probe" if exact else
+                       f"SERIES_SWITCH: bhavcopy series {series}, Kite lists {c['tradingsymbol']} "
+                       f"({c['instrument_token']}); price checked by probe")
         else:
             listed = ", ".join(f"{c['tradingsymbol']} ({c['instrument_token']})" for c in cands)
-            row["match_status"] = "REVIEW"
-            row["note"] = (f"{len(cands)} candidates: {listed}" if len(cands) > 1
-                           else f"only {listed} in Kite's list, bhavcopy series {series}")
+            row.update(match_status="REVIEW", note=f"{len(cands)} candidates: {listed}")
         rows.append(row)
     return rows
 
 
-def tokens(folder=None, kite=None, include_etf=False, now=None, log=print):
-    """One instrument-list request: save it as received, match every ACTIVE security, write kite_tokens.csv."""
+def saved_instruments(folder):
+    """(path, list date) of the newest saved kite_instruments_NSE_<date>.csv."""
+    paths = sorted(glob(os.path.join(plan_dir(folder), "kite_instruments_NSE_*.csv")))
+    if not paths:
+        raise NotBuilt(f"No saved Kite instrument list in {plan_dir(folder)}. Run: python equity_minute.py tokens")
+    name = os.path.basename(paths[-1])
+    return paths[-1], sm.as_date(name[len("kite_instruments_NSE_"):-len(".csv")])
+
+
+def tokens(folder=None, kite=None, include_etf=False, rematch=False, now=None, log=print):
+    """One instrument-list request: save it as received, match every ACTIVE security, write kite_tokens.csv.
+    rematch: match again from the newest saved list instead, offline (no Kite request)."""
     folder = folder or config.equity_data_dir()
     inp = Inputs(folder, include_etf)
     lock = RunLock(lock_path(folder)).acquire("equity_minute.py tokens")
     try:
-        kite = kite or kite_client()
-        try:
-            instruments = kite.instruments("NSE")
-        except kex.TokenException as e:
-            raise SignInNeeded(f"Kite session expired or invalid ({type(e).__name__}). Sign in again (python app.py).")
         out = plan_dir(folder)
-        os.makedirs(out, exist_ok=True)
-        day = (now or now_ist()).date()
-        name = f"kite_instruments_NSE_{day.isoformat()}.csv"
-        sm.write_csv(pd.DataFrame(instruments), os.path.join(out, name))
+        if rematch:
+            path, day = saved_instruments(folder)
+            name = os.path.basename(path)
+            instruments = pd.read_csv(path, dtype=str, keep_default_na=False).to_dict("records")
+        else:
+            kite = kite or kite_client()
+            try:
+                instruments = kite.instruments("NSE")
+            except kex.TokenException as e:
+                raise SignInNeeded(f"Kite session expired or invalid ({type(e).__name__}). "
+                                   "Sign in again (python app.py).")
+            os.makedirs(out, exist_ok=True)
+            day = (now or now_ist()).date()
+            name = f"kite_instruments_NSE_{day.isoformat()}.csv"
+            sm.write_csv(pd.DataFrame(instruments), os.path.join(out, name))
         rows = match_tokens(inp.universe, instruments)
         sm.write_csv(pd.DataFrame(rows, columns=TOKEN_COLUMNS), os.path.join(out, "kite_tokens.csv"))
         counts = pd.Series([r["match_status"] for r in rows], dtype=object).value_counts().to_dict()
+        rules = pd.Series([r["match_rule"] for r in rows if r["match_rule"]], dtype=object).value_counts().to_dict()
         info = {"built_at": f"{now or now_ist():%Y-%m-%d %H:%M:%S}", "instruments_file": name,
-                "instruments_date": day.isoformat(), "instruments_rows": len(instruments),
+                "instruments_date": day.isoformat(), "instruments_rows": len(instruments), "rematch": rematch,
                 "bhav_last": iso(inp.days[-1]), "calendar_days_between": int(np.busday_count(inp.days[-1], day)),
-                "active": len(rows), "match_status": counts}
+                "active": len(rows), "match_status": counts, "match_rule": rules}
         write_json(os.path.join(out, "tokens_info.json"), info)
-        lines = [f"Kite instrument list {day}: {len(instruments):,} rows -> {name}",
+        lines = [f"Kite instrument list {day}: {len(instruments):,} rows " + (f"(rematched offline from {name})"
+                                                                                if rematch else f"-> {name}"),
                  f"Latest bhavcopy day {inp.days[-1]} ({info['calendar_days_between']} weekdays before the list; "
                  "a rename in between shows up as NO_TOKEN)",
-                 f"ACTIVE securities: {len(rows):,}"] + [f"  {k}: {v:,}" for k, v in sorted(counts.items())]
+                 f"ACTIVE securities: {len(rows):,}"] + [f"  {k}: {v:,}" for k, v in sorted(counts.items())] + \
+            ["Match rule:"] + [f"  {k}: {v:,}" for k, v in sorted(rules.items())]
         text = "\n".join(lines) + "\n"
         log(text, end="")
         return {"out": out, "rows": rows, "info": info, "report": text}
@@ -351,7 +385,11 @@ def read_tokens(folder):
     path = os.path.join(plan_dir(folder), "kite_tokens.csv")
     if not os.path.isfile(path):
         raise NotBuilt(f"No {path}. Run: python equity_minute.py tokens")
-    return pd.read_csv(path, dtype=str, keep_default_na=False)
+    df = pd.read_csv(path, dtype=str, keep_default_na=False)
+    if "match_rule" not in df:          # written before the rule existed: every match was exact
+        df.insert(df.columns.get_loc("note"), "match_rule",
+                  np.where(df["match_status"].isin(MATCHED), "EXACT", ""))
+    return df
 
 
 # ---- Part 3: probe ----
@@ -581,7 +619,7 @@ def kite_vs_bhav(folder, inp, probed):
             k.insert(0, "security_id", sid)
             frames.append(k)
     cols = ["security_id", "date"] + [f"kite_{f}" for f in FIELDS] + [f"bhav_{f}" for f in FIELDS] + \
-        ["our_factor", "ratio", "difference", "adj_difference"]
+        ["our_factor", "ratio", "difference", "adj_difference", "kite_multiplier", "kite_difference"]
     if not frames:
         return pd.DataFrame(columns=cols + ["symbol"])
     k = pd.concat(frames, ignore_index=True).rename(columns={f: f"kite_{f}" for f in FIELDS})
@@ -591,98 +629,155 @@ def kite_vs_bhav(folder, inp, probed):
     j["ratio"] = j["bhav_close"] / j["kite_close"]
     j["difference"] = j["bhav_close"] - j["kite_close"]
     j["adj_difference"] = j["bhav_close"] / j["our_factor"] - j["kite_close"]
+    j["kite_multiplier"] = kite_multiplier(j)
+    j["kite_difference"] = j["bhav_close"] / j["kite_multiplier"] - j["kite_close"]
     return j[cols + ["symbol"]]
 
 
-def agreement(g):
-    """Per day: do O/H/L convert like the close, multiplicatively (ratio) and additively (adj_difference)?"""
-    mult = np.ones(len(g), dtype=bool)
-    add = np.ones(len(g), dtype=bool)
-    for f in ("open", "high", "low"):
-        kite, bhav = g[f"kite_{f}"].to_numpy(float), g[f"bhav_{f}"].to_numpy(float)
-        tol = np.maximum(PRICE_ABS, PRICE_REL * np.abs(kite))
-        mult &= np.abs(kite - bhav / g["ratio"].to_numpy(float)) <= tol
-        add &= np.abs(kite - (bhav / g["our_factor"].to_numpy(float) - g["adj_difference"].to_numpy(float))) <= tol
-    return mult, add
+def kite_multiplier(j):
+    """Kite's own multiplier M per day (raw = M x (Kite + d)): bhav high-low range / Kite range on days with a wide
+    enough range, the median of the SLOPE_WINDOW measured days around each day within one of our factor's periods
+    (so it follows a step at an action), our factor where nothing was measured. Equal to the day's ratio when Kite
+    is purely multiplicative, to our factor when it is purely additive."""
+    rng = (j["kite_high"] - j["kite_low"]).to_numpy(float)
+    unit = 2 * half_units(j)
+    ok = (rng >= np.maximum(SLOPE_RANGE * j["kite_close"].to_numpy(float), SLOPE_UNITS * unit)) & \
+        (j["bhav_high"] > j["bhav_low"]).to_numpy()
+    with np.errstate(divide="ignore", invalid="ignore"):
+        slope = pd.Series(np.where(ok, (j["bhav_high"] - j["bhav_low"]).to_numpy(float) / rng, np.nan), index=j.index)
+
+    def rolled(x):
+        m = x.dropna().rolling(SLOPE_WINDOW, center=True, min_periods=1).median()
+        return m.reindex(x.index).ffill().bfill()
+
+    m = slope.groupby([j["security_id"], j["our_factor"]]).transform(rolled)
+    return m.fillna(j["our_factor"]).to_numpy(float)
 
 
-def period_kind(p, mult, add):
-    """MULTIPLICATIVE when Kite's factor is stable and O/H/L agree with it, ADDITIVE when the difference is stable
-    and O/H/L agree with it, else MIXED. Both possible (flat prices, one day): the better agreement wins."""
-    q = p["ratio"] / p["our_factor"]
-    q_ok = q.max() / q.min() - 1 <= STEP_TOL
-    d = p["adj_difference"]
-    d_ok = d.max() - d.min() <= max(STABLE_ABS, STEP_TOL * float(p["kite_close"].median()))
-    m_share, a_share = float(mult.mean()), float(add.mean())
-    is_m, is_a = q_ok and m_share >= AGREE_SHARE, d_ok and a_share >= AGREE_SHARE
-    if is_m and (not is_a or m_share >= a_share):
-        return "MULTIPLICATIVE", m_share, a_share
-    if is_a:
-        return "ADDITIVE", m_share, a_share
-    return "MIXED", m_share, a_share
+def half_units(kvb):
+    """Half of Kite's rounding unit per day. Kite rounds some stocks' adjusted prices to 0.5, 1 or 5 (not tied to
+    the factor): the unit is the largest of UNITS all four Kite prices sit on for UNIT_SHARE of the stock's days in
+    a year with one of our factors, and for the day itself (one day alone never loosens its own check); at least
+    0.05."""
+    prices = kvb[["kite_open", "kite_high", "kite_low", "kite_close"]].to_numpy(float)
+    keys = [kvb["security_id"], kvb["our_factor"], pd.to_datetime(kvb["date"]).dt.year]
+    unit = np.full(len(kvb), UNITS[0])
+    for u in UNITS[1:]:
+        on = (np.abs(prices / u - np.round(prices / u)) < 1e-6).all(axis=1)
+        share = pd.Series(on, index=kvb.index).groupby(keys).transform("mean").to_numpy(float)
+        unit = np.where(on & (share >= UNIT_SHARE), u, unit)
+    return unit * (HALF_TICK / UNITS[0])
+
+
+def misfits(kvb):
+    """Per O/H/L field and day: off the day's own ratio (multiplicative) / off the additive conversion by more than
+    0.05% plus half of Kite's rounding unit per rounded Kite price (the field, and the close inside the ratio or
+    kite_difference). Additive: raw = kite_multiplier x (Kite + kite_difference)."""
+    kc = kvb["kite_close"].to_numpy(float)
+    ratio, km = kvb["ratio"].to_numpy(float), kvb["kite_multiplier"].to_numpy(float)
+    kd = kvb["kite_difference"].to_numpy(float)
+    half = half_units(kvb)
+    m_bad, a_bad = {}, {}
+    with np.errstate(divide="ignore", invalid="ignore"):
+        for f in ("open", "high", "low"):
+            kite, bhav = kvb[f"kite_{f}"].to_numpy(float), kvb[f"bhav_{f}"].to_numpy(float)
+            rel = PRICE_REL * np.abs(kite)
+            m_bad[f] = np.abs(kite - bhav / ratio) > rel + half * (1 + np.abs(kite / kc))
+            a_bad[f] = np.abs(kite - (bhav / km - kd)) > rel + 2 * half
+    return m_bad, a_bad
+
+
+def additive_periods(add_ok, mult_ok, ad, kc, half):
+    """[(first, last, additive days)] positions of one security's ADDITIVE periods. An additive day fits the
+    additive conversion but not its own ratio. A period ends after STEP_DAYS days that do not fit additively (days
+    that fit both, flat candles, are neutral) and splits only on a lasting step: the difference moves by more than
+    STEP_TOL x close + two half units and the next STEP_DAYS days are additive at a level of their own. A shorter
+    move is a blip and stays inside. Periods with fewer than ADD_MIN_DAYS additive days are dropped."""
+    cand = add_ok & ~mult_ok
+    n, out, i = len(cand), [], 0
+    while i < n:
+        if not cand[i]:
+            i += 1
+            continue
+        start, last, level, quiet, count, j = i, i, [ad[i]], 0, 1, i + 1
+        while j < n:
+            if cand[j]:
+                tol = STEP_TOL * abs(kc[j]) + 2 * half[j]
+                if abs(ad[j] - np.median(level[-STEP_DAYS:])) > tol:
+                    w = slice(j, j + STEP_DAYS)
+                    if j + STEP_DAYS <= n and cand[w].all() and np.ptp(ad[w]) <= tol:
+                        break                               # a lasting step: a new period starts at j
+                else:
+                    level.append(ad[j])                     # a blip does not move the level
+                last, quiet, count = j, 0, count + 1
+            elif not add_ok[j]:
+                quiet += 1
+                if quiet >= STEP_DAYS:
+                    break
+            j += 1
+        if count >= ADD_MIN_DAYS:
+            out.append((start, last, count))
+        i = last + 1
+    return out
 
 
 def adjustments_and_mismatches(kvb, inp):
-    """kite_adjustment.csv periods, the day kind (OUR_FACTOR outside a period) and eod_mismatch.csv rows."""
+    """kite_adjustment.csv (ADDITIVE periods), the day kind and eod_mismatch.csv rows. Every day outside an additive
+    period converts with its own ratio (raw = Kite x ratio), so splits, demergers and small dividend steps need no
+    period; a mismatch is a field that does not fit that day's own conversion."""
     periods, mismatches = [], []
     kvb = kvb.reset_index(drop=True)
-    kvb["kind"] = "OUR_FACTOR"
+    kvb["kind"] = "MULTIPLICATIVE"
     if kvb.empty:
         return pd.DataFrame(columns=ADJUSTMENT_COLUMNS), pd.DataFrame(columns=MISMATCH_COLUMNS), kvb
-    q = kvb["ratio"] / kvb["our_factor"]
-    flagged = ((q - 1).abs() > ADJ_TOL).to_numpy()
-    mult_all, add_all = agreement(kvb)
+    m_bad, a_bad = misfits(kvb)
+    mult_ok = ~(m_bad["open"] | m_bad["high"] | m_bad["low"])
+    add_ok = ~(a_bad["open"] | a_bad["high"] | a_bad["low"])
+    candidates = add_ok & ~mult_ok
     kinds = kvb["kind"].to_numpy(object)
-    for sid, idx in kvb.groupby("security_id").indices.items():
-        f = flagged[idx]
-        if not f.any():
+    ad_all, kc_all = kvb["kite_difference"].to_numpy(float), kvb["kite_close"].to_numpy(float)
+    half = half_units(kvb)
+    for (sid, _), idx in kvb.groupby(["security_id", "our_factor"], sort=False).indices.items():
+        if not candidates[idx].any():
             continue
-        g = kvb.iloc[idx]
-        qq, dd, kc = (g["ratio"] / g["our_factor"]).to_numpy(), g["adj_difference"].to_numpy(), g["kite_close"].to_numpy()
-        runs, cur = [], None
-        for j in range(len(idx)):
-            if not f[j]:
-                cur = None
-                continue
-            step = cur is not None and abs(qq[j] / qq[j - 1] - 1) > STEP_TOL and \
-                abs(dd[j] - dd[j - 1]) > STEP_TOL * kc[j]
-            if cur is None or step:
-                cur = []
-                runs.append(cur)
-            cur.append(j)
-        for run in runs:
-            p = g.iloc[run]
-            mult, add = mult_all[idx[run]], add_all[idx[run]]
-            kind, m_share, a_share = period_kind(p, mult, add)
-            kinds[idx[run]] = kind
+        for first, last, count in additive_periods(add_ok[idx], mult_ok[idx], ad_all[idx], kc_all[idx], half[idx]):
+            run = idx[first:last + 1]
+            kinds[run] = "ADDITIVE"
+            p = kvb.iloc[run]
             factors = sorted(set(p["our_factor"].round(6)))
             periods.append({"security_id": sid, "symbol": inp.by_id[sid]["symbol"], "from_date": iso(p["date"].iloc[0]),
-                            "to_date": iso(p["date"].iloc[-1]), "days": len(p),
+                            "to_date": iso(p["date"].iloc[-1]), "days": len(p), "additive_days": count,
                             "kite_vs_ours": round(float((p["ratio"] / p["our_factor"]).median()), 6),
                             "median_ratio": round(float(p["ratio"].median()), 6),
+                            "kite_multiplier": round(float(p["kite_multiplier"].median()), 6),
+                            "median_kite_difference": round(float(p["kite_difference"].median()), 4),
                             "median_adj_difference": round(float(p["adj_difference"].median()), 4),
-                            "our_factor": "|".join(f"{x:g}" for x in factors), "kind": kind,
-                            "agree_multiplicative": round(m_share, 3), "agree_additive": round(a_share, 3)})
+                            "our_factor": "|".join(f"{x:g}" for x in factors), "kind": "ADDITIVE"})
     kvb["kind"] = kinds
+    additive = kinds == "ADDITIVE"
     for f in ("open", "high", "low"):
-        kite, bhav = kvb[f"kite_{f}"].to_numpy(float), kvb[f"bhav_{f}"].to_numpy(float)
-        tol = np.maximum(PRICE_ABS, PRICE_REL * np.abs(kite))
-        m_bad = np.abs(kite - bhav / kvb["ratio"].to_numpy(float)) > tol
-        a_bad = np.abs(kite - (bhav / kvb["our_factor"].to_numpy(float) - kvb["adj_difference"].to_numpy(float))) > tol
-        bad = np.where(kinds == "ADDITIVE", a_bad, np.where(kinds == "MIXED", m_bad & a_bad, m_bad))
+        bad = np.where(additive, a_bad[f], m_bad[f])
         for r in kvb[bad].itertuples():
             mismatches.append({"security_id": r.security_id, "symbol": r.symbol, "date": iso(r.date), "field": f,
                                "kite": getattr(r, f"kite_{f}"), "bhav": getattr(r, f"bhav_{f}"),
                                "factor": round(r.ratio, 6), "kind": r.kind})
     kv, bv = kvb["kite_volume"].to_numpy(float), kvb["bhav_volume"].to_numpy(float)
-    off = [np.abs(kv - bv * x) > VOLUME_TOL * np.maximum(bv * x, 1.0)
-           for x in (kvb["our_factor"].to_numpy(float), kvb["ratio"].to_numpy(float))]
-    for r in kvb[off[0] & off[1]].itertuples():
+    with np.errstate(divide="ignore", invalid="ignore"):
+        vr = pd.Series(np.where(bv > 0, kv / bv, np.nan))
+    # Kite scales volume by its own factor (not always ours, not the price ratio); it only steps at an action, so
+    # a centred median of the neighbours follows a step exactly and a one-day error stands out
+    vf = vr.groupby(kvb["security_id"]).transform(
+        lambda x: x.rolling(VOLUME_WINDOW, center=True, min_periods=1).median()).to_numpy(float)
+    vf = np.where(np.isnan(vf), 1.0, vf)
+    off = [np.abs(kv - bv * x) > VOLUME_TOL * bv * x + 1
+           for x in (kvb["our_factor"].to_numpy(float), kvb["ratio"].to_numpy(float), vf)]
+    for r in kvb[off[0] & off[1] & off[2]].itertuples():
         mismatches.append({"security_id": r.security_id, "symbol": r.symbol, "date": iso(r.date), "field": "volume",
                            "kite": r.kite_volume, "bhav": r.bhav_volume, "factor": round(r.our_factor, 6),
                            "kind": r.kind})
     mm = pd.DataFrame(mismatches, columns=MISMATCH_COLUMNS).sort_values(["security_id", "date", "field"], kind="stable")
-    return pd.DataFrame(periods, columns=ADJUSTMENT_COLUMNS), mm.reset_index(drop=True), kvb
+    per = pd.DataFrame(periods, columns=ADJUSTMENT_COLUMNS).sort_values(["security_id", "from_date"], kind="stable")
+    return per.reset_index(drop=True), mm.reset_index(drop=True), kvb
 
 
 def spans(rows, field, a=None, b=None):
@@ -819,6 +914,7 @@ def build_outputs(folder, inp, now=None, log=print):
         p = probes.get(sid)
         s = {"sid": sid, "u": u, "token": t.instrument_token if t is not None and t.instrument_token else "",
              "match": t.match_status if t is not None else ("NO_TOKEN" if u["status"] == "ACTIVE" else ""),
+             "rule": t.match_rule if t is not None else "",
              "token_note": t.note if t is not None else "", "probed": False, "eod_first": None, "eod_last": None,
              "missing": [], "minute_first": None, "days": bhav_days.get(sid, [])}
         if (s["match"] in MATCHED and p and p["status"] == "DONE" and p["instrument_token"] == s["token"]):
@@ -841,10 +937,12 @@ def build_outputs(folder, inp, now=None, log=print):
     kvb = kite_vs_bhav(folder, inp, usable)
     periods, mismatches, kvb = adjustments_and_mismatches(kvb, inp)
     kite_days = {sid: list(g["date"]) for sid, g in kvb.groupby("security_id")} if len(kvb) else {}
-    sm.write_parquet(kvb.drop(columns=["symbol", "kind"]), os.path.join(out, "kite_vs_bhav.parquet"))
+    sm.write_parquet(kvb.drop(columns=["symbol"]), os.path.join(out, "kite_vs_bhav.parquet"))
     sm.write_csv(periods, os.path.join(out, "kite_adjustment.csv"))
     sm.write_csv(mismatches, os.path.join(out, "eod_mismatch.csv"))
     mismatch_days = mismatches.groupby("security_id")["date"].nunique().to_dict() if len(mismatches) else {}
+    off = (kvb["ratio"] / kvb["our_factor"] - 1).abs() > ADJ_TOL if len(kvb) else pd.Series(dtype=bool)
+    top = sorted(mismatch_days.items(), key=lambda x: (-x[1], x[0]))[:TOP_MISMATCH]
 
     # plan.csv and kite_gaps.csv
     plan_rows, gap_rows = [], []
@@ -861,7 +959,8 @@ def build_outputs(folder, inp, now=None, log=print):
         plan_rows.append({
             "security_id": sid, "symbols": spans(rows, "symbol") if rows is not None else u["symbol"],
             "isins": spans(rows, "isin") if rows is not None else u["isin"], "status": u["status"],
-            "exit_reason": u["exit_reason"], "match_status": s["match"], "instrument_token": s["token"],
+            "exit_reason": u["exit_reason"], "match_status": s["match"], "match_rule": s["rule"],
+            "instrument_token": s["token"],
             "need_from": iso(a), "need_to": iso(b), "eod_first_day": iso(s["eod_first"]),
             "eod_missing_days": len(s["missing"]) if s["probed"] else "",
             "eod_mismatch_days": mismatch_days.get(sid, 0) if s["probed"] else "",
@@ -901,7 +1000,11 @@ def build_outputs(folder, inp, now=None, log=print):
     extra = {"probe_failed": sum(1 for s in states.values() if s.get("probe_error")),
              "not_probed": sum(1 for s in states.values() if s["match"] in MATCHED and not s["probed"]
                                and not s.get("probe_error")),
-             "est_eod_rows": sum(len(kite_days.get(sid, [])) for sid in usable)}
+             "est_eod_rows": sum(len(kite_days.get(sid, [])) for sid in usable),
+             "factor_differs_days": int(off.sum()),
+             "factor_differs_securities": int(kvb.loc[off, "security_id"].nunique()) if len(kvb) else 0,
+             "eod_mismatch_days": int(sum(mismatch_days.values())),
+             "top_mismatch": [{"security_id": sid, "symbol": inp.by_id[sid]["symbol"], "days": n} for sid, n in top]}
     info = build_info(folder, inp, plan, gap, periods, mismatches, sessions, extra, now)
     text = report_text(info, gap, coverage)
     sm.write_text(os.path.join(out, "build_report.txt"), text)
@@ -1048,6 +1151,7 @@ def build_info(folder, inp, plan, gap, periods, mismatches, sessions, extra, now
         "built_at": f"{now or now_ist():%Y-%m-%d %H:%M:%S}", "bhav_first": iso(inp.days[0]), "bhav_last": iso(inp.days[-1]),
         "instruments_date": toks_info.get("instruments_date", ""), "instruments_file": toks_info.get("instruments_file", ""),
         "securities": len(plan), "status": counts(plan["status"]), "match_status": counts(plan["match_status"]),
+        "match_rule": counts(plan.loc[plan["match_rule"] != "", "match_rule"]),
         "not_probed": extra["not_probed"], "probe_failed": extra["probe_failed"],
         "download_eod": int((plan["download_eod"] == "Y").sum()), "download_minute": int((plan["download_minute"] == "Y").sum()),
         "gap_rows": len(gap), "reason": counts(gap["reason"]), "data_missing": counts(gap["data_missing"]),
@@ -1056,6 +1160,9 @@ def build_info(folder, inp, plan, gap, periods, mismatches, sessions, extra, now
         "adjustment_securities": int(periods["security_id"].nunique()) if len(periods) else 0,
         "eod_mismatch_rows": len(mismatches), "eod_mismatch_fields": counts(mismatches["field"]) if len(mismatches) else {},
         "eod_mismatch_securities": int(mismatches["security_id"].nunique()) if len(mismatches) else 0,
+        "eod_mismatch_days": extra["eod_mismatch_days"], "top_mismatch": extra["top_mismatch"],
+        "factor_differs_days": extra["factor_differs_days"],
+        "factor_differs_securities": extra["factor_differs_securities"],
         "missing_sessions": {iso(d): {"lacking": a, "traded": b} for d, (a, b) in sessions.items()},
         "kite_minute_from": iso(KITE_MINUTE_FROM),
         "eod_requests": eod_req, "minute_requests": min_req,
@@ -1063,8 +1170,10 @@ def build_info(folder, inp, plan, gap, periods, mismatches, sessions, extra, now
         "est_minute_rows": rows, "est_eod_rows": extra["est_eod_rows"],
         "est_disk_gb": {"parquet": round(rows * PARQUET_BYTES / 1e9, 1), "csv": round(rows * CSV_BYTES / 1e9, 1)},
         "disk_assumption": f"{PARQUET_BYTES} bytes per minute row in parquet, {CSV_BYTES} in CSV (estimates)",
-        "parameters": {"price_tol_default": PRICE_TOL, "adj_tol": ADJ_TOL, "step_tol": STEP_TOL,
-                       "price_abs": PRICE_ABS, "price_rel": PRICE_REL, "volume_tol": VOLUME_TOL,
+        "parameters": {"price_tol_default": PRICE_TOL, "adj_tol": ADJ_TOL, "half_tick": HALF_TICK, "units": UNITS,
+                       "unit_share": UNIT_SHARE, "price_rel": PRICE_REL, "step_tol": STEP_TOL, "step_days": STEP_DAYS,
+                       "add_min_days": ADD_MIN_DAYS, "slope_range": SLOPE_RANGE, "slope_units": SLOPE_UNITS,
+                       "slope_window": SLOPE_WINDOW, "volume_tol": VOLUME_TOL, "volume_window": VOLUME_WINDOW,
                        "later_days": LATER_DAYS, "session_share": SESSION_SHARE, "session_min": SESSION_MIN},
     }
 
@@ -1077,6 +1186,7 @@ def report_text(info, gap, coverage):
              f"Bhavcopy {info['bhav_first']} to {info['bhav_last']}; Kite instrument list {info['instruments_date'] or '-'}",
              "", PART0_FINDINGS, "", f"Securities: {info['securities']:,}"]
     lines += block("Status:", info["status"]) + block("Match status:", info["match_status"])
+    lines += block("Match rule:", info["match_rule"])
     if info["not_probed"]:
         lines.append(f"Not probed yet: {info['not_probed']:,} (run: python equity_minute.py probe)")
     if info["probe_failed"]:
@@ -1085,12 +1195,18 @@ def report_text(info, gap, coverage):
     lines += block("Per reason:", info["reason"]) + block("Per data_missing:", info["data_missing"])
     lines += block("Per priority:", info["priority"])
     lines += ["", "Market-wide missing sessions: " + (", ".join(info["missing_sessions"]) or "none")]
-    lines += ["", f"Kite adjustment periods (kite_adjustment.csv): {sum(info['adjustment_periods'].values()):,} in "
-                  f"{info['adjustment_securities']:,} securities"] + \
-        [f"  {k}: {v:,}" for k, v in info["adjustment_periods"].items()]
-    lines += [f"EOD mismatches (eod_mismatch.csv): {info['eod_mismatch_rows']:,} rows in "
-              f"{info['eod_mismatch_securities']:,} securities"] + \
+    lines += ["", "EOD check: every day converts with its own ratio (raw = Kite x bhav close / Kite close); inside an "
+                  "additive period raw = kite_multiplier x (Kite + kite_difference).",
+              f"Kite's factor differs from ours by more than {ADJ_TOL:.1%} on {info['factor_differs_days']:,} days in "
+              f"{info['factor_differs_securities']:,} securities (converted per day, no period needed)",
+              f"Additive periods (kite_adjustment.csv): {sum(info['adjustment_periods'].values()):,} in "
+              f"{info['adjustment_securities']:,} securities"]
+    lines += [f"EOD mismatches (eod_mismatch.csv): {info['eod_mismatch_rows']:,} rows, "
+              f"{info['eod_mismatch_days']:,} security-days in {info['eod_mismatch_securities']:,} securities"] + \
         [f"  {k}: {v:,}" for k, v in info["eod_mismatch_fields"].items()]
+    if info["top_mismatch"]:
+        lines.append(f"Top {TOP_MISMATCH} securities by mismatch days:")
+        lines += [f"  {t['symbol']} ({t['security_id']}): {t['days']:,}" for t in info["top_mismatch"]]
     lines += ["", "Index coverage (index_coverage.csv):"]
     for index in INDEXES:
         for kind in ("eod", "minute"):

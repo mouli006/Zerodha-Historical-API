@@ -3,16 +3,17 @@ instrument tokens, from which day Kite has day and minute candles, and the vendo
 Downloads no candles to keep.
 
     python equity_minute.py tokens                Kite instrument list (one request) -> kite_tokens.csv
+    python equity_minute.py tokens --rematch      match again from the newest saved list, offline
     python equity_minute.py probe [--speed 2.5] [--force] [--price-tol 0.02]
                                                   day candles + first minute day per matched stock, then gaps
     python equity_minute.py gaps                  rebuild plan.csv, kite_gaps.csv, ... offline
     python equity_minute.py show RELIANCE         the plan, token, gaps and adjustment periods of one company
 
 Every command takes --folder (absolute; default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data) and --include-etf.
-Output: <folder>/equity_1min/plan/. Only tokens and probe use the network (Kite only; the token from .env is never
-printed). Exit codes: 0 done; 1 an input not built or stale, tokens not run yet, some probes failed or the probe
-stopped, show found nothing; 2 bad arguments, a lock busy, an input build or bhavcopy download running, a Kite F&O
-run busy, or Kite sign-in needed."""
+Output: <folder>/equity_1min/plan/. Only tokens (not --rematch) and probe use the network (Kite only; the token
+from .env is never printed). Exit codes: 0 done; 1 an input not built or stale, tokens not run yet (or no saved list
+for --rematch), some probes failed or the probe stopped, show found nothing; 2 bad arguments, a lock busy, an input
+build or bhavcopy download running, a Kite F&O run busy, or Kite sign-in needed."""
 import argparse
 import os
 import sys
@@ -84,7 +85,9 @@ def show(key, folder):
 def main(argv=None):
     p = argparse.ArgumentParser(description="Kite 1-minute / EOD plan: tokens, availability probe, gap list.")
     sub = p.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("tokens", help="download Kite's NSE instrument list and match every ACTIVE stock")
+    tk = sub.add_parser("tokens", help="download Kite's NSE instrument list and match every ACTIVE stock")
+    tk.add_argument("--rematch", action="store_true",
+                    help="match again from the newest saved instrument list, offline (no Kite request)")
     pr = sub.add_parser("probe", help="day candles and the first minute day of every matched stock, then gaps")
     pr.add_argument("--speed", type=speed, default=mp.SPEED, help="requests per second (default 2.5, at most 3)")
     pr.add_argument("--force", action="store_true", help="probe every matched stock again")
@@ -102,7 +105,7 @@ def main(argv=None):
     folder = args.folder or equity_data_dir()
     try:
         if args.cmd == "tokens":
-            result = mp.tokens(folder, include_etf=args.include_etf)
+            result = mp.tokens(folder, include_etf=args.include_etf, rematch=args.rematch)
             print(f"Written to {result['out']}")
             return 0
         if args.cmd == "probe":

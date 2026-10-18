@@ -28,16 +28,34 @@ These decide the rules below; they are also printed in every `build_report.txt` 
   O/H/L/C and volume are identical. In split / bonus-only periods prices are within 0.05 (Kite rounds adjusted
   prices to 0.01 - 0.05).
 - HDFC (merged 2023), MINDTREE and LTIM are not in the list.
+- **Series switches** (real run, 2026-10-18): 8 ACTIVE stocks whose bhavcopy series is BE while Kite lists only the
+  plain symbol (MTARTECH, HEXAGON, AMANTA, TRANSWORLD, PPAP, UMAEXPORTS, SMARTLINK), or EQ while Kite lists only
+  `-BE` (GUJRAFFIA): one instrument per stock, so they are matched (`SERIES_SWITCH`) and price checked.
+- **INFIBEAM -> CCAVENUE** (S001680, ISIN INE483S01020; INFIBEAM 2016-04-04..2026-02-02, CCAVENUE 2026-02-03..
+  2026-10-12, one BL row 2026-03-23): Kite's list has only `CCAVENUE` (token 4159745, exchange_token 16249, name
+  AVENUESAI, tick 0.01), no INFIBEAM and no -BE / -BZ row; its day requests for 2016-04-04..2026-10-12 returned no
+  candles (`NO_KITE_DATA`). The bhavcopy has no row for that ISIN, nor any AVENUE* / CCAV* / INFIB* symbol, on
+  2026-10-13..16, and the master has no AVENUESAI.
+- **Kite's conversion** (real run, every probed stock vs the bhavcopy): raw = M x (Kite + B). M is Kite's own
+  multiplier (our factor, times small dividend multipliers: GNFC 1.073, OFSS 1.062, BANKBARODA 1.068, HINDPETRO
+  1.618 where our factor is 1.5), B an additive amount (OFSS about 225, GNFC 43, HINDPETRO 19.5, VEDL 10.6,
+  TATASTEEL 3.6); both stay the same for years and step at an action. B = 0 for most stocks (purely
+  multiplicative). Kite rounds adjusted prices to 0.05, and some stocks to 0.5, 1 or 5 (TATAINVEST, GODFRYPHLP,
+  MCX, BAJFINANCE, ABBOTINDIA), not tied to the factor. Volume uses yet another Kite factor (SKFINDIA x2.13 where
+  the price ratio is 2.185, VEDL x1.91 vs 2.62), steady between actions.
 
 ## Decisions (user, 2026-10-18)
 - The price check uses the probe's day candle, not `last_price`.
-- The EOD check writes `kite_adjustment.csv` (periods where Kite's factor differs from ours, with kind),
-  `eod_mismatch.csv` (real data differences only) and `kite_vs_bhav.parquet` (every compared day).
+- The EOD check writes `kite_adjustment.csv` (additive periods), `eod_mismatch.csv` (real data differences only)
+  and `kite_vs_bhav.parquet` (every compared day, with its kind). Every tolerance allows half of Kite's rounding unit
+  per Kite price on top of the percentage; each day converts with its own ratio, so only additive periods need
+  finding, and a period splits only on a lasting step (user, 2026-10-18, second round).
+- `SERIES_SWITCH`: the only candidate is the same symbol in another series -> matched, the price check decides.
 - Market-wide missing sessions and the January 2015 minute gap are one gap row each, not one per stock.
 - The later minute store keeps Kite's candles unchanged plus, per security-day, the ratio and differences from
-  `kite_vs_bhav.parquet` and the period kind from `kite_adjustment.csv`: raw = Kite x ratio in multiplicative
-  periods, raw = our_factor x (Kite + adj_difference) in additive ones, raw = Kite x our_factor outside a period.
-  Built in the download task.
+  `kite_vs_bhav.parquet` and the day's `kind`: raw = Kite x ratio on MULTIPLICATIVE days, raw = kite_multiplier x
+  (Kite + kite_difference) on ADDITIVE days (the same as our_factor x (Kite + adj_difference) when Kite's multiplier
+  is ours). Built in the download task.
 - DORMANT securities are not matched (only ACTIVE ones can have a token); their gap row says `DORMANT`.
 
 ## Part 1: universe and inputs (`Inputs`)
@@ -56,10 +74,16 @@ These decide the rules below; they are also printed in every `build_report.txt` 
 - Saved as received: `plan\kite_instruments_NSE_<IST date>.csv`.
 - Rows of segment NSE are grouped by base symbol (`series_suffix()`: a 2-character suffix is a series; only BE / BZ
   are kept). For each ACTIVE security the expected name is the symbol (EQ) or `SYMBOL-BE` / `SYMBOL-BZ`. One
-  candidate with that name -> `MATCHED_UNCHECKED`; none -> `NO_TOKEN`; two candidates, or only another series'
-  name -> `REVIEW` with the candidates in `note`. Never guessed. EXITED and DORMANT securities get no row.
-- `kite_tokens.csv` (`TOKEN_COLUMNS`), `tokens_info.json` (list date, latest bhavcopy day, weekdays between; a
-  rename in between shows up as NO_TOKEN).
+  candidate with that name -> `MATCHED_UNCHECKED`, `match_rule` `EXACT`; one candidate with the same symbol in
+  another series -> `MATCHED_UNCHECKED`, `match_rule` `SERIES_SWITCH` (note "SERIES_SWITCH: bhavcopy series BE, Kite
+  lists X (token)"; the probe's price check decides MATCHED / PRICE_MISMATCH); none -> `NO_TOKEN`; two or more ->
+  `REVIEW` with the candidates in `note`. Never guessed. EXITED and DORMANT securities get no row.
+- `kite_tokens.csv` (`TOKEN_COLUMNS`), `tokens_info.json` (list date, latest bhavcopy day, weekdays between, counts
+  per match status and rule; a rename in between shows up as NO_TOKEN). A `kite_tokens.csv` from before
+  `match_rule` existed reads as EXACT for its matches.
+- `tokens --rematch`: matches again from the newest saved `kite_instruments_NSE_<date>.csv`, offline (`NotBuilt`,
+  exit 1, without one). The tokens keep their list date, so a plain `probe` afterwards probes only the new matches
+  (the others have a DONE row with the same token).
 
 ## Part 3: `probe` (Kite day and minute candles)
 - Refuses: the inputs (Part 1); no `kite_tokens.csv` (`NotBuilt`, exit 1); a Kite F&O run: `held()` on every
@@ -93,16 +117,26 @@ Every file is rebuilt in full and written atomically under `<folder>\equity_1min
 - **kite_vs_bhav.parquet:** every Kite day of the usable securities joined with that day's bhavcopy row:
   `kite_open..kite_volume, bhav_open..bhav_volume, our_factor` (`factor_on`, vectorised in `with_factor`),
   `ratio` = bhav close / Kite close, `difference` = bhav close - Kite close, `adj_difference` = bhav close /
-  our_factor - Kite close.
-- **kite_adjustment.csv:** runs of days where ratio / our_factor is off 1 by more than `ADJ_TOL` (0.5%), split
-  where Kite's factor and adj_difference both step by more than `STEP_TOL` (0.3% of the price). Kind per period:
-  `MULTIPLICATIVE` when ratio / our_factor varies by at most 0.3% and O/H/L agree with the day's ratio on at least
-  90% of the days; `ADDITIVE` when adj_difference varies by at most max(0.02, 0.3% of the price) and O/H/L agree with
-  it; both -> the better agreement; else `MIXED`. Agreement tolerance: max(`PRICE_ABS` 0.011 on Kite's scale,
-  `PRICE_REL` 0.05%).
-- **eod_mismatch.csv:** a day's O/H/L that do not convert like its close (multiplicatively outside a period and in
-  MULTIPLICATIVE ones, additively in ADDITIVE ones, either way in MIXED ones) beyond that tolerance, and a volume off
-  both raw x our_factor and raw x ratio by more than 1%. Information only.
+  our_factor - Kite close, `kite_multiplier` (M, below), `kite_difference` = bhav close / M - Kite close, `kind`
+  (MULTIPLICATIVE / ADDITIVE).
+- **Rounding unit** (`half_units`): 0.05, or the largest of `UNITS` (0.1 .. 10) all four Kite prices sit on for
+  `UNIT_SHARE` (80%) of the stock's days in a year with one of our factors and on the day itself. Each Kite price
+  in a comparison adds half a unit (`HALF_TICK` 0.025 for 0.05) to the 0.05% (`PRICE_REL`).
+- **Kite's multiplier M** (`kite_multiplier`): bhav high-low / Kite high-low on days whose Kite range is at least 2%
+  of the close and 20 units, the median of the 63 measured days around each day within one of our factors (follows a
+  step at an action), our factor where nothing was measured.
+- **Fits per O/H/L field:** multiplicative |Kite - bhav / ratio| <= 0.05% Kite + half unit x (1 + Kite / Kite close);
+  additive |Kite - (bhav / M - kite_difference)| <= 0.05% Kite + 2 half units. An additive day fits additively but
+  not its own ratio.
+- **kite_adjustment.csv (ADDITIVE periods only),** per security and our factor: a period starts at an additive day
+  and ends after `STEP_DAYS` (3) days that do not fit additively (days fitting both, flat candles, are neutral). It
+  splits only on a lasting step: kite_difference moves by more than 0.3% of the close + 2 half units and the next 3
+  days are additive at a level of their own; a shorter move is a blip and stays inside. Fewer than `ADD_MIN_DAYS` (3)
+  additive days -> dropped. Columns: from / to, days, additive_days, kite_vs_ours, median_ratio, kite_multiplier,
+  median_kite_difference, median_adj_difference, our_factor, kind.
+- **eod_mismatch.csv:** a field that does not fit that day's own conversion (ratio, or additive inside a period), and
+  a volume off raw x our_factor, raw x ratio and raw x Kite's volume factor (median of Kite volume / raw volume over
+  the 11 days around it, `VOLUME_WINDOW`) by more than 1% + 1 share. Information only.
 - **plan.csv** (`PLAN_COLUMNS`): symbols and ISINs with date ranges, status, exit reason, match status (after the
   price check), token, need range, `eod_first_day`, `eod_missing_days` (sessions excluded), `eod_mismatch_days`,
   `minute_first_day`, `download_eod` / `download_minute` (Y when usable with candles), `eod_requests` (2,000-day
@@ -126,13 +160,15 @@ Every file is rebuilt in full and written atomically under `<folder>\equity_1min
     from the bhavcopy rows in the gap. `priority`: 1 in NIFTY 50 during the gap, 2 in NIFTY 500, else 3.
 - **index_coverage.csv:** per covered index and trading day: members, members with Kite EOD (inside the Kite range
   and not missing), with 1-minute (also from the first minute day), and the symbols without each.
-- **build_report.txt / build_info.json:** counts per status, match status, reason, data_missing and priority; the
-  Part 0 block; sessions; adjustment periods per kind; mismatches per field; coverage runs (all for NIFTY 50, 5 per
+- **build_report.txt / build_info.json:** counts per status, match status, match rule, reason, data_missing and
+  priority; the Part 0 block; sessions; days where Kite's factor differs from ours by more than 0.5% (information);
+  additive periods; mismatch rows, security-days, per field, and the top 10 securities by mismatch days;
+  coverage runs (all for NIFTY 50, 5 per
   other index); the later download's requests, hours at 2.5 requests/s, rows and disk (15 bytes per minute row in
   parquet, 45 in CSV: assumptions); the top 20 gaps of priority 1 and 2.
 
 ## CLI
-`tokens | probe [--speed 2.5] [--force] [--price-tol 0.02] | gaps | show SYMBOL|ISIN`, each with `--folder`
+`tokens [--rematch] | probe [--speed 2.5] [--force] [--price-tol 0.02] | gaps | show SYMBOL|ISIN`, each with `--folder`
 (absolute) and `--include-etf`. Exit codes: 0 done; 1 not built / stale / tokens not run / some probes failed or the
 probe stopped / show found nothing; 2 argparse, a lock busy, an input build or bhavcopy download running, a Kite
 F&O run, Kite sign-in needed.
@@ -141,8 +177,12 @@ F&O run, Kite sign-in needed.
 `tests/test_equity_minute_plan.py`: a synthetic store from 2015-01-01 (80 weekdays, an N1 filler row every day),
 `sm.build`, `adj.build` (a corporate-actions CSV confirms one split), `ex.build` (reference lists with the real
 headers, one merger), index membership files with the real columns, and a `FakeKite` whose candles follow each
-stock's raw prices: our factor, a multiplicative step, two additive periods, a mixed period, a volume error, a late
-start, missing days, no minute data, a price mismatch, a failing token, a session missing for everyone. Covers the
-universe, matching, the price check, probe (first days, binary search, resume after a stop, token error, `--force`,
+stock's raw prices: our factor, a multiplicative step, two additive periods (with a blip), bad O/H/L days, a volume
+error, a late start, missing days, no minute data, a price mismatch, three series switches (one 10% off), a failing
+token, a session missing for everyone. Hand-built frames test the EOD check: a rounded low-price stock, a coarse
+Kite unit, a small dividend step, an additive period with a blip and a lasting step, Kite's own multiplier, a too
+short additive run, real O/H/L and volume errors and whole-share rounding. Covers the universe, matching
+(`SERIES_SWITCH`, `--rematch` offline, probing only the new match), the price check, probe (first days, binary
+search, resume after a stop, token error, `--force`,
 token change, the F&O lock, its own lock), the outputs, sessions, every gap reason, spans, priority and sort, index
 coverage, the report, `gaps` offline, inputs byte for byte unchanged, every refusal and the CLI codes.

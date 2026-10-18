@@ -4,6 +4,7 @@ real columns, and a fake KiteConnect (instruments, historical_data). No network;
 (config.load_env stubbed); every input is only read."""
 import hashlib
 import json
+import math
 import os
 import shutil
 import sqlite3
@@ -51,7 +52,8 @@ def r(a, b):
     return list(range(a, b))
 
 
-# symbol: isin, trading days, price level, token (None: not in Kite), Kite behaviour, minute start (day index)
+# symbol: isin, trading days, price level, token (None: not in Kite), Kite behaviour, minute start (day index),
+# kite_ts: Kite's tradingsymbol when not the symbol
 STOCKS = {
     "RELI": dict(isin="INE002A01018", idx=r(0, N), level=lambda i: 1000 + i, token=101, minute=FEB2, tv=2.0),
     "SPLITCO": dict(isin="INE070A01011", idx=r(0, N), level=lambda i: 5 * (100 + i) if i < SPLIT_DAY else 100 + i,
@@ -62,7 +64,7 @@ STOCKS = {
     "EMPTYCO": dict(isin="INE074A01011", idx=r(0, N), level=lambda i: 80 + i, token=106, kite="vol30",
                     kite_missing={20, 21, 22}, minute=FEB2),
     "BECO": dict(isin="INE075A01011", idx=r(0, N), level=lambda i: 30.0, token=107, minute=FEB2,
-                 series=lambda i: "BE" if i >= 60 else "EQ"),
+                 series=lambda i: "BE" if i >= 60 else "EQ", kite_ts="BECO-BE"),
     "NOMIN": dict(isin="INE076A01011", idx=r(0, N), level=lambda i: 60.0, token=108, minute=None),
     "PRICEX": dict(isin="INE077A01011", idx=r(0, N), level=lambda i: 70.0, token=109, kite="x1.1", minute=FEB2),
     "NEWNM": dict(isin="INE078A01011", idx=r(0, N), level=lambda i: 90.0, token=110, minute=FEB2,
@@ -73,13 +75,18 @@ STOCKS = {
     "FAILCO": dict(isin="INE084A01011", idx=r(0, N), level=lambda i: 43.0, token=199, minute=FEB2),
     "NOTOK": dict(isin="INE085A01011", idx=r(0, N), level=lambda i: 44.0, token=None),
     "TWIN": dict(isin="INE086A01011", idx=r(0, N), level=lambda i: 45.0, token=None),
-    "OTHERSER": dict(isin="INE087A01011", idx=r(0, N), level=lambda i: 46.0, token=None),
+    "OTHERSER": dict(isin="INE087A01011", idx=r(0, N), level=lambda i: 46.0, token=122, minute=FEB2,
+                     kite_ts="OTHERSER-BE"),                          # series switch: bhavcopy EQ, Kite -BE
+    "SWBE": dict(isin="INE092A01011", idx=r(0, N), level=lambda i: 48.0, token=114, minute=FEB2,
+                 series=lambda i: "BE"),                              # series switch: bhavcopy BE, Kite plain
+    "SWPX": dict(isin="INE093A01011", idx=r(0, N), level=lambda i: 49.0, token=115, minute=FEB2, kite="x1.1",
+                 kite_ts="SWPX-BE"),                                  # series switch, price 10% off
     "GONE": dict(isin="INE088A01011", idx=r(0, 11), level=lambda i: 200.0, token=None, tv=50.0),
     "DORMCO": dict(isin="INE089A01011", idx=r(0, 51), level=lambda i: 47.0, token=None),
     "ETFX": dict(isin="INF090A01011", idx=r(0, N), level=lambda i: 10.0, token=130, minute=FEB2),
     "ABC-RE": dict(isin="INE091A01011", idx=r(5, 20), level=lambda i: 1.0, token=None),
 }
-EXTRA_INSTRUMENTS = [("TWIN", 120), ("TWIN-BE", 121), ("OTHERSER-BE", 122), ("GONE", 123), ("ABC-RE", 124),
+EXTRA_INSTRUMENTS = [("TWIN", 120), ("TWIN-BE", 121), ("GONE", 123), ("ABC-RE", 124),
                      ("RELI-N1", 125)]
 HEADERS = {   # the real headers of the reference lists (nse_reference.py, 2026-10-17)
     "mergers.csv": ["circular_no", "circular_date", "department", "old_symbol", "old_company", "scheme_type",
@@ -143,7 +150,8 @@ def kite_row(sym, i):
     if kind == "split" and i < 30:
         k = {x: v / 1.02 for x, v in k.items()}                 # a demerger-like multiplicative step
     if kind == "add":
-        c = 4.6 if i < 20 else 2.0 if i < 40 else 0.0          # two additive periods, then none
+        c = (4.3 if i == 10 else 4.6) if i < 20 else 2.0 if i < 40 else 0.0   # two additive periods (a blip on day
+        #                                                                       10), then none
         k = {x: v - c for x, v in k.items()}
     if kind == "mix" and i < 10:
         k = {x: b[x] / (1.03 if x == "close" else 1.05) for x in k}
@@ -171,8 +179,7 @@ class FakeKite:
         out = []
         for sym, s in STOCKS.items():
             if s["token"]:
-                ts = f"{sym}-BE" if sym == "BECO" else sym
-                out.append(self.inst(ts, s["token"]))
+                out.append(self.inst(s.get("kite_ts", sym), s["token"]))
         out += [self.inst(ts, tok) for ts, tok in EXTRA_INSTRUMENTS]
         out.append({**self.inst("NIFTY 50", 256265), "segment": "INDICES"})
         return out
@@ -350,11 +357,12 @@ def test_tokens_matching(world):
     assert t.loc["RELI", "match_status"] == "MATCHED_UNCHECKED" and t.loc["RELI", "instrument_token"] == "101"
     assert t.loc["RELI", "kite_name"] == "RELI LIMITED" and t.loc["RELI", "bhav_close"] == "1079.0"
     assert t.loc["BECO", "kite_tradingsymbol"] == "BECO-BE" and t.loc["BECO", "series"] == "BE"
-    assert t.loc["BECO", "match_status"] == "MATCHED_UNCHECKED"
+    assert t.loc["BECO", "match_status"] == "MATCHED_UNCHECKED" and t.loc["BECO", "match_rule"] == "EXACT"
+    assert t.loc["RELI", "match_rule"] == "EXACT"
     assert t.loc["NEWNM", "kite_tradingsymbol"] == "NEWNM"
     assert t.loc["NOTOK", "match_status"] == "NO_TOKEN"
     assert t.loc["TWIN", "match_status"] == "REVIEW" and "2 candidates" in t.loc["TWIN", "note"]
-    assert t.loc["OTHERSER", "match_status"] == "REVIEW" and "only OTHERSER-BE" in t.loc["OTHERSER", "note"]
+    assert t.loc["TWIN", "match_rule"] == "" and t.loc["NOTOK", "match_rule"] == ""
     assert "GONE" not in t.index and "DORMCO" not in t.index and "ETFX" not in t.index   # never matched
     assert kite.calls == [("instruments", "NSE")]
     saved = os.path.join(mp.plan_dir(world), "kite_instruments_NSE_2015-04-25.csv")
@@ -375,6 +383,77 @@ def test_match_tokens_unit():
     assert rows["S1"]["match_status"] == "MATCHED_UNCHECKED" and rows["S1"]["instrument_token"] == 1
     assert rows["S2"]["match_status"] == "MATCHED_UNCHECKED" and rows["S2"]["instrument_token"] == 2
     assert rows["S3"]["match_status"] == "NO_TOKEN"      # a bond series and an index never match
+
+
+def test_series_switch_rule_unit():
+    u = [{"security_id": f"S{i}", "isin": f"I{i}", "symbol": sym, "series": series, "last_close": 5.0,
+          "status": "ACTIVE"} for i, (sym, series) in
+         enumerate([("EQBE", "EQ"), ("BEEQ", "BE"), ("BZBE", "BZ"), ("TWO", "EQ"), ("EXACT", "BE")])]
+    inst = [FakeKite.inst("EQBE-BE", 1), FakeKite.inst("BEEQ", 2), FakeKite.inst("BZBE-BE", 3),
+            FakeKite.inst("TWO", 4), FakeKite.inst("TWO-BZ", 5), FakeKite.inst("EXACT-BE", 6)]
+    rows = {x["symbol"]: x for x in mp.match_tokens(u, inst)}
+    for sym, token in (("EQBE", 1), ("BEEQ", 2), ("BZBE", 3)):     # only candidate, the same symbol in another series
+        assert rows[sym]["match_status"] == "MATCHED_UNCHECKED" and rows[sym]["match_rule"] == "SERIES_SWITCH"
+        assert rows[sym]["instrument_token"] == token and rows[sym]["note"].startswith("SERIES_SWITCH: bhavcopy series")
+    assert rows["EXACT"]["match_rule"] == "EXACT" and rows["EXACT"]["instrument_token"] == 6
+    assert rows["TWO"]["match_status"] == "REVIEW" and rows["TWO"]["match_rule"] == ""      # two: never guessed
+
+
+def test_series_switch_probed_and_price_checked(done):
+    f, _, _ = done
+    t = read(f, "kite_tokens.csv").set_index("symbol")
+    assert t.loc["OTHERSER", "kite_tradingsymbol"] == "OTHERSER-BE"
+    assert t.loc["OTHERSER", "match_rule"] == "SERIES_SWITCH"
+    assert t.loc["SWBE", "kite_tradingsymbol"] == "SWBE" and t.loc["SWBE", "series"] == "BE"
+    assert "bhavcopy series EQ, Kite lists OTHERSER-BE (122)" in t.loc["OTHERSER", "note"]
+    plan = read(f, "plan.csv").set_index("security_id")
+    assert plan.loc[sid_of(f, "OTHERSER"), "match_status"] == "MATCHED"
+    sw, px = plan.loc[sid_of(f, "SWBE")], plan.loc[sid_of(f, "SWPX")]
+    assert sw["match_status"] == "MATCHED" and sw["download_eod"] == "Y"
+    assert px["match_status"] == "PRICE_MISMATCH"                                   # 10% off: the price check decides
+    assert px["match_rule"] == "SERIES_SWITCH" and plan.loc[sid_of(f, "RELI"), "match_rule"] == "EXACT"
+
+
+def test_tokens_rematch_is_offline(world, monkeypatch):
+    with pytest.raises(mp.NotBuilt, match="instrument list"):
+        mp.tokens(world, rematch=True, log=lambda *a, **k: None)
+    mp.tokens(world, kite=FakeKite(), now=NOW, log=lambda *a, **k: None)
+    path = os.path.join(mp.plan_dir(world), "kite_tokens.csv")
+    before = read(world, "kite_tokens.csv")
+    t = before.copy()
+    t.loc[t["symbol"] == "OTHERSER", ["kite_tradingsymbol", "instrument_token", "match_status", "match_rule"]] = \
+        ["", "", "REVIEW", ""]                                    # as the old rule left it
+    t.to_csv(path, index=False)
+
+    def no_kite():
+        raise AssertionError("rematch asked Kite")
+    monkeypatch.setattr(mp, "kite_client", no_kite)
+    res = mp.tokens(world, rematch=True, now=NOW + timedelta(days=3), log=lambda *a, **k: None)
+    after = read(world, "kite_tokens.csv")
+    pd.testing.assert_frame_equal(after, before)
+    assert res["info"]["rematch"] and res["info"]["instruments_date"] == "2015-04-25"
+    assert res["info"]["match_rule"] == {"EXACT": 14, "SERIES_SWITCH": 3}
+    assert "rematched offline" in res["report"]
+    names = [n for n in os.listdir(mp.plan_dir(world)) if n.startswith("kite_instruments_NSE_")]
+    assert names == ["kite_instruments_NSE_2015-04-25.csv"]       # no new list saved
+
+
+def test_probe_after_rematch_probes_only_the_new_match(world):
+    kite = FakeKite()
+    mp.tokens(world, kite=kite, now=NOW, log=lambda *a, **k: None)
+    path = os.path.join(mp.plan_dir(world), "kite_tokens.csv")
+    t = pd.read_csv(path, dtype=str, keep_default_na=False)
+    t = t.drop(columns="match_rule")                              # a file from before the rule: read as EXACT
+    t.loc[t["symbol"] == "OTHERSER", ["kite_tradingsymbol", "instrument_token", "match_status"]] = ["", "", "REVIEW"]
+    t.to_csv(path, index=False)
+    first = mp.probe(world, kite=FakeKite(), speed=FAST, log=lambda *a, **k: None)
+    assert first["stats"]["probed"] == 15
+    assert read(world, "plan.csv").set_index("security_id").loc[sid_of(world, "RELI"), "match_rule"] == "EXACT"
+    mp.tokens(world, rematch=True, log=lambda *a, **k: None)
+    kite = FakeKite()
+    res = mp.probe(world, kite=kite, speed=FAST, log=lambda *a, **k: None)
+    assert res["stats"]["probed"] == 1 and res["stats"]["skipped"] == 15 and res["stats"]["failed"] == 1
+    assert {c[0] for c in kite.calls} == {122, 199}               # OTHERSER, and FAILCO again
 
 
 def test_tokens_with_etf(world):
@@ -439,7 +518,7 @@ def test_probe_failure_is_recorded_and_others_go_on(done):
     p = probes(f)
     fail = p[sid_of(f, "FAILCO")]
     assert fail["status"] == "FAILED" and "something broke" in fail["error"]
-    assert result["stats"]["failed"] == 1 and result["stats"]["probed"] == 13
+    assert result["stats"]["failed"] == 1 and result["stats"]["probed"] == 16
     plan = read(f, "plan.csv").set_index("security_id")
     assert "something broke" in plan.loc[sid_of(f, "FAILCO"), "note"]
     assert result["info"]["probe_failed"] == 1
@@ -451,7 +530,7 @@ def test_probe_resume_after_stop(world):
     assert first["stats"]["stopped"] and first["stats"]["probed"] == 2
     kite = FakeKite()
     second = mp.probe(world, kite=kite, speed=FAST, log=lambda *a, **k: None)
-    assert second["stats"]["skipped"] == 2 and second["stats"]["probed"] == 11
+    assert second["stats"]["skipped"] == 2 and second["stats"]["probed"] == 14
     asked = {c[0] for c in kite.calls}
     assert 101 not in asked and 102 not in asked
 
@@ -472,7 +551,7 @@ def test_probe_force_and_token_change(world):
     res = mp.probe(world, kite=kite, speed=FAST, log=lambda *a, **k: None)
     assert res["stats"]["probed"] == 0 and {c[0] for c in kite.calls} == {199}   # only the failed one again
     res = mp.probe(world, kite=FakeKite(), speed=FAST, force=True, log=lambda *a, **k: None)
-    assert res["stats"]["probed"] == 13 and res["stats"]["skipped"] == 0
+    assert res["stats"]["probed"] == 16 and res["stats"]["skipped"] == 0
     path = os.path.join(mp.plan_dir(world), "kite_tokens.csv")
     t = pd.read_csv(path, dtype=str, keep_default_na=False)
     t.loc[t["symbol"] == "RELI", "instrument_token"] = "5101"
@@ -535,31 +614,30 @@ def test_kite_vs_bhav_columns_and_values(done):
     f, _, _ = done
     kvb = pd.read_parquet(os.path.join(mp.plan_dir(f), "kite_vs_bhav.parquet"))
     assert list(kvb.columns) == ["security_id", "date"] + [f"kite_{x}" for x in mp.FIELDS] + \
-        [f"bhav_{x}" for x in mp.FIELDS] + ["our_factor", "ratio", "difference", "adj_difference"]
+        [f"bhav_{x}" for x in mp.FIELDS] + ["our_factor", "ratio", "difference", "adj_difference", "kite_multiplier",
+                                            "kite_difference", "kind"]
     sp = kvb[(kvb["security_id"] == sid_of(f, "SPLITCO")) & (kvb["date"] == DAYS[40])].iloc[0]
     assert sp.our_factor == 5.0 and sp.ratio == pytest.approx(5.0, rel=1e-3)
     assert sp.difference == pytest.approx(sp.bhav_close - sp.kite_close)
     ad = kvb[(kvb["security_id"] == sid_of(f, "ADDCO")) & (kvb["date"] == DAYS[5])].iloc[0]
     assert ad.adj_difference == pytest.approx(4.6)
+    assert ad.kite_multiplier == pytest.approx(1.0) and ad.kite_difference == pytest.approx(4.6)
+    assert ad.kind == "ADDITIVE"
+    assert sp.kind == "MULTIPLICATIVE"
     assert sid_of(f, "PRICEX") not in set(kvb["security_id"])   # a price mismatch is not compared
 
 
 def test_adjustment_periods_and_kinds(done):
     f, _, _ = done
     a = read(f, "kite_adjustment.csv")
-    assert list(a.columns) == mp.ADJUSTMENT_COLUMNS
-    sp = a[a["security_id"] == sid_of(f, "SPLITCO")]
-    assert len(sp) == 1 and sp.iloc[0]["kind"] == "MULTIPLICATIVE"
-    assert (sp.iloc[0]["from_date"], sp.iloc[0]["to_date"]) == (str(DAYS[0]), str(DAYS[29]))
-    assert float(sp.iloc[0]["kite_vs_ours"]) == pytest.approx(1.02, abs=1e-3) and sp.iloc[0]["our_factor"] == "5"
+    assert list(a.columns) == mp.ADJUSTMENT_COLUMNS and set(a["kind"]) == {"ADDITIVE"}
+    assert sid_of(f, "SPLITCO") not in set(a["security_id"])     # a 2% multiplicative step: the day's ratio converts
     ad = a[a["security_id"] == sid_of(f, "ADDCO")].reset_index(drop=True)
-    assert list(ad["kind"]) == ["ADDITIVE", "ADDITIVE"]                     # split at the step
     assert [(x.from_date, x.to_date) for x in ad.itertuples()] == [(str(DAYS[0]), str(DAYS[19])),
-                                                                    (str(DAYS[20]), str(DAYS[39]))]
-    assert [float(x) for x in ad["median_adj_difference"]] == pytest.approx([4.6, 2.0])
-    mx = a[a["security_id"] == sid_of(f, "MIXCO")]
-    assert len(mx) == 1 and mx.iloc[0]["kind"] == "MIXED"
-    assert sid_of(f, "RELI") not in set(a["security_id"])
+                                                                    (str(DAYS[20]), str(DAYS[39]))]   # lasting step
+    assert [float(x) for x in ad["median_kite_difference"]] == pytest.approx([4.6, 2.0])
+    assert [float(x) for x in ad["kite_multiplier"]] == pytest.approx([1.0, 1.0])
+    assert sid_of(f, "MIXCO") not in set(a["security_id"]) and sid_of(f, "RELI") not in set(a["security_id"])
 
 
 def test_eod_mismatch(done):
@@ -567,25 +645,115 @@ def test_eod_mismatch(done):
     m = read(f, "eod_mismatch.csv")
     assert list(m.columns) == mp.MISMATCH_COLUMNS
     mix = m[m["security_id"] == sid_of(f, "MIXCO")]
-    assert len(mix) == 30 and set(mix["field"]) == {"open", "high", "low"} and set(mix["kind"]) == {"MIXED"}
+    assert len(mix) == 30 and set(mix["field"]) == {"open", "high", "low"} and set(mix["kind"]) == {"MULTIPLICATIVE"}
     vol = m[m["field"] == "volume"]
     assert len(vol) == 1 and vol.iloc[0]["security_id"] == sid_of(f, "EMPTYCO") and vol.iloc[0]["date"] == str(DAYS[30])
-    assert set(m["security_id"]) == {sid_of(f, "MIXCO"), sid_of(f, "EMPTYCO")}   # the other periods convert cleanly
+    assert set(m["security_id"]) == {sid_of(f, "MIXCO"), sid_of(f, "EMPTYCO")}   # the others convert cleanly
     plan = read(f, "plan.csv").set_index("security_id")
     assert plan.loc[sid_of(f, "MIXCO"), "eod_mismatch_days"] == "10"
     assert plan.loc[sid_of(f, "RELI"), "eod_mismatch_days"] == "0"
 
 
-def test_period_kind_unit():
-    days = 10
-    base = pd.DataFrame({"kite_close": [100.0 + i for i in range(days)], "our_factor": 1.0})
-    for x in ("open", "high", "low"):
-        base[f"bhav_{x}"] = base["kite_close"] * {"open": 0.99, "high": 1.1, "low": 0.9}[x] * 1.02
-        base[f"kite_{x}"] = base["kite_close"] * {"open": 0.99, "high": 1.1, "low": 0.9}[x]
-    base["ratio"] = 1.02
-    base["adj_difference"] = base["kite_close"] * 0.02
-    mult, add = mp.agreement(base)
-    assert mp.period_kind(base, mult, add)[0] == "MULTIPLICATIVE"
+# hand-built kite_vs_bhav frames for the EOD check
+
+UNIT_DAYS = weekdays(date(2016, 1, 4), 80)
+UNIT_INP = type("Inp", (), {"by_id": {"S1": {"symbol": "X"}}})()
+
+
+def tick(v, unit=0.05):
+    return round(round(v / unit) * unit, 2)
+
+
+def candle(c, wide=0.05):
+    """A raw candle around close c, on the 0.05 tick."""
+    return [tick(c * 0.99), tick(c * (1 + wide)), tick(c * (1 - wide)), tick(c)]
+
+
+def frame(raw, kite, factor=1.0, bvol=None, kvol=None):
+    n = len(raw)
+    d = pd.DataFrame({"security_id": "S1", "date": UNIT_DAYS[:n], "symbol": "X", "our_factor": float(factor)})
+    for j, x in enumerate(("open", "high", "low", "close")):
+        d[f"bhav_{x}"] = [c[j] for c in raw]
+        d[f"kite_{x}"] = [c[j] for c in kite]
+    d["bhav_volume"] = bvol if bvol is not None else 1000
+    d["kite_volume"] = kvol if kvol is not None else d["bhav_volume"] * factor
+    d["ratio"] = d["bhav_close"] / d["kite_close"]
+    d["difference"] = d["bhav_close"] - d["kite_close"]
+    d["adj_difference"] = d["bhav_close"] / d["our_factor"] - d["kite_close"]
+    d["kite_multiplier"] = mp.kite_multiplier(d)
+    d["kite_difference"] = d["bhav_close"] / d["kite_multiplier"] - d["kite_close"]
+    return d
+
+
+def level(i, base=100.0):
+    return base * (1 + 0.1 * math.sin(i / 7))
+
+
+def check(d):
+    return mp.adjustments_and_mismatches(d, UNIT_INP)
+
+
+def test_eod_check_rounded_low_price_stock():
+    raw = [candle(level(i, 10.0), wide=0.03) for i in range(60)]           # raw 9..11, our factor 10
+    kite = [[tick(v / 10) for v in c] for c in raw]                        # Kite about 1.00, rounded to 0.05
+    periods, mism, kvb = check(frame(raw, kite, factor=10))
+    assert periods.empty and mism.empty and set(kvb["kind"]) == {"MULTIPLICATIVE"}
+
+
+def test_eod_check_coarse_kite_unit():
+    raw = [candle(level(i, 600.0)) for i in range(60)]
+    kite = [[tick(v / 3, 1.0) for v in c] for c in raw]                    # Kite rounds this stock to whole rupees
+    periods, mism, _ = check(frame(raw, kite, factor=3))
+    assert periods.empty and mism.empty
+
+
+def test_eod_check_small_dividend_step():
+    raw = [candle(level(i, 200.0)) for i in range(60)]
+    kite = [[tick(v / 1.004) for v in c] if i < 20 else c for i, c in enumerate(raw)]
+    periods, mism, kvb = check(frame(raw, kite))
+    assert periods.empty and mism.empty
+    assert kvb["ratio"].iloc[0] == pytest.approx(1.004, abs=5e-4) and kvb["ratio"].iloc[-1] == pytest.approx(1.0)
+
+
+def test_eod_check_additive_period_blip_and_lasting_step():
+    raw = [candle(level(i)) for i in range(70)]
+    shift = [(3.6 if i == 10 else 4.6) if i < 25 else 2.0 if i < 50 else 0.0 for i in range(70)]
+    kite = [[tick(v - shift[i]) for v in c] for i, c in enumerate(raw)]
+    periods, mism, kvb = check(frame(raw, kite))
+    assert [(p.from_date, p.to_date) for p in periods.itertuples()] == \
+        [(str(UNIT_DAYS[0]), str(UNIT_DAYS[24])), (str(UNIT_DAYS[25]), str(UNIT_DAYS[49]))]   # day 10 is a blip
+    assert list(periods["median_kite_difference"]) == pytest.approx([4.6, 2.0], abs=0.03)
+    assert mism.empty
+    assert list(kvb["kind"][:50]) == ["ADDITIVE"] * 50 and set(kvb["kind"][50:]) == {"MULTIPLICATIVE"}
+
+
+def test_eod_check_additive_with_kites_own_multiplier():
+    raw = [candle(level(i, 300.0)) for i in range(60)]
+    kite = [[tick(v / 1.07 - 40) for v in c] for c in raw]                 # raw = 1.07 x (Kite + 40), our factor 1
+    periods, mism, kvb = check(frame(raw, kite))
+    assert len(periods) == 1 and periods.iloc[0]["days"] == 60
+    assert periods.iloc[0]["kite_multiplier"] == pytest.approx(1.07, abs=0.005)
+    assert periods.iloc[0]["median_kite_difference"] == pytest.approx(40, abs=1.0)
+    assert mism.empty
+
+
+def test_eod_check_short_additive_run_and_real_errors():
+    raw = [candle(level(i)) for i in range(60)]
+    kite = [list(c) for c in raw]
+    for i in (30, 31):                                                     # two additive-looking days: too short
+        kite[i] = [tick(v - 3) for v in raw[i]]
+    kite[40][1] = tick(raw[40][1] * 1.02)                                  # a real 2% high error
+    bvol = [7] * 60
+    kvol = [21] * 60
+    kvol[5] = 20                                                           # whole-share rounding: not a mismatch
+    kvol[45] = 42                                                          # a real volume error
+    periods, mism, kvb = check(frame(raw, kite, factor=3, bvol=bvol, kvol=kvol))
+    assert periods.empty and set(kvb["kind"]) == {"MULTIPLICATIVE"}
+    rows = {(r.date, r.field) for r in mism.itertuples()}
+    days = {d for d, _ in rows}
+    assert days == {str(UNIT_DAYS[30]), str(UNIT_DAYS[31]), str(UNIT_DAYS[40]), str(UNIT_DAYS[45])}
+    assert (str(UNIT_DAYS[40]), "high") in rows and (str(UNIT_DAYS[45]), "volume") in rows
+    assert (str(UNIT_DAYS[40]), "open") not in rows and (str(UNIT_DAYS[5]), "volume") not in rows
 
 
 # ---- sessions, plan and gaps ----
@@ -621,8 +789,9 @@ def test_gap_reasons_and_kinds(done):
     assert one("GONE") == [("BOTH", "MERGED", str(DAYS[0]), str(DAYS[10]))]
     assert one("DORMCO") == [("BOTH", "DORMANT", str(DAYS[0]), str(DAYS[50]))]
     assert one("NOTOK")[0][:2] == ("BOTH", "NO_KITE_TOKEN")
-    assert one("TWIN")[0][:2] == ("BOTH", "TOKEN_REVIEW") and one("OTHERSER")[0][:2] == ("BOTH", "TOKEN_REVIEW")
-    assert one("PRICEX")[0][:2] == ("BOTH", "PRICE_MISMATCH")
+    assert one("TWIN")[0][:2] == ("BOTH", "TOKEN_REVIEW")
+    assert one("OTHERSER") == [] and one("SWBE") == []                     # series switches: matched, no gap
+    assert one("PRICEX")[0][:2] == ("BOTH", "PRICE_MISMATCH") and one("SWPX")[0][:2] == ("BOTH", "PRICE_MISMATCH")
     assert one("LATECO") == [("BOTH", "EOD_STARTS_LATER", str(DAYS[40]), str(DAYS[45])),
                              ("1MIN", "MINUTE_STARTS_LATER", str(DAYS[46]), str(DAYS[59]))]
     assert one("EMPTYCO") == [("BOTH", "EOD_EMPTY_DAYS", str(DAYS[20]), str(DAYS[22]))]
@@ -710,9 +879,13 @@ def test_report_and_build_info(done):
     assert f"Market-wide missing sessions: {DAYS[SESSION]}" in text
     assert "Top 20 gaps of priority 1" in text and "can only be found by downloading" in text
     assert info["reason"]["MERGED"] == 1 and info["data_missing"]["1MIN"] == 3
-    assert info["match_status"]["PRICE_MISMATCH"] == 1 and info["adjustment_periods"] == \
-        {"ADDITIVE": 2, "MIXED": 1, "MULTIPLICATIVE": 1}
+    assert info["match_status"]["PRICE_MISMATCH"] == 2 and info["adjustment_periods"] == {"ADDITIVE": 2}
+    assert info["match_rule"] == {"EXACT": 14, "SERIES_SWITCH": 3}
     assert info["eod_mismatch_rows"] == 31 and info["eod_requests"] > 0 and info["minute_requests"] > 0
+    assert info["eod_mismatch_days"] == 11 and info["top_mismatch"][0]["symbol"] == "MIXCO"
+    assert info["top_mismatch"][0]["days"] == 10 and info["factor_differs_days"] > 0
+    assert "Top 10 securities by mismatch days:" in text and "  MIXCO (" in text and "Additive periods" in text
+    assert "Match rule:" in text and "SERIES_SWITCH: 3" in text
     assert info["instruments_date"] == "2015-04-25" and info["est_disk_gb"]["parquet"] >= 0
     assert info["priority"]["1"] >= 3
 
@@ -804,6 +977,13 @@ def test_cli_flow_and_codes(world, monkeypatch, capsys):
     assert cli.main(["show", "NOSUCH", "--folder", world]) == 1
     monkeypatch.setattr(mp, "kite_client", lambda: FakeKite(fail=()))
     assert cli.main(["probe", "--folder", world]) == 0
+    monkeypatch.setattr(mp, "kite_client", lambda: 1 / 0)
+    assert cli.main(["tokens", "--rematch", "--folder", world]) == 0   # offline
+
+
+def test_cli_rematch_without_a_saved_list(world, capsys):
+    assert cli.main(["tokens", "--rematch", "--folder", world]) == 1
+    assert "instrument list" in capsys.readouterr().err
 
 
 def test_cli_sign_in_needed_and_arguments(world, capsys):

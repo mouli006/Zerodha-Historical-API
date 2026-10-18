@@ -620,12 +620,13 @@ python index_membership.py check                      # known cases (RELIANCE, H
 
 ```
 python equity_minute.py tokens                 # Kite instrument list (one request) -> kite_tokens.csv
+python equity_minute.py tokens --rematch       # match again from the saved list, offline
 python equity_minute.py probe                  # day candles + first minute day per stock (about an hour; --speed 2.5, resumable, --force)
 python equity_minute.py gaps                   # rebuild the outputs offline
 python equity_minute.py show RELIANCE
 ```
 
-- **Files** in `<data folder>/equity_1min/plan/`: `kite_gaps.csv` (the shopping list: 1MIN, EOD or BOTH per stock and period, with reason, symbols, ISINs, indices and priority 1 = NIFTY 50, 2 = NIFTY 500), `plan.csv` (one row per stock: token, first days, requests for the download), `index_coverage.csv` (per index and day: members with Kite EOD / 1-minute), `kite_adjustment.csv` and `kite_vs_bhav.parquet` (how Kite's adjusted prices relate to the bhavcopy), `eod_mismatch.csv`, `build_report.txt`.
+- **Files** in `<data folder>/equity_1min/plan/`: `kite_gaps.csv` (the shopping list: 1MIN, EOD or BOTH per stock and period, with reason, symbols, ISINs, indices and priority 1 = NIFTY 50, 2 = NIFTY 500), `plan.csv` (one row per stock: token, first days, requests for the download), `index_coverage.csv` (per index and day: members with Kite EOD / 1-minute), `kite_vs_bhav.parquet` (every Kite day next to the bhavcopy, with the factor that turns it back into raw prices) and `kite_adjustment.csv` (the periods where Kite subtracts an amount instead of only scaling), `eod_mismatch.csv` (real differences left after that conversion, allowing for Kite's rounding), `build_report.txt`.
 - Kite only has stocks that trade today, so delisted and merged companies are always in the list. Kite has no 1-minute data before 2015-02-02 at all.
 - `probe` refuses while a Kite F&O download runs (they would share Kite's request limit). If the Kite session expires it stops; sign in again and run `probe` again: finished stocks are kept. Exit codes: 0 done, 1 not run, some stocks failed or stopped, 2 bad arguments, busy, or Kite sign-in needed.
 
