@@ -1,13 +1,29 @@
 """Shared test setup. No test may reach NSE: Kite runs don't fetch the bhavcopy after a day unless a
 test turns fno.AUTO_BHAV on again (and stubs bhav.fetch_bhav), and the "download only contracts in the
-bhavcopy" setting is OFF (never read from .env) unless a test turns it on (trim_on) with the fetch stubbed."""
+bhavcopy" setting is OFF (never read from .env) unless a test turns it on (trim_on) with the fetch stubbed.
+The real .env is never read or written: before anything imports app (whose import calls config.secret_key()),
+config.ENV_PATH points at a throwaway .env in a session temp folder, removed when the run ends."""
+import atexit
+import os
+import shutil
+import tempfile
+
 import pytest
 
 import config
-import dashboard
+
+ENV_DIR = tempfile.mkdtemp(prefix="kite_backfill_env_")
+config.ENV_PATH = os.path.join(ENV_DIR, ".env")
+atexit.register(shutil.rmtree, ENV_DIR, ignore_errors=True)
+
+import dashboard  # after ENV_PATH is set (imports app)
 import dhan
 import nifty_daily
 from backfill import fno
+
+
+def pytest_sessionfinish(session, exitstatus):
+    shutil.rmtree(ENV_DIR, ignore_errors=True)
 
 
 @pytest.fixture(autouse=True)
