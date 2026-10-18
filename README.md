@@ -609,7 +609,8 @@ python index_membership.py check                      # known cases (RELIANCE, H
 
 - **Point in time:** a company is in an index from the change's effective date (and out from the effective date of its exclusion). An AMFI list counts from the first trading day of the month after its half year plus 5 trading days. Asking for a date outside the covered range is an error, never a guess.
 - **Sources:** the current constituent lists from niftyindices.com, walked back through NSE Indices' change notices (PDF, since late 2014); the AMFI half-yearly Excel lists (since H2-2017). Wayback Machine copies of old lists are only used as a check.
-- **Your corrections** go in `<data folder>/index_membership/input/manual_changes.csv` (IN, OUT or IGNORE rows; created once with an example, never overwritten). Then run `build` again.
+- **Reliable from:** each index gets a `reliable_from` date: from then to the end it is at its expected size on at least 98% of days (the Tata Motors DVR and REITs count as expected), and every archived list from then on matches. `members` refuses earlier dates unless you pass `--allow-unreliable` (in Python: `allow_unreliable=True`).
+- **Your corrections** go in `<data folder>/index_membership/input/manual_changes.csv` (IN, OUT or IGNORE rows; created once with an example, never overwritten). Then run `build` again. `reference/manual_index_changes.csv` in this repo is its backup: after editing the data copy, copy it there and commit it.
 - **Files** in `<data folder>/index_membership/`: `nifty_membership.csv/.parquet`, `nifty_changes.csv`, `amfi.csv/.parquet`, `review.csv` (what needs a look: unmapped symbols, skipped changes, size mismatches, image-only notices, demerger notices) and `build_report.txt`. Build the security master again first after new bhavcopy days (the build refuses while it is older). Exit codes: 0 done, 1 not run, a download failed or `check` failed, 2 bad arguments or another run is going.
 
 ## Credentials

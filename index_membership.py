@@ -4,7 +4,7 @@ and the queries are offline.
 
     python index_membership.py fetch [--amfi] [--nifty] [--changes] [--snapshots] [--force] [--no-browser]
     python index_membership.py build [--amfi-lag 5]
-    python index_membership.py members "NIFTY 50" 2023-07-13
+    python index_membership.py members "NIFTY 50" 2023-07-13 [--allow-unreliable]
     python index_membership.py show HDFC          NIFTY periods and AMFI categories of every security that had it
     python index_membership.py check              re-run the known-case checks
 
@@ -90,6 +90,8 @@ def main(argv=None):
     mm = sub.add_parser("members", help="members of an index on a date")
     mm.add_argument("index", help='e.g. "NIFTY 50", NIFTY_MIDCAP_150')
     mm.add_argument("date", type=date.fromisoformat, help="YYYY-MM-DD")
+    mm.add_argument("--allow-unreliable", action="store_true",
+                    help="answer for a date before the index's reliable_from date too")
     s = sub.add_parser("show", help="NIFTY periods and AMFI categories of one company")
     s.add_argument("key", help="any symbol or ISIN it ever had")
     sub.add_parser("check", help="re-run the known-case checks")
@@ -113,7 +115,10 @@ def main(argv=None):
             print(f"Written to {result['out']}")
             return 0
         if args.cmd == "members":
-            ids = im.members(args.index, args.date, folder)
+            ids = im.members(args.index, args.date, folder, allow_unreliable=args.allow_unreliable)
+            rel = im.coverage(args.index, folder).reliable_from
+            if rel is None or args.date < rel:
+                print(f"Note: before {args.index} is reliable ({rel or 'never'}); shown because of --allow-unreliable")
             master = im.Master(folder)
             print(f"{args.index} on {args.date}: {len(ids)} members")
             for sid in ids:

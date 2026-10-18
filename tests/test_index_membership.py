@@ -72,7 +72,9 @@ N = 200
 DAYS = weekdays(date(2021, 1, 4), N)
 R1, ADHOC, R2 = 60, 90, 190          # effective days: March review, ad hoc change, September review
 ISIN = {"AAA": "INE001A01011", "BBB": "INE002A01011", "CCC": "INE003A01011", "DDD": "INE004A01011",
-        "GONE": "INE005A01011", "NEWCO": "INE006A01011", "SPLIT": "INE007A01011", "SPLIT2": "INE007A01029"}
+        "GONE": "INE005A01011", "NEWCO": "INE006A01011", "SPLIT": "INE007A01011", "SPLIT2": "INE007A01029",
+        "ZZZDVR": "IN9008A01011", "EMBASSY": "INE041025011"}
+COMPANY = {"EMBASSY": "Embassy Office Parks REIT"}   # not in the equity master (a REIT)
 SIZES = {**nt.SIZES, "NIFTY 50": 2, "NIFTY NEXT 50": 2, "NIFTY 100": 4}
 
 
@@ -89,6 +91,7 @@ def store_rows():
     rows += trade("GONE", ISIN["GONE"], range(0, 61))                    # stops trading; out of Next 50 at ADHOC
     rows += trade("NEWCO", ISIN["NEWCO"], range(120, N))                 # lists on day 120, in Next 50 at R2
     rows += trade("SPLIT", ISIN["SPLIT"], range(0, 100)) + trade("SPLIT", ISIN["SPLIT2"], range(100, N))
+    rows += trade("ZZZDVR", ISIN["ZZZDVR"], range(N))                   # an additional share class
     rows += trade("FILLER", "INE999Z01011", range(N), series="N1")      # every day in the calendar
     return rows
 
@@ -156,7 +159,8 @@ CURRENT = {"NIFTY 50": ["AAA", "CCC"], "NIFTY NEXT 50": ["BBB", "NEWCO"], "NIFTY
 def write_current(folder, index, symbols, day=LIST_DATE, isins=None):
     sub = fe.input_dir(folder, "nifty_current")
     os.makedirs(sub, exist_ok=True)
-    lines = [",".join(nt_header())] + [f"{s} Ltd.,Finance,{s},EQ,{(isins or ISIN).get(s, '')}" for s in symbols]
+    lines = [",".join(nt_header())] + [f"{COMPANY.get(s, s + ' Ltd.')},Finance,{s},EQ,{(isins or ISIN).get(s, '')}"
+                                       for s in symbols]
     with open(os.path.join(sub, f"{fe.file_key(index)}_{day}.csv"), "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -436,7 +440,8 @@ def test_point_in_time_loaders(world):
     assert im.members("NIFTY 50", DAYS[R1], f) == sorted([a, c])
     assert im.members("nifty50", DAYS[R1 + 1], f) == sorted([a, c])
     assert im.is_member(b, "NIFTY 50", DAYS[R1 - 1], f) and not im.is_member(b, "NIFTY 50", DAYS[R1], f)
-    assert im.coverage("NIFTY 50", f) == (DAYS[0], DAYS[-1])
+    assert im.coverage("NIFTY 50", f) == (DAYS[0], DAYS[-1], DAYS[0])
+    assert im.coverage("NIFTY 50", f).reliable_from == DAYS[0]
     with pytest.raises(im.OutOfCoverage):
         im.members("NIFTY 50", DAYS[0] - timedelta(days=1), f)
     with pytest.raises(im.OutOfCoverage):
@@ -620,7 +625,78 @@ def test_count_mismatch_ranges(world):
     assert list(rows["details"]) == [f"3 members (size 2) from {DAYS[0]} to {DAYS[-1]}"]
     info = json.load(open(os.path.join(im.out_dir(f), "build_info.json")))
     n50 = next(s for s in info["size_checks"] if s["index"] == "NIFTY 50")
-    assert n50["exact"] == 0 and n50["days"] == N
+    assert n50["exact"] == 0 and n50["exact_adjusted"] == 0 and n50["days"] == N
+    assert info["coverage"]["NIFTY 50"]["reliable_from"] is None
+    with pytest.raises(im.OutOfCoverage, match="on no day"):
+        im.members("NIFTY 50", DAYS[-1], f)
+    assert len(im.members("NIFTY 50", DAYS[-1], f, allow_unreliable=True)) == 3
+
+
+# ---- reliable_from ----
+
+def test_reliable_from_rule():
+    days = DAYS[:100]
+    ok = [True] * 100
+    assert im.reliable_from(days, ok, [])[0] == days[0]
+    early = [i >= 10 for i in range(100)]                  # 10 days off at the start
+    assert im.reliable_from(days, early, [])[0] == days[9]   # 1 off in 91 days = 98.9%; from day 8: 2 in 92 = 97.8%
+    two = [i >= 2 for i in range(100)]
+    assert im.reliable_from(days, two, [])[0] == days[0]     # exactly 98%
+    snaps = [{"status": "compared", "day": str(days[50]), "mismatch": 1},
+             {"status": "compared", "day": str(days[70]), "mismatch": 0},          # matching: no effect
+             {"status": "outside coverage", "day": str(days[80])}]
+    day, why = im.reliable_from(days, ok, snaps)
+    assert day == days[51] and f"after the snapshot mismatch on {days[50]}" in why
+    assert im.reliable_from(days, [False] * 100, [])[0] is None
+
+
+def test_expected_sizes_rules():
+    sets = [{"A", "B", "DVR1"}, {"A", "B", "DVR1"}, {"A", "B"}]
+    assert im.expected_sizes("NIFTY 50", DAYS[:3], sets, {"DVR1"}, [DAYS[1]]) == [51, 50, 49]
+
+
+def test_dvr_and_reit_are_expected_deviations(world):
+    notices = base_notices()
+    notices[notice_name(DAYS[140])] = stream(DAYS[150], [("Nifty 100", [("OUT", ["BBB"]), ("IN", ["EMBASSY"])])])
+    f = world(notices=notices, current={**CURRENT, "NIFTY 50": ["AAA", "CCC", "ZZZDVR"],
+                                        "NIFTY 100": ["AAA", "CCC", "NEWCO", "EMBASSY"]})
+    r = build(f)
+    info = json.load(open(os.path.join(im.out_dir(f), "build_info.json")))
+    sizes = {s["index"]: s for s in info["size_checks"]}
+    assert sizes["NIFTY 50"]["share"] == 0.0 and sizes["NIFTY 50"]["share_adjusted"] == 1.0      # 3 = 2 + DVR
+    assert sizes["NIFTY 100"]["share"] < 1.0 and sizes["NIFTY 100"]["share_adjusted"] == 1.0     # 3 = 4 - REIT
+    assert info["coverage"]["NIFTY 50"]["reliable_from"] == str(DAYS[0])
+    assert info["coverage"]["NIFTY 100"]["reliable_from"] == str(DAYS[0])
+    assert info["expected_rules"] == im.EXPECTED_RULES and info["reliable_share"] == 0.98
+    rv = read(f, "review.csv")
+    assert rv[(rv["kind"] == "count_mismatch") & rv["index"].isin(["NIFTY 50", "NIFTY 100"])].empty
+    assert "Reliable from" in r["report"] and "expected deviations:" in r["report"]
+    assert "raw 0 of 200 days (0.0%), adjusted 200 (100.0%)" in r["report"]
+
+
+def test_members_before_reliable_from(world, capsys):
+    f = world(snapshots={f"NIFTY_NEXT_50_{DAYS[30]:%Y%m%d}060000.csv": ["CCC", "AAA"]})   # mismatch on day 30
+    build(f)
+    assert im.coverage("NIFTY NEXT 50", f).reliable_from == DAYS[31]
+    assert im.coverage("NIFTY 50", f).reliable_from == DAYS[0]
+    with pytest.raises(im.OutOfCoverage, match=f"reliable \\(from {DAYS[31]}\\)"):
+        im.members("NIFTY NEXT 50", DAYS[10], f)
+    bbb = sid(f, "BBB")
+    with pytest.raises(im.OutOfCoverage):
+        im.is_member(bbb, "NIFTY NEXT 50", DAYS[10], f)
+    assert len(im.members("NIFTY NEXT 50", DAYS[10], f, allow_unreliable=True)) == 2
+    assert not im.is_member(bbb, "NIFTY NEXT 50", DAYS[10], f, allow_unreliable=True)
+    assert len(im.members("NIFTY NEXT 50", DAYS[31], f)) == 2
+    with pytest.raises(im.OutOfCoverage):                     # outside first..last even with the override
+        im.members("NIFTY NEXT 50", DAYS[0] - timedelta(days=1), f, allow_unreliable=True)
+    capsys.readouterr()
+    assert cli.main(["members", "NIFTY NEXT 50", str(DAYS[10]), "--folder", f]) == 1
+    assert "allow_unreliable" in capsys.readouterr().err
+    assert cli.main(["members", "NIFTY NEXT 50", str(DAYS[10]), "--allow-unreliable", "--folder", f]) == 0
+    out = capsys.readouterr().out
+    assert "Note: before NIFTY NEXT 50 is reliable" in out and "2 members" in out
+    rep = open(os.path.join(im.out_dir(f), "build_report.txt"), encoding="utf-8").read()
+    assert f"{'NIFTY NEXT 50':20} {DAYS[31]}" in rep and "snapshots from then: 0 of 0 match" in rep
 
 
 def test_composite_check_reports_the_days_off(world):

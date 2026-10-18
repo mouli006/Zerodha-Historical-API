@@ -153,10 +153,30 @@ table are dropped. The build caches it in `index_membership\text_cache\<file>.js
 - `calendar.csv`, `build_report.txt`;
 - `build_info.json` (parameters, inputs, coverage, AMFI periods, reviews per year, size / composite results).
 
+## reliable_from (per index)
+**Expected deviations** (`EXPECTED_RULES`, also in the report and build_info):
+- **Additional share class:** each member whose symbol ends in `DVR` (`ADDITIONAL_CLASS`; the Tata Motors DVR)
+  adds 1 to the expected size.
+- **REIT / InvIT:** each current-list row whose company matches `REIT_RX` (not in the equity master, so never a
+  member here) takes 1 from the expected size. It counts from the effective date of its (unmapped) IN row in that
+  index, else from the coverage start.
+- Nothing else is expected; e.g. a DUMMYHEG-style placeholder day counts as off.
+
+**The rule** (`reliable_from()`):
+- The size check reports the raw share (count = size) and the adjusted share (count = expected size).
+  `count_mismatch` review rows are the days off the expected size.
+- `reliable_from` = the earliest trading day d of the coverage that comes after the latest compared snapshot with
+  a real mismatch (timing differences allowed), and with the index at its expected size on at least
+  `RELIABLE_SHARE` (98%) of the trading days from d to the coverage end. None if there is no such day.
+- Stored in build_info `coverage[index]` (`reliable_from`, `reliable_why`, `snapshots_after`). The report lists it
+  per index with the rules.
+
 ## Loaders (cached until the files change; `NotBuilt` when missing)
-- `members(index, on_date)` → sorted security_ids.
-- `is_member(security_id, index, on_date)`.
-- `coverage(index)` → (first, last).
+- `members(index, on_date, allow_unreliable=False)` → sorted security_ids. A date before `reliable_from` (or any
+  date when it is None) → `OutOfCoverage`, unless `allow_unreliable=True`. A date outside first..last always
+  raises. CLI: `members INDEX DATE --allow-unreliable` (prints a note).
+- `is_member(security_id, index, on_date, allow_unreliable=False)`.
+- `coverage(index)` → `Coverage(first, last, reliable_from)` (a namedtuple).
 - `amfi_category(security_id, on_date)` → (LARGE / MID / SMALL or None, period).
 - `amfi_list(on_date, category=None)` → the rows of the list valid then, by rank.
 - A date outside the coverage (AMFI: before the first `valid_from` or after the last bhavcopy day) →
@@ -181,11 +201,17 @@ table are dropped. The build caches it in `index_membership\text_cache\<file>.js
     / Next 50 / 200 / 500 one more while it was in them (exit 2024-08-30).
   - REITs / InvITs entered NIFTY 500 / Midcap 150 / Smallcap 250 on 2026-09-30, and are not in the equity master.
 - **2020-03-27:** the replacements announced for that date (18 Feb, 12 Mar, 19 Mar 2020) were declared "null and
-  void" (ind_prs13052020.pdf), except NIFTY 50, and redone for 2020-06-26. The parser does not read that: it needs
-  IGNORE rows (index, 2020-03-27, IGNORE, blank symbol) in `manual_changes.csv`.
-- **ind_prs23082021.pdf** (the Sept 2021 review) is an image-only PDF. Its NIFTY 50 / 100 / Next 50 / 200 /
-  Midcap 100 rows must come from `manual_changes.csv`. Its 500 / Midcap 150 / Smallcap 250 lists were replaced by
-  ind_prs15092021.pdf anyway.
+  void" (ind_prs13052020.pdf), except NIFTY 50, and redone for 2020-06-26. The parser does not read that, so
+  `manual_changes.csv` has 7 IGNORE rows (every index but NIFTY 50, 2020-03-27, blank symbol; added 2026-10-18).
+- **Backup:** `reference/manual_index_changes.csv` in the repo is the backup of the data folder's
+  `manual_changes.csv` (force-added: `*.csv` is gitignored). The build reads only the data copy. After editing it,
+  copy it to the repo and commit.
+- **ind_prs23082021.pdf** (the Sept 2021 review) is an image-only PDF (no NIFTY 50 section).
+  - Its Next 50 / 100 / 200 / Midcap 100 rows were read by eye into
+    `<folder>\index_membership\input\draft_rows_2021-09.csv`, which the build never reads. They are to be checked,
+    then copied to `manual_changes.csv`.
+  - Its 500 / Midcap 150 / Smallcap 250 lists were replaced by ind_prs15092021.pdf (parsed), so they are not
+    drafted.
 - A missed change makes every earlier date of that index wrong for the stocks involved. The snapshots, the size
   check and `undo_mismatch` show where; fix it with manual rows.
 

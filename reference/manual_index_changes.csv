@@ -1,0 +1,18 @@
+index,effective_date,action,symbol,isin,note
+# Manual index changes, added to the parsed notices (index_membership.py build). Lines starting with # are
+# ignored. index: NIFTY 50, NIFTY NEXT 50, NIFTY 100, NIFTY 200, NIFTY 500, NIFTY MIDCAP 150, NIFTY SMALLCAP 250,
+# NIFTY MIDCAP 100. effective_date: the first day in (IN) or out (OUT), YYYY-MM-DD. action: IN, OUT, or IGNORE
+# (drops the parsed row of that index, date and symbol; with symbol and isin blank, every parsed row of that
+# index and date). isin is optional (used before the symbol).
+# Example (not active):
+# NIFTY 50,2023-07-13,IN,LTIM,INE214T01019,replaces HDFC (ind_prs04072023.pdf)
+# Backup in the repo: reference/manual_index_changes.csv (copy it there after editing this file and commit it).
+# 2020-03-27: the replacements announced for that date were declared null and void, except NIFTY 50 (rebalanced
+# on 2020-03-19), and redone for 2020-06-26.
+NIFTY NEXT 50,2020-03-27,IGNORE,,,null and void (ind_prs13052020.pdf)
+NIFTY 100,2020-03-27,IGNORE,,,null and void (ind_prs13052020.pdf)
+NIFTY 200,2020-03-27,IGNORE,,,null and void (ind_prs13052020.pdf)
+NIFTY 500,2020-03-27,IGNORE,,,null and void (ind_prs13052020.pdf)
+NIFTY MIDCAP 150,2020-03-27,IGNORE,,,null and void (ind_prs13052020.pdf)
+NIFTY SMALLCAP 250,2020-03-27,IGNORE,,,null and void (ind_prs13052020.pdf)
+NIFTY MIDCAP 100,2020-03-27,IGNORE,,,null and void (ind_prs13052020.pdf)

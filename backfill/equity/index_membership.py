@@ -15,6 +15,7 @@ import json
 import os
 import re
 from bisect import bisect_left, bisect_right
+from collections import namedtuple
 from datetime import date, datetime, timedelta
 
 import numpy as np
@@ -40,6 +41,15 @@ AMFI_LAG = 5             # trading days after the first trading day of the month
 NOT_TRADING_DAYS = 20    # a member without a bhavcopy row for more than this many trading days -> review
 SNAPSHOT_TIMING = 5      # a snapshot difference within this many trading days of a change is timing
 REVIEW_EXAMPLES = 10
+RELIABLE_SHARE = 0.98    # reliable_from: at least this share of days at the expected size from then on
+ADDITIONAL_CLASS = re.compile(r"DVR$")   # a second share class counted on top of the size (Tata Motors DVR)
+REIT_RX = re.compile(r"REIT|InvIT|Real Estate (Investment )?Trust|Infrastructure Investment Trust", re.I)
+EXPECTED_RULES = [
+    "additional share class: each member whose symbol ends in DVR (Tata Motors DVR) adds 1 to the expected size",
+    "REIT / InvIT: each current-list row of a REIT or InvIT (not in the equity master) takes 1 from the expected "
+    "size from the effective date of its inclusion in that index (else from the coverage start)",
+    "nothing else is expected; every other day off the size counts against reliable_from",
+]
 COMPOSITES = [  # (name, whole, parts, from): whole = union of the disjoint parts (NSE methodology, Sept 2026)
     ("NIFTY 100 = NIFTY 50 + NIFTY NEXT 50", "NIFTY 100", ["NIFTY 50", "NIFTY NEXT 50"], None),
     # before 2018-04-02 NIFTY 200 was NIFTY 100 + the (ceased) Nifty Full Midcap 100 (ind_prs05012018.pdf)
@@ -532,7 +542,8 @@ def assemble_changes(parsed, manual, bad_manual, master, cal, review, replacing=
 
 
 def map_current(index, rows, list_date, master, review):
-    sids = {}
+    """({security_id: symbol}, [unmapped rows]) of a constituent list."""
+    sids, unmapped = {}, []
     for r in rows:
         sid = master.by_isin(r["isin"])
         if not sid:
@@ -540,9 +551,10 @@ def map_current(index, rows, list_date, master, review):
         if not sid:
             review.append(row("unmapped_current", index, list_date, "", r["symbol"],
                               f"{r['company']} ISIN {r['isin']}: {why}"))
+            unmapped.append(r)
             continue
         sids[sid] = r["symbol"]
-    return sids
+    return sids, unmapped
 
 
 def walk(index, current, list_date, start, changes, cal, review):
@@ -623,15 +635,46 @@ def ranges(days, flags, values=None):
     return [(a, b, v) for a, b, v, _ in out]
 
 
-def size_check(index, days, sets, review):
+def expected_sizes(index, days, sets, extra_class, reits):
+    """The size each day should have (EXPECTED_RULES): SIZES + members of an additional share class - REIT / InvIT
+    rows included by then. extra_class: security_ids; reits: [inclusion date]."""
+    return [SIZES[index] + len(s & extra_class) - sum(1 for d0 in reits if d0 <= d) for d, s in zip(days, sets)]
+
+
+def size_check(index, days, sets, review, expected=None):
+    """Raw (count = size) and adjusted (count = expected size) exact days. Days off the expected size go to review
+    (count_mismatch); "ok" (per day, adjusted) is used for reliable_from."""
     counts = [len(s) for s in sets]
-    bad = [c != SIZES[index] for c in counts]
-    rs = ranges(days, bad, counts)
+    expected = expected or [SIZES[index]] * len(days)
+    raw_bad = [c != SIZES[index] for c in counts]
+    bad = [c != e for c, e in zip(counts, expected)]
+    notes = [f"{c} members" + (f" (expected {e})" if e != SIZES[index] else "") for c, e in zip(counts, expected)]
+    rs = ranges(days, bad, notes)
     for a, b, v in rs:
-        review.append(row("count_mismatch", index, a, "", "", f"{v} members (size {SIZES[index]}) from {a} to {b}"))
-    ok = len(days) - sum(bad)
-    return {"index": index, "days": len(days), "exact": ok, "share": ok / len(days) if days else 0.0,
-            "ranges": [(str(a), str(b), v) for a, b, v in rs]}
+        review.append(row("count_mismatch", index, a, "", "", f"{v} (size {SIZES[index]}) from {a} to {b}"))
+    ok, raw_ok = len(days) - sum(bad), len(days) - sum(raw_bad)
+    return {"index": index, "days": len(days), "exact": raw_ok, "share": raw_ok / len(days) if days else 0.0,
+            "exact_adjusted": ok, "share_adjusted": ok / len(days) if days else 0.0,
+            "ranges": [(str(a), str(b), v) for a, b, v in rs], "ok": [not x for x in bad]}
+
+
+def reliable_from(days, ok, snaps, share=RELIABLE_SHARE):
+    """(day or None, why): the earliest day d after the latest compared snapshot with a real mismatch (timing
+    differences allowed) such that the index is at its expected size on at least share of the days from d on."""
+    bad_snaps = [as_date(x["day"]) for x in snaps if x.get("status") == "compared" and x["mismatch"]]
+    after = max(bad_snaps) if bad_snaps else None
+    n = len(days)
+    suffix = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix[i] = suffix[i + 1] + (1 if ok[i] else 0)
+    for i in range(n):
+        if after is not None and days[i] <= after:
+            continue
+        if suffix[i] >= share * (n - i):
+            lead = f"after the snapshot mismatch on {after}; " if after else ""
+            return days[i], f"{lead}{suffix[i] / (n - i):.1%} of {n - i:,} days at the expected size from then"
+    lead = f" after the snapshot mismatch on {after}" if after else ""
+    return None, f"no day{lead} from which {share:.0%} of the days are at the expected size"
 
 
 def composite_check(name, whole, parts, first, daysets, master):
@@ -848,11 +891,21 @@ def report_text(info, checks, sizes, comps, snaps, review, counts, changes_per_y
     L.append("  change rows by status: " + ", ".join(f"{k} {int(v):,}" for k, v in st.items()))
     if info.get("pending"):
         L.append("  pending (effective after the current list): " + "; ".join(info["pending"]))
-    L += ["", "Size check (members on each trading day of the coverage = the index size):"]
+    L += ["", "Size check (members on each trading day of the coverage; raw = the index size, adjusted = the "
+          "expected size):"]
     for s in sizes:
-        L.append(f"  {s['index']:20} {s['exact']:,} of {s['days']:,} days exact ({s['share']:.1%})"
-                 + (f"; {len(s['ranges'])} ranges off, first: " + "; ".join(f"{a}..{b}: {v}" for a, b, v in s['ranges'][:4])
+        L.append(f"  {s['index']:20} raw {s['exact']:,} of {s['days']:,} days ({s['share']:.1%}), adjusted "
+                 f"{s['exact_adjusted']:,} ({s['share_adjusted']:.1%})"
+                 + (f"; {len(s['ranges'])} ranges off, first: " + "; ".join(f"{a}..{b}: {v}" for a, b, v in s['ranges'][:3])
                     if s["ranges"] else ""))
+    L += ["", f"Reliable from (at the expected size on at least {RELIABLE_SHARE:.0%} of the days from then to the end, "
+          "and every snapshot from then on matching, timing differences allowed):"]
+    for index in INDEXES:
+        c = info["coverage"][index]
+        L.append(f"  {index:20} {c.get('reliable_from') or 'not reliable':12}  {c.get('reliable_why', '')}"
+                 + (f"; snapshots from then: {c['snapshots_after']}" if c.get("snapshots_after") else ""))
+    L.append("  expected deviations:")
+    L += [f"    - {x}" for x in EXPECTED_RULES]
     L += ["", "Composite checks (days where every index in them is covered):"]
     for c in comps:
         L.append(f"  {c['name']} (from {c['from']}): holds on {c['holds']:,} of {c['days']:,} days ({c['share']:.1%})")
@@ -978,7 +1031,7 @@ def _build(folder, out, amfi_lag, now, log):
                                [n["file"] for n in notices if n["replaces"]])
 
     lists = current_lists(folder)
-    coverage, periods_all, rows_out, pending = {}, {}, [], []
+    coverage, periods_all, rows_out, pending, reit_rows = {}, {}, [], [], {}
     for index in INDEXES:
         if index not in lists:
             coverage[index] = {"first": None, "last": None, "list": None, "why": "no current list"}
@@ -990,7 +1043,8 @@ def _build(folder, out, amfi_lag, now, log):
         else:
             start, why = cal.first, "from the data start"
         last = cal.on_or_before(list_date)
-        cur = map_current(index, nt.read_constituents(read_file(path)), list_date, master, review)
+        cur, unmapped = map_current(index, nt.read_constituents(read_file(path)), list_date, master, review)
+        reit_rows[index] = [r for r in unmapped if REIT_RX.search(r["company"])]
         for c in changes:
             if c["index"] == index and c["status"] == "applied" and c["effective_date"] > list_date:
                 c["status"] = "pending"
@@ -1013,11 +1067,17 @@ def _build(folder, out, amfi_lag, now, log):
 
     log("Checks")
     sizes, daysets = [], {}
+    extra_class = {sid for sid, rows in master.periods.items() if any(ADDITIONAL_CLASS.search(r[2]) for r in rows)}
     for index, periods in periods_all.items():
         c = coverage[index]
         days, sets = daily_sets([(p[0], p[1], p[2]) for p in periods], cal, as_date(c["first"]), as_date(c["last"]))
         daysets[index] = (days, sets)
-        sizes.append(size_check(index, days, sets, review))
+        reits = []
+        for r in reit_rows.get(index, []):
+            ins = [x["effective_date"] for x in changes if x["index"] == index and x["symbol"] == r["symbol"]
+                   and x["action"] == "IN" and x["status"] == "unmapped"]
+            reits.append(max(ins) if ins else as_date(c["first"]))
+        sizes.append(size_check(index, days, sets, review, expected_sizes(index, days, sets, extra_class, reits)))
     comps = [composite_check(n, w, p, f, daysets, master) for n, w, p, f in COMPOSITES
              if w in daysets and all(x in daysets for x in p)]
     member_ids = sorted(set(membership["security_id"]))
@@ -1027,6 +1087,16 @@ def _build(folder, out, amfi_lag, now, log):
     cov_dates = {k: (as_date(v["first"]) if v["first"] else None, as_date(v["last"]) if v["last"] else None)
                  for k, v in coverage.items()}
     snaps = snapshot_check(folder, membership, changes, cal, cov_dates, master, review)
+    for sz in sizes:
+        index = sz["index"]
+        mine = [x for x in snaps if x["index"] == index]
+        day, why = reliable_from(daysets[index][0], sz.pop("ok"), mine)
+        later = [x for x in mine if x.get("status") == "compared" and day and as_date(x["day"]) >= day]
+        coverage[index].update({"reliable_from": str(day) if day else None, "reliable_why": why,
+                                "snapshots_after": f"{sum(1 for x in later if not x['mismatch'])} of {len(later)} match"})
+    for c in coverage.values():
+        c.setdefault("reliable_from", None)
+        c.setdefault("reliable_why", c["why"])
 
     counts = {index: {} for index in INDEXES}
     for index, (days, sets) in daysets.items():
@@ -1056,6 +1126,7 @@ def _build(folder, out, amfi_lag, now, log):
             "reviews": reviews_per_year(notices, changes), "pending": pending,
             "midcap_entry": pick_midcap_entry(changes, membership, amfi),
             "size_checks": [{k: v for k, v in s.items() if k != "ranges"} for s in sizes],
+            "reliable_share": RELIABLE_SHARE, "expected_rules": EXPECTED_RULES,
             "composite_checks": [{k: v for k, v in c.items() if k != "ranges"} for c in comps]}
     checks = known_checks(membership, changes, amfi, info, lambda s, d: sm.security_id_for(s, d, folder))
     info["_changes"] = changes
@@ -1099,32 +1170,41 @@ def load_built(folder=None):
     return _CACHE[key]
 
 
+Coverage = namedtuple("Coverage", ["first", "last", "reliable_from"])
+
+
 def coverage(index, folder=None):
-    """(first, last): the dates the membership of index is reliable for (from the sources)."""
+    """Coverage(first, last, reliable_from): the dates the sources cover, and the first date from which the
+    membership passed the checks (None: never)."""
     c = load_built(folder)["info"]["coverage"][index_name(index)]
     if not c["first"]:
         raise OutOfCoverage(f"{index_name(index)} is not covered: {c['why']}")
-    return as_date(c["first"]), as_date(c["last"])
+    rel = c.get("reliable_from")
+    return Coverage(as_date(c["first"]), as_date(c["last"]), as_date(rel) if rel else None)
 
 
-def _in_coverage(index, day, folder):
-    first, last = coverage(index, folder)
+def _in_coverage(index, day, folder, allow_unreliable=False):
+    first, last, rel = coverage(index, folder)
     if not first <= day <= last:
         raise OutOfCoverage(f"{day} is outside the coverage of {index_name(index)} ({first} to {last})")
+    if not allow_unreliable and (rel is None or day < rel):
+        raise OutOfCoverage(f"{day} is before {index_name(index)} is reliable "
+                            f"({'from ' + str(rel) if rel else 'on no day'}); allow_unreliable=True uses it anyway")
 
 
-def members(index, on_date, folder=None):
-    """The security_ids in index on on_date (point in time), sorted."""
+def members(index, on_date, folder=None, allow_unreliable=False):
+    """The security_ids in index on on_date (point in time), sorted. A date before the index's reliable_from date
+    raises OutOfCoverage unless allow_unreliable."""
     index, day = index_name(index), as_date(on_date)
-    _in_coverage(index, day, folder)
+    _in_coverage(index, day, folder, allow_unreliable)
     m = load_built(folder)["membership"]
     m = m[m["index"] == index]
     hit = m[(m["from_date"] <= day) & (until(m["to_date"]) >= day)]
     return sorted(hit["security_id"])
 
 
-def is_member(security_id, index, on_date, folder=None):
-    return security_id in members(index, on_date, folder)
+def is_member(security_id, index, on_date, folder=None, allow_unreliable=False):
+    return security_id in members(index, on_date, folder, allow_unreliable)
 
 
 def _amfi_period(day, folder):
