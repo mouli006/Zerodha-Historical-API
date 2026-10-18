@@ -97,6 +97,20 @@ def test_default_cli_folder(monkeypatch):
     assert config.default_fno_folder("kite", True, env) == "D:/old"   # not split: as before
 
 
+def test_keep_zero_setting_defaults_on(monkeypatch):
+    """Keep zero-volume is ON unless .env says OFF, so every run (NIFTY and SENSEX, Kite and Dhan) saves to the with
+    store by default."""
+    assert config.KEEP_ZERO_VOLUME is True
+    for value, want in (("OFF", False), ("off", False), ("ON", True), ("", True), (None, True)):
+        monkeypatch.setattr(config, "load_env", lambda v=value: {} if v is None else {"KEEP_ZERO_VOLUME": v})
+        assert config.keep_zero_volume() is want
+    env = {"FNO_RAW_KITE": "D:/raw/kite", "FNO_RAW_DHAN": "D:/raw/dhan"}
+    monkeypatch.setattr(config, "load_env", lambda: {})
+    for source in ("kite", "dhan"):
+        assert config.default_fno_folder(source, None, env) == os.path.join(env[config.FNO_RAW_KEYS[source]],
+                                                                            "with_zero_volume")
+
+
 def test_derive_setting(monkeypatch):
     monkeypatch.undo()   # the real config.derive_without, with a stubbed .env
     for value, want in (("OFF", False), ("on", True), ("", config.DERIVE_WITHOUT_ZERO_VOLUME)):

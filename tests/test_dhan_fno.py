@@ -7,6 +7,7 @@ from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+import config
 import dashboard
 import dhan
 from app import app
@@ -389,3 +390,11 @@ def test_dhan_page_has_trim_switch(client, monkeypatch):
     assert "Download only contracts in the bhavcopy" in html and '"trim_to_bhav": true' in html
     monkeypatch.setattr(dhan, "trim_to_bhav", lambda: False)
     assert '"trim_to_bhav": false' in c.get("/dhan/dashboard").get_data(as_text=True)
+
+
+def test_dhan_page_keep_zero_defaults_on(client, monkeypatch):
+    """No KEEP_ZERO_VOLUME in .env: the Dhan F&O page starts with the switch ON (config.KEEP_ZERO_VOLUME)."""
+    c, _ = client
+    monkeypatch.setattr(config, "load_env", lambda: {})
+    monkeypatch.setattr(dhan, "keep_zero_volume", config.keep_zero_volume)
+    assert '"keep_zero_volume": true' in c.get("/dhan/dashboard").get_data(as_text=True)

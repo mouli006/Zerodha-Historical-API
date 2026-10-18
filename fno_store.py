@@ -8,6 +8,7 @@
     python fno_store.py compare-variants --source kite|dhan [--underlying ...] [--from D] [--to D]
                                          [--with PATH] [--without PATH]
     python fno_store.py clear --underlying NIFTY|SENSEX [--source kite|dhan|all] [--variant with|without|all]
+                              [--date YYYY-MM-DD ... | --from YYYY-MM-DD --to YYYY-MM-DD]
                               [--no-backtest] [--archive-to PATH] [--apply] [--delete] [--yes]
     python fno_store.py restore --from "<archive folder>" [--apply]
     python fno_store.py import --from "<prepared folder>" --underlying NIFTY|SENSEX [--apply] [--yes]
@@ -28,7 +29,9 @@ replaced or deleted, only listed.
 
 clear (backfill/fno_clear.py) moves one underlying's day folders, day counts, progress rows and backtest folders into
 <home>/archive/<time>_clear_<U>/ so its next downloads start clean (expiries_seen.csv, holidays.log and .lock stay);
-it says which cleared days can no longer be downloaded. restore puts an archive back. Both are dry runs without
+it says which cleared days can no longer be downloaded. --date (repeatable) or --from / --to clear only those days:
+their day folders, their progress rows and their backtest entries of the sources and variants in scope (the day
+count is rewritten, every other file stays). restore puts an archive back. Both are dry runs without
 --apply; clear --apply --delete deletes instead (typed confirmation).
 
 import (backfill/fno_import.py) replaces one underlying's live data with a prepared copy (kite*/dhan* folders holding
@@ -46,7 +49,7 @@ import sys
 from datetime import date
 
 from backfill.fno import UNDERLYINGS
-from backfill.fno_clear import clear, restore
+from backfill.fno_clear import clear, day_filter, restore
 from backfill.fno_derive import compare_variants, derive_without
 from backfill.fno_import import import_data
 from backfill.fno_publish import publish_variants
@@ -104,6 +107,10 @@ def main(argv=None):
     k.add_argument("--underlying", choices=sorted(UNDERLYINGS), required=True, help="no default: name it")
     k.add_argument("--source", choices=sorted(FNO_RAW_KEYS) + ["all"], default="all")
     k.add_argument("--variant", choices=sorted(VARIANTS) + ["all"], default="all")
+    k.add_argument("--date", dest="dates", action="append", type=day, metavar="YYYY-MM-DD",
+                   help="clear only this day (repeat for several); default: the whole underlying")
+    k.add_argument("--from", dest="date_from", type=day, help="clear only days from this one")
+    k.add_argument("--to", dest="date_to", type=day, help="clear only days up to this one")
     k.add_argument("--no-backtest", action="store_true", help="leave the published backtest folders")
     k.add_argument("--archive-to", help="archive folder (default <common folder of the .env bases>/archive/<time>_clear_<U>)")
     k.add_argument("--apply", action="store_true", help="move into the archive (default: only print)")
@@ -141,10 +148,15 @@ def main(argv=None):
             to = args.to or base
         return move_raw(args.froms, args.source, to, apply=args.apply)
     if args.cmd == "clear":
+        if args.dates and (args.date_from or args.date_to):
+            k.error("give --date or --from / --to, not both")
+        if args.date_from and args.date_to and args.date_from > args.date_to:
+            k.error("--from is after --to")
         sources = sorted(FNO_RAW_KEYS) if args.source == "all" else [args.source]
         variants = sorted(VARIANTS) if args.variant == "all" else [args.variant]
         return clear(args.underlying, sources, variants, env, backtest=not args.no_backtest, archive_to=args.archive_to,
-                     apply=args.apply, delete=args.delete, yes=args.yes, command=" ".join(["python fno_store.py", *(argv or sys.argv[1:])]))
+                     apply=args.apply, delete=args.delete, yes=args.yes, command=" ".join(["python fno_store.py", *(argv or sys.argv[1:])]),
+                     days=day_filter(args.dates or (), args.date_from, args.date_to))
     if args.cmd == "import":
         return import_data(args.src, args.underlying, env, apply=args.apply, yes=args.yes,
                            command=" ".join(["python fno_store.py", *(argv or sys.argv[1:])]))

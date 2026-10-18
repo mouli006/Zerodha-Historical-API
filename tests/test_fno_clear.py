@@ -1,6 +1,7 @@
 """fno_store.py clear / restore (backfill/fno_clear.py): archive one underlying's F&O data in every store, raw and
 backtest, leaving the other underlying, equity rows, expiries_seen.csv, holidays.log and .lock alone.
 tmp_path only, .env stubbed, prompts stubbed, no network."""
+import csv
 import json
 import os
 import sqlite3
@@ -9,7 +10,7 @@ from datetime import date, datetime
 import pytest
 
 import fno_store as cli
-from backfill import fno, fno_clear, fno_days
+from backfill import fno, fno_clear, fno_days, fno_publish
 from backfill.job import JOB, JOB_LOCK
 from test_fno_store import make_day
 from test_fno_store import tree as full_tree
@@ -344,3 +345,171 @@ def test_cli_restore(data, monkeypatch, capsys):
     assert cli.main(["restore", "--from", str(home / "archive" / ARCHIVE)]) == 0
     assert "Dry run" in capsys.readouterr().out
     assert cli.main(["restore", "--from", str(home / "nope")]) == 1
+
+
+# --- one day: --date / --from / --to ---------------------------------------------------------------------------
+
+DAY = "2026-10-16"
+DHAN_DAY = f"fno-dhan:SENSEX:BSE_FNO:{DAY}"
+WO = ("dhan", "without_zero_volume")
+
+
+def add_day_rows(home):
+    """Rows of 16 Oct (two contracts) and a range key that starts with 16 Oct in every save folder."""
+    for source in ("kite", "dhan"):
+        pre, exch = ("fno", "BFO") if source == "kite" else ("fno-dhan", "BSE_FNO")
+        for save in [home / "raw" / source / s for s in STORES] + [home / "raw" / source]:
+            db = fno_clear.open_db(str(save))
+            db.executemany("INSERT INTO chunks (run, symbol, token, chunk_from, chunk_to, status) VALUES (?, ?, 1, 'a', 'b', 'DONE')",
+                           [(f"{pre}:SENSEX:{exch}:{DAY}", "S4"), (f"{pre}:SENSEX:{exch}:{DAY}", "S5"),
+                            (f"{pre}:SENSEX:{exch}:{DAY}_to_2026-10-20", "S6")])
+            db.commit()
+            db.close()
+
+
+def publish(env):
+    lines = []
+    assert fno_publish.publish_variants({"kite": env["FNO_RAW_KITE"], "dhan": env["FNO_RAW_DHAN"]}, env["FNO_BACKTEST_DIR"],
+                                        ["with", "without"], ["SENSEX"], log=lines.append) == 0, lines
+
+
+def one_day(env, **kw):
+    return do(env, sources=["dhan"], variants=["without"], days=fno_clear.day_filter([date(2026, 10, 16)]), **kw)
+
+
+def store_tree(home, source, store):
+    """The store's files without .lock and progress.sqlite (its bytes change on any write; rows are compared)."""
+    return {k: v for k, v in tree(str(home / "raw" / source / store)).items() if k != "progress.sqlite"}
+
+
+def test_day_filter_and_run_day():
+    assert fno_clear.day_filter() is None
+    f = fno_clear.day_filter(date_from=date(2026, 10, 15))
+    assert f.keep(date(2026, 10, 16)) and not f.keep(date(2026, 10, 9)) and f.label == "from 2026-10-15"
+    f = fno_clear.day_filter([date(2026, 10, 16), date(2026, 10, 9)])
+    assert f.keep(date(2026, 10, 9)) and not f.keep(date(2026, 10, 15)) and f.label == "2026-10-09, 2026-10-16"
+    assert fno_clear.run_day(DHAN_DAY) == date(2026, 10, 16)
+    assert fno_clear.run_day(f"{DHAN_DAY}_to_2026-10-20") is None and fno_clear.run_day("fno:SENSEX:BFO:missing") is None
+
+
+def test_one_day_dry_run_changes_nothing(data):
+    home, env = data
+    add_day_rows(home)
+    publish(env)
+    before = tree(str(home))
+    code, out = one_day(env)
+    assert code == 0 and tree(str(home)) == before and not (home / "archive").exists()
+    assert "== Clear SENSEX F&O data of 2026-10-16" in out
+    assert out.count("  archive 2026-10-") == 1 and "noZeroVol" in out                 # only the Dhan without folder
+    assert f"archive 2 progress rows ({DHAN_DAY})" in out and out.count("progress rows (") == 1
+    assert out.count("\nbacktest ") == 1 and "2026-10-16 dhan: archive" in out and "publish_manifest.json entry removed" in out
+    assert "Can be downloaded again: 2026-10-16." in out and "Cannot be downloaded" not in out
+    assert "keep everything else" in out and "archive _DAYS" not in out and "archive bhavcopy.log" not in out
+    assert out.endswith("Dry run: nothing changed. Run again with --apply to archive.")
+
+
+def test_one_day_apply_moves_only_that_day(data):
+    home, env = data
+    add_day_rows(home)
+    others = {(s, st): store_tree(home, s, st) for s in ("kite", "dhan") for st in STORES if (s, st) != WO}
+    other_rows = {(s, st): runs(home / "raw" / s / st) for s in ("kite", "dhan") for st in STORES if (s, st) != WO}
+    old_roots = {s: tree(str(home / "raw" / s / fno.fno_folder("SENSEX", s))) for s in ("kite", "dhan")}
+    base_rows = {s: runs(home / "raw" / s) for s in ("kite", "dhan")}
+    wo = home / "raw" / "dhan" / "without_zero_volume"
+    before = runs(wo)
+    code, out = one_day(env, apply=True)                     # 16 Oct is in the window: no question asked
+    assert code == 0, out
+    days = sensex_days(home)
+    assert days[WO] == LOST and all(v == LOST + OK for k, v in days.items() if k != WO)
+    assert {k: store_tree(home, *k) for k in others} == others
+    assert {k: runs(home / "raw" / k[0] / k[1]) for k in other_rows} == other_rows
+    assert {s: tree(str(home / "raw" / s / fno.fno_folder("SENSEX", s))) for s in ("kite", "dhan")} == old_roots
+    assert {s: runs(home / "raw" / s) for s in ("kite", "dhan")} == base_rows
+    assert runs(wo) == [r for r in before if r != DHAN_DAY] and f"{DHAN_DAY}_to_2026-10-20" in runs(wo)
+    root = fno.fno_root(str(wo), "SENSEX", "dhan")
+    folders = fno.day_folders(root)
+    assert sorted(os.listdir(root)) == sorted([".lock", "_DAYS-2_2026-10-09_to_2026-10-15.txt", "bhavcopy.log",
+                                               "days_index.csv", fno.EXPIRIES_FILE, "holidays.log",
+                                               *(folders[date.fromisoformat(d)] for d in LOST)])
+    with open(os.path.join(root, "days_index.csv"), encoding="utf-8") as f:
+        index = f.read()
+    assert DAY not in index and "2026-10-15" in index
+    arch = home / "archive" / ARCHIVE
+    moved = arch / "raw" / "dhan" / "without_zero_volume" / fno.fno_folder("SENSEX", "dhan")
+    assert [fno.parse_day_folder(n)[0].isoformat() for n in os.listdir(moved)] == [DAY]
+    db = sqlite3.connect(str(arch / "raw" / "dhan" / "without_zero_volume" / "progress_sensex.sqlite"))
+    assert sorted(r[0] for r in db.execute("SELECT symbol FROM chunks")) == ["S4", "S5"]
+    db.close()
+    man = json.loads((arch / fno_clear.MANIFEST).read_text())
+    assert man["days"] == DAY and len(man["items"]) == 1 and man["backtest_edits"] == []   # the fixture's store is unpublished
+    assert "of 2026-10-16" in (arch / "CLEARED.txt").read_text()
+
+
+def test_one_day_backtest_drops_only_that_source_and_day(data):
+    home, env = data
+    publish(env)
+    bt = home / "backtest"
+    wo = bt / "without_zero_volume" / "SENSEX"
+    with_store = tree(str(bt / "with_zero_volume"))
+    kite, eod = tree(str(wo / "minute" / "kite")), tree(str(wo / "eod"))
+    keep = {n: tree(str(wo)).get(n) for n in ("contracts.parquet", "expiries.csv")}
+    man_before = json.loads((wo / "publish_manifest.json").read_text())
+    assert set(man_before["days"][DAY]) >= {"kite", "dhan"}
+    code, out = one_day(env, apply=True)
+    assert code == 0, out
+    assert tree(str(bt / "with_zero_volume")) == with_store
+    assert tree(str(wo / "minute" / "kite")) == kite and tree(str(wo / "eod")) == eod
+    assert {n: tree(str(wo)).get(n) for n in keep} == keep
+    assert not (wo / "minute" / "dhan" / "2026" / f"{DAY}.parquet").exists()
+    assert (wo / "minute" / "dhan" / "2026" / "2026-10-15.parquet").exists()
+    man = json.loads((wo / "publish_manifest.json").read_text())
+    assert "dhan" not in man["days"][DAY] and man["days"][DAY]["kite"] == man_before["days"][DAY]["kite"]
+    assert man["days"][DAY].get("eod_source") == man_before["days"][DAY].get("eod_source")
+    assert {d: v for d, v in man["days"].items() if d != DAY} == {d: v for d, v in man_before["days"].items() if d != DAY}
+    with open(wo / "days.csv", newline="", encoding="utf-8") as f:
+        rows = {r["date"]: r for r in csv.DictReader(f)}
+    assert rows[DAY]["dhan_available"] == "False" and rows[DAY]["kite_available"] == "True"
+    assert rows["2026-10-15"]["dhan_available"] == "True"
+    arch = home / "archive" / ARCHIVE / "backtest" / "without_zero_volume" / "SENSEX"
+    assert (arch / "minute" / "dhan" / "2026" / f"{DAY}.parquet").exists()
+    assert json.loads((arch / "publish_manifest.json").read_text()) == man_before and (arch / "days.csv").exists()
+    edits = json.loads((home / "archive" / ARCHIVE / fno_clear.MANIFEST).read_text())["backtest_edits"]
+    assert [(e["date"], e["source"]) for e in edits] == [(DAY, "dhan")]
+    lines = []
+    assert fno_clear.restore(str(home / "archive" / ARCHIVE), log=lines.append) == 0
+    assert "python fno_store.py publish" in "\n".join(lines)
+    publish(env)                                                                     # the raw day is gone: stays out
+    assert "dhan" not in json.loads((wo / "publish_manifest.json").read_text())["days"][DAY]
+
+
+def test_one_day_restore(data):
+    home, env = data
+    add_day_rows(home)
+    before, rows = store_tree(home, *WO), runs(home / "raw" / "dhan" / "without_zero_volume")
+    assert one_day(env, apply=True)[0] == 0
+    arch = str(home / "archive" / ARCHIVE)
+    lines = []
+    assert fno_clear.restore(arch, apply=True, log=lines.append) == 0, lines
+    assert store_tree(home, *WO) == before and runs(home / "raw" / "dhan" / "without_zero_volume") == rows
+    lines = []
+    assert fno_clear.restore(arch, apply=True, log=lines.append) == 1
+    assert "REFUSED" in "\n".join(lines) and "not in the archive" in "\n".join(lines)   # already put back
+
+
+def test_cli_date_options(data, monkeypatch, capsys):
+    home, env = data
+    monkeypatch.setattr(cli, "load_env", lambda: env)
+    before = tree(str(home))
+    assert cli.main(["clear", "--underlying", "SENSEX", "--date", "2026-10-09", "--date", DAY]) == 0
+    out = capsys.readouterr().out
+    assert "of 2026-10-09, 2026-10-16" in out and out.count("  archive 2026-10-") == 2 * 4   # 2 days in 4 stores
+    assert tree(str(home)) == before
+    for bad in (["--date", DAY, "--from", "2026-10-15"], ["--from", DAY, "--to", "2026-10-15"]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["clear", "--underlying", "SENSEX", *bad])
+        assert e.value.code == 1
+    assert cli.main(["clear", "--underlying", "SENSEX", "--source", "kite", "--variant", "with",
+                     "--from", "2026-10-15", "--to", DAY, "--apply", "--yes"]) == 0
+    days = sensex_days(home)
+    assert days[("kite", "with_zero_volume")] == ["2026-10-09"]
+    assert all(v == LOST + OK for k, v in days.items() if k != ("kite", "with_zero_volume"))

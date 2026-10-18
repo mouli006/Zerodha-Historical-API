@@ -4,6 +4,7 @@ from datetime import date, datetime
 
 import pytest
 
+import config
 import dashboard
 import nifty_daily
 from app import app
@@ -341,6 +342,13 @@ def test_cli_lock_busy(cli, monkeypatch, tmp_path):
 def test_success_page_has_keep_zero_switch(client):
     html = client.get("/success").get_data(as_text=True)
     assert "Keep contracts with candles but zero volume" in html and '"keep_zero_volume": false' in html
+
+
+def test_success_page_keep_zero_defaults_on(client, monkeypatch):
+    """No KEEP_ZERO_VOLUME in .env: the Kite F&O card starts with the switch ON (config.KEEP_ZERO_VOLUME)."""
+    monkeypatch.setattr(config, "load_env", lambda: {})
+    monkeypatch.setattr(dashboard, "keep_zero_volume", config.keep_zero_volume)
+    assert '"keep_zero_volume": true' in client.get("/success").get_data(as_text=True)
 
 
 def test_fno_start_passes_keep_zero(client, tmp_path, monkeypatch):

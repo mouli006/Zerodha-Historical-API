@@ -16,13 +16,21 @@ Nothing is deleted by default: everything moves into <home>\\archive\\<YYYY-MM-D
 relative to <home> (the common folder of the .env bases, e.g. D:\\Data\\fno), the rows into progress_<u>.sqlite next to
 it, with clear_manifest.json (read by restore) and CLEARED.txt. Days outside the download window can never be
 downloaded again, so the dry run says which cleared days are lost for good. --apply --delete removes instead (typed
-confirmation, interactive terminal only). Dry run by default; run by hand."""
+confirmation, interactive terminal only). Dry run by default; run by hand.
+
+With a date filter (--date D, repeatable, or --from / --to) only those days go: their day folders (and .part
+folders), the progress rows of exactly their run keys (fno.run_key; range keys stay), and in the backtest store of
+each variant in scope only those days of the sources in scope (minute\\<source>\\<YYYY>\\<date>.parquet archived,
+the day's publish_manifest.json entry for that source dropped and days.csv rewritten; a copy of both is kept in the
+archive; EOD, contracts.parquet, expiries.csv and the other source stay, the next publish rebuilds the rest). Every
+other file of a root stays; the day count (_DAYS-*.txt, days_index.csv) is rewritten."""
 import json
 import os
 import shutil
 import sqlite3
 import sys
 from datetime import date
+from typing import Callable, NamedTuple
 
 from config import FNO_RAW_KEYS, VARIANTS, weekly_expiry_weekday
 
@@ -46,13 +54,68 @@ def prefix(underlying, source):
     return f"{'fno' if source == 'kite' else f'fno-{source}'}:{underlying}:"
 
 
-def count_rows(db_path, prefixes):
+class DayFilter(NamedTuple):
+    keep: Callable    # date -> bool
+    label: str        # "2026-10-16" / "2026-10-14 to 2026-10-16" / "from 2026-10-14"
+
+
+def day_filter(dates=(), date_from=None, date_to=None):
+    """The days clear keeps to (--date, repeatable, or --from / --to), or None: the whole underlying."""
+    if dates:
+        dates = set(dates)
+        return DayFilter(lambda d: d in dates, ", ".join(map(str, sorted(dates))))
+    if date_from or date_to:
+        label = (f"{date_from} to {date_to}" if date_from and date_to
+                 else f"from {date_from}" if date_from else f"up to {date_to}")
+        return DayFilter(lambda d: (not date_from or d >= date_from) and (not date_to or d <= date_to), label)
+    return None
+
+
+def run_day(run):
+    """The trading day of a per-day run key (fno.run_key), else None (range / missing-days keys)."""
+    try:
+        return date.fromisoformat(run.rsplit(":", 1)[1])
+    except (IndexError, ValueError):
+        return None
+
+
+def match(prefixes, runs=()):
+    """(SQL condition, params): exactly the run keys runs when given (a date filter), else every key that starts
+    with one of the prefixes."""
+    if runs:
+        return f"run IN ({', '.join('?' * len(runs))})", list(runs)
+    return " OR ".join("substr(run, 1, ?) = ?" for _ in prefixes), [x for p in prefixes for x in (len(p), p)]
+
+
+def has_chunks(db):
+    return bool(db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone())
+
+
+def day_runs(db_path, prefixes, keep):
+    """The per-day run keys of the prefixes in db_path whose day passes keep (sorted)."""
+    if not os.path.exists(db_path):
+        return []
+    db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    try:
+        if not has_chunks(db):
+            return []
+        cond, params = match(prefixes)
+        found = [r[0] for r in db.execute(f"SELECT DISTINCT run FROM chunks WHERE {cond}", params)]
+    finally:
+        db.close()
+    return sorted(r for r in found if (d := run_day(r)) and keep(d))
+
+
+def count_rows(db_path, prefixes, runs=()):
     if not os.path.exists(db_path):
         return 0
     db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     try:
-        if not db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='chunks'").fetchone():
+        if not has_chunks(db):
             return 0
+        if runs:
+            cond, params = match(prefixes, runs)
+            return db.execute(f"SELECT COUNT(*) FROM chunks WHERE {cond}", params).fetchone()[0]
         return sum(db.execute("SELECT COUNT(*) FROM chunks WHERE substr(run, 1, ?) = ?", (len(p), p)).fetchone()[0]
                    for p in prefixes)
     finally:
@@ -79,9 +142,16 @@ def rel_to(path, home):
     return os.path.join(drive.rstrip(":") or "root", rest.lstrip("\\/"))
 
 
-def plan_clear(underlying, sources, variants, backtest, env):
-    """{"roots": [...], "dbs": [...], "backtest": [...]} of everything in scope (reads only)."""
-    roots, dbs, bt = [], {}, []
+def in_filter(name, path, days):
+    """True for a day folder (or its .part) of a day the filter keeps."""
+    parsed = fno.parse_day_folder(name[:-len(".part")] if name.endswith(".part") else name)
+    return bool(parsed and os.path.isdir(path) and days.keep(parsed[0]))
+
+
+def plan_clear(underlying, sources, variants, backtest, env, days=None):
+    """{"roots": [...], "dbs": [...], "backtest": [...], "backtest_days": [...]} of everything in scope (reads
+    only). days (day_filter) limits it to those days: see the module notes."""
+    roots, dbs, bt, bt_days = [], {}, [], []
     for source in sources:
         base = os.path.normpath(env[FNO_RAW_KEYS[source]])
         saves = [os.path.join(base, VARIANTS[v]) for v in variants]
@@ -90,27 +160,86 @@ def plan_clear(underlying, sources, variants, backtest, env):
         for save in saves:
             root = fno.fno_root(save, underlying, source)
             if os.path.isdir(root):
-                days = fno.day_folders(root)
+                found = fno.day_folders(root)
                 items, kept = [], []
                 for n in sorted(os.listdir(root)):
                     path = os.path.join(root, n)
+                    if days:   # only the filtered days' folders; markers are rewritten, the rest stays
+                        if in_filter(n, path, days):
+                            items.append(path)
+                        else:
+                            kept.append(n)
+                        continue
                     parsed = fno.parse_day_folder(n)
                     if (parsed and os.path.isdir(path)) or (n.endswith(".part") and os.path.isdir(path)) \
                             or fno_days.MARKER_RE.fullmatch(n) or n in CLEAR_FILES:
                         items.append(path)
                     else:
                         kept.append(n)
-                roots.append({"root": root, "source": source, "items": items, "kept": kept, "days": sorted(days)})
+                roots.append({"root": root, "source": source, "items": items, "kept": kept,
+                              "days": sorted(d for d in found if not days or days.keep(d))})
             db = os.path.join(save, "progress.sqlite")
             dbs.setdefault(db, set()).add(prefix(underlying, source))
-    db_list = [{"live": p, "prefixes": sorted(px), "rows": count_rows(p, px)} for p, px in dbs.items()]
+    db_list = []
+    for p, px in dbs.items():
+        if days:
+            runs = day_runs(p, px, days.keep)
+            db_list.append({"live": p, "prefixes": sorted(px), "runs": runs, "rows": count_rows(p, px, runs) if runs else 0})
+        else:
+            db_list.append({"live": p, "prefixes": sorted(px), "rows": count_rows(p, px)})
     if backtest and env.get("FNO_BACKTEST_DIR"):
         out = os.path.normpath(env["FNO_BACKTEST_DIR"])
-        cands = [os.path.join(out, VARIANTS[v], underlying) for v in variants]
-        if len(variants) == len(VARIANTS):
-            cands.append(os.path.join(out, underlying))
-        bt = [p for p in cands if os.path.isdir(p)]
-    return {"roots": roots, "dbs": [d for d in db_list if d["rows"]], "backtest": bt}
+        if days:
+            bt_days = published_days(out, underlying, sources, variants, days)
+        else:
+            cands = [os.path.join(out, VARIANTS[v], underlying) for v in variants]
+            if len(variants) == len(VARIANTS):
+                cands.append(os.path.join(out, underlying))
+            bt = [p for p in cands if os.path.isdir(p)]
+    return {"roots": roots, "dbs": [d for d in db_list if d["rows"]], "backtest": bt, "backtest_days": bt_days}
+
+
+def published_days(out, underlying, sources, variants, days):
+    """[{"store", "date", "source", "file" (the minute parquet or None), "entry" (in the manifest)}] of the filtered
+    days of the sources in the backtest store of each variant (<out>\\<variant>\\<U>; never the old layout)."""
+    from .fno_publish import load_manifest, minute_path
+    found = []
+    for v in variants:
+        out_u = os.path.join(out, VARIANTS[v], underlying)
+        if not os.path.isdir(out_u):
+            continue
+        man = load_manifest(out_u)["days"]
+        for source in sources:
+            dates = {d for d, e in man.items() if source in e}
+            folder = os.path.join(out_u, "minute", source)
+            if os.path.isdir(folder):
+                for year in os.listdir(folder):
+                    for n in os.listdir(os.path.join(folder, year)) if os.path.isdir(os.path.join(folder, year)) else []:
+                        if n.endswith(".parquet"):
+                            dates.add(n[:-len(".parquet")])
+            for d in sorted(dates):
+                try:
+                    if not days.keep(date.fromisoformat(d)):
+                        continue
+                except ValueError:
+                    continue
+                path = minute_path(out_u, source, d)
+                found.append({"store": out_u, "date": d, "source": source,
+                              "file": path if os.path.exists(path) else None, "entry": source in man.get(d, {})})
+    return found
+
+
+def drop_published(out_u, pairs):
+    """Remove the (date, source) pairs from out_u's publish_manifest.json and rewrite days.csv from it (the
+    minute files are moved by the caller). A day left without any source goes from both."""
+    from .fno_publish import MANIFEST as PUBLISHED, SOURCES, _json, load_manifest, write_atomic, write_days
+    man = load_manifest(out_u)
+    for day, source in pairs:
+        man["days"].get(day, {}).pop(source, None)
+        if day in man["days"] and not any(s in man["days"][day] for s in SOURCES):
+            del man["days"][day]
+    write_days(out_u, man["days"], "kite")
+    write_atomic(os.path.join(out_u, PUBLISHED), lambda tmp: _json(tmp, man))
 
 
 def window_lines(underlying, roots, today=None, also=(), also_label="Correct data"):
@@ -154,15 +283,26 @@ def write_json(path, obj):
 
 
 def write_cleared(archive, man, window):
-    lines = [f"Cleared {man['underlying']} F&O data on {man['created']} IST",
+    days = man.get("days")
+    lines = [f"Cleared {man['underlying']} F&O data" + (f" of {days}" if days else "") + f" on {man['created']} IST",
              f"Command: {man['command']}", "", *window, "", f"Moved items ({len(man['items'])}):"]
     lines += [f"  {i['src']} -> {i['dst']}" for i in man["items"]]
     lines += ["", "Progress rows (removed from the live databases, kept in the archive):"]
     lines += [f"  {d['live']}: {d['rows']:,} rows -> {d['archive']}" for d in man["dbs"]]
-    lines += ["", "Kept in place: expiries_seen.csv, holidays.log and .lock of every root; a fresh _DAYS-0.txt and "
-                  "empty days_index.csv were written.",
-              "", "To put everything back (refused for any path that exists again):",
+    if man.get("backtest_edits"):
+        lines += ["", "Backtest store entries removed (publish_manifest.json and days.csv rewritten; copies before "
+                      "the change kept in the archive):"]
+        lines += [f"  {e['store']}: {e['date']} {e['source']} (backup {e['backup']})" for e in man["backtest_edits"]]
+    if days:
+        lines += ["", "Kept in place: every other day folder and file of each root (expiries_seen.csv, holidays.log, "
+                      ".lock, bhavcopy.log); the day count (_DAYS-*.txt, days_index.csv) was rewritten."]
+    else:
+        lines += ["", "Kept in place: expiries_seen.csv, holidays.log and .lock of every root; a fresh _DAYS-0.txt and "
+                      "empty days_index.csv were written."]
+    lines += ["", "To put everything back (refused for any path that exists again):",
               f'  python fno_store.py restore --from "{archive}"  (dry run; add --apply)']
+    if man.get("backtest_edits"):
+        lines.append("  then python fno_store.py publish (adds the restored days to the backtest store again)")
     path = os.path.join(archive, CLEARED)
     with open(path + ".tmp", "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines) + "\n")
@@ -192,12 +332,13 @@ def remove_item(path):
     shutil.rmtree(path) if os.path.isdir(path) else os.remove(path)
 
 
-def copy_rows(live, archive_db, prefixes):
-    """The live db's rows of the prefixes into archive_db (created with the chunks schema)."""
+def copy_rows(live, archive_db, prefixes, runs=()):
+    """The live db's rows of the prefixes (or exactly the run keys runs) into archive_db (created with the chunks
+    schema)."""
     src = sqlite3.connect(f"file:{live}?mode=ro", uri=True)
     try:
-        cur = src.execute("SELECT * FROM chunks WHERE " + " OR ".join("substr(run, 1, ?) = ?" for _ in prefixes),
-                          [x for p in prefixes for x in (len(p), p)])
+        cond, params = match(prefixes, runs)
+        cur = src.execute(f"SELECT * FROM chunks WHERE {cond}", params)
         cols, rows = [d[0] for d in cur.description], cur.fetchall()
     finally:
         src.close()
@@ -219,12 +360,16 @@ def copy_rows(live, archive_db, prefixes):
     return len(rows)
 
 
-def delete_rows(live, prefixes):
+def delete_rows(live, prefixes, runs=()):
     db = sqlite3.connect(live)
     try:
-        n = 0
-        for p in prefixes:
-            n += db.execute("DELETE FROM chunks WHERE substr(run, 1, ?) = ?", (len(p), p)).rowcount
+        if runs:
+            cond, params = match(prefixes, runs)
+            n = db.execute(f"DELETE FROM chunks WHERE {cond}", params).rowcount
+        else:
+            n = 0
+            for p in prefixes:
+                n += db.execute("DELETE FROM chunks WHERE substr(run, 1, ?) = ?", (len(p), p)).rowcount
         db.commit()
         return n
     finally:
@@ -241,8 +386,9 @@ def rewrite_counts(roots, log):
 
 
 def clear(underlying, sources, variants, env, backtest=True, archive_to=None, apply=False, delete=False, yes=False,
-          command="", log=print, ask=input, interactive=None):
-    """See the module notes. Returns the exit code: 0 done or dry run, 1 not run, refused or stopped by an error."""
+          command="", log=print, ask=input, interactive=None, days=None):
+    """See the module notes; days (day_filter) clears only those days. Returns the exit code: 0 done or dry run,
+    1 not run, refused or stopped by an error."""
     interactive = interactive if interactive is not None else (lambda: sys.stdin.isatty())
     if not underlying:
         log("Not run: give --underlying (there is no default, so nothing is cleared by accident).")
@@ -278,7 +424,7 @@ def clear(underlying, sources, variants, env, backtest=True, archive_to=None, ap
             log(f"Not run: the archive folder {archive} already exists.")
             return 1
     try:
-        scope = plan_clear(underlying, sources, variants, backtest, env)
+        scope = plan_clear(underlying, sources, variants, backtest, env, days)
     except fno.DayFolderError as e:
         log(f"Not run: {e}")
         return 1
@@ -288,36 +434,56 @@ def clear(underlying, sources, variants, env, backtest=True, archive_to=None, ap
         log(f"Not run: {e}")
         return 1
     try:
-        return run_clear(scope, underlying, env, home, archive, apply, delete, yes, command, log, ask, interactive)
+        return run_clear(scope, underlying, env, home, archive, apply, delete, yes, command, log, ask, interactive,
+                         days=days)
     finally:
         for lock in locks:
             lock.release()
 
 
 def run_clear(scope, underlying, env, home, archive, apply, delete, yes, command, log, ask, interactive, label="Clear",
-              also=(), dry_tail=True):
+              also=(), dry_tail=True, days=None):
     target = (lambda p: os.path.join(archive, rel_to(p, home))) if archive else (lambda p: "(deleted)")
-    items = [(p, "item") for r in scope["roots"] for p in r["items"]] + [(p, "backtest") for p in scope["backtest"]]
+    bt_days = scope.get("backtest_days", [])
+    items = [(p, "item") for r in scope["roots"] for p in r["items"]] + [(p, "backtest") for p in scope["backtest"]]         + [(b["file"], "backtest") for b in bt_days if b["file"]]
+    edits = {}   # backtest store -> [(date, source)] to drop from its manifest and days.csv
+    for b in bt_days:
+        if b["entry"]:
+            edits.setdefault(b["store"], []).append((b["date"], b["source"]))
     verb = "delete" if delete else "archive"
-    log(f"== {label} {underlying} F&O data ({'DELETE, no archive' if delete else f'archive: {archive}'})")
+    log(f"== {label} {underlying} F&O data" + (f" of {days.label}" if days else "")
+        + f" ({'DELETE, no archive' if delete else f'archive: {archive}'})")
     for r in scope["roots"]:
         log(f"{r['root']}:")
         for p in r["items"]:
             log(f"  {verb} {os.path.basename(p)}" + ("" if delete else f" -> {target(p)}"))
-        log(f"  keep {', '.join(r['kept']) or '(nothing)'}")
+        if days:
+            log(f"  keep everything else ({len(r['kept'])} entries); the day count (_DAYS-*.txt, days_index.csv) is rewritten")
+        else:
+            log(f"  keep {', '.join(r['kept']) or '(nothing)'}")
     for d in scope["dbs"]:
-        log(f"{d['live']}: {verb} {d['rows']:,} progress rows ({' / '.join(d['prefixes'])}*)"
+        keys = ", ".join(d["runs"]) if d.get("runs") else " / ".join(d["prefixes"]) + "*"
+        log(f"{d['live']}: {verb} {d['rows']:,} progress rows ({keys})"
             + ("" if delete else f" -> {target(os.path.join(os.path.dirname(d['live']), f'progress_{underlying.lower()}.sqlite'))}"))
     for p in scope["backtest"]:
         log(f"backtest: {verb} {p}" + ("" if delete else f" -> {target(p)}"))
     if scope["backtest"]:
         log("  (the backtest folders hold every broker; the next publish rebuilds them from the raw data that is left)")
+    for b in bt_days:
+        log(f"backtest {b['store']}: {b['date']} {b['source']}: "
+            + (f"{verb} {b['file']}" + ("" if delete else f" -> {target(b['file'])}") if b["file"] else "no minute file")
+            + ("; publish_manifest.json entry removed, days.csv rewritten" if b["entry"] else "; not in publish_manifest.json"))
+    if bt_days:
+        log("  (EOD, contracts.parquet, expiries.csv and the other source's data of those days stay; "
+            "the next publish rebuilds what is needed)")
     window, lost = window_lines(underlying, scope["roots"], also=also)
     for line in window:
         log(line)
     n_rows = sum(d["rows"] for d in scope["dbs"])
-    log(f"Totals: {len(items)} folders/files, {n_rows:,} progress rows in {len(scope['dbs'])} databases.")
-    if not items and not n_rows:
+    n_edits = sum(map(len, edits.values()))
+    log(f"Totals: {len(items)} folders/files, {n_rows:,} progress rows in {len(scope['dbs'])} databases"
+        + (f", {n_edits} backtest store entries" if days else "") + ".")
+    if not items and not n_rows and not n_edits:
         log("Nothing to clear.")
         return 0
     if not apply:
@@ -339,6 +505,8 @@ def run_clear(scope, underlying, env, home, archive, apply, delete, yes, command
     from .fno import now_ist
     man = {"underlying": underlying, "created": f"{now_ist():%Y-%m-%d %H:%M:%S}", "command": command, "home": home,
            "roots": [r["root"] for r in scope["roots"]], "items": [], "dbs": []}
+    if days:
+        man.update({"days": days.label, "backtest_edits": []})
     done, touched = [], [r["root"] for r in scope["roots"]]
     try:
         if not delete:
@@ -346,7 +514,7 @@ def run_clear(scope, underlying, env, home, archive, apply, delete, yes, command
             write_json(os.path.join(archive, MANIFEST), man)
             for d in scope["dbs"]:
                 arch = target(os.path.join(os.path.dirname(d["live"]), f"progress_{underlying.lower()}.sqlite"))
-                rows = copy_rows(d["live"], arch, d["prefixes"])
+                rows = copy_rows(d["live"], arch, d["prefixes"], d.get("runs", ()))
                 man["dbs"].append({"live": d["live"], "archive": arch, "prefixes": d["prefixes"], "rows": rows})
                 write_json(os.path.join(archive, MANIFEST), man)
         for p, kind in items:
@@ -358,8 +526,20 @@ def run_clear(scope, underlying, env, home, archive, apply, delete, yes, command
                 write_json(os.path.join(archive, MANIFEST), man)
             done.append(p)
         for d in scope["dbs"]:
-            delete_rows(d["live"], d["prefixes"])
-    except (OSError, sqlite3.Error) as e:
+            delete_rows(d["live"], d["prefixes"], d.get("runs", ()))
+        for store, pairs in edits.items():
+            backup = None
+            if not delete:   # the manifest and days.csv as they were, next to the archived minute files
+                backup = target(store)
+                os.makedirs(backup, exist_ok=True)
+                for n in ("publish_manifest.json", "days.csv"):
+                    if os.path.exists(os.path.join(store, n)):
+                        shutil.copy2(os.path.join(store, n), os.path.join(backup, n))
+            drop_published(store, pairs)
+            if not delete:
+                man["backtest_edits"] += [{"store": store, "date": d, "source": s, "backup": backup} for d, s in pairs]
+                write_json(os.path.join(archive, MANIFEST), man)
+    except (OSError, sqlite3.Error, ValueError) as e:
         log(f"Stopped: {type(e).__name__}: {e}")
         log(f"{'Deleted' if delete else 'Moved'} before the error ({len(done)}):" + "".join(f"\n  {p}" for p in done))
         log("Progress rows were not removed." + ("" if delete else f" Restore with: python fno_store.py restore --from \"{archive}\""))
@@ -442,6 +622,10 @@ def restore(archive, apply=False, log=print):
             if keep:
                 log(f"  restore {len(keep)} run keys of progress rows into {d['live']}")
                 rows_plan.append((d, keep))
+        published = sorted({(e["date"], e["source"]) for e in man.get("backtest_edits", [])})
+        if published:
+            log("  backtest store entries are not put back: after the restore run python fno_store.py publish, which "
+                "adds " + ", ".join(f"{d} {s}" for d, s in published) + " again from the restored raw days")
         if not apply:
             log("Dry run: nothing changed. Run again with --apply to restore.")
             return code

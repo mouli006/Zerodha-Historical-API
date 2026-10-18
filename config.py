@@ -172,9 +172,9 @@ def weekly_expiry_weekday(underlying="NIFTY"):
 
 
 # "Keep contracts with candles but zero volume" (backfill/fno.py): Kite can report a contract that
-# traded once as candles with volume 0. False = no file for those (the old rule); .env KEEP_ZERO_VOLUME
-# (ON/OFF) overrides this default.
-KEEP_ZERO_VOLUME = False
+# traded once as candles with volume 0. True = keep a file for those (saved to the with_zero_volume store, from
+# which the without copy is derived); False = no file (the old rule). .env KEEP_ZERO_VOLUME (ON/OFF) overrides.
+KEEP_ZERO_VOLUME = True
 
 
 def keep_zero_volume():
