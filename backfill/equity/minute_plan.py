@@ -986,6 +986,7 @@ def build_outputs(folder, inp, now=None, log=print):
                          "reason": "KITE_MINUTE_START", "exit_note": "", "indices": "", "median_turnover": None,
                          "priority": 1, "note": f"Kite has no 1-minute candles before {KITE_MINUTE_FROM} for any "
                                                 f"stock; {len(early_ids):,} probed stocks traded then"})
+    gap_rows = minute_gap_rows(folder, o, gap_rows, states, usable)
     plan = pd.DataFrame(plan_rows, columns=PLAN_COLUMNS)
     gap = pd.DataFrame(gap_rows, columns=GAP_COLUMNS)
     gap["_t"] = pd.to_numeric(gap["median_turnover"], errors="coerce")
@@ -1012,6 +1013,76 @@ def build_outputs(folder, inp, now=None, log=print):
     log(text, end="")
     return {"out": out, "plan": plan, "gaps": gap, "coverage": coverage, "periods": periods,
             "mismatches": mismatches, "info": info, "report": text}
+
+
+def stored_minute_days(folder):
+    """{security_id: dates with stored 1-minute candles} from the phase 2 download's data/<sid>/days.parquet ({} before
+    any stock is downloaded)."""
+    base = os.path.join(out_dir(folder), "data")
+    out = {}
+    if not os.path.isdir(base):
+        return out
+    for sid in sorted(os.listdir(base)):
+        path = os.path.join(base, sid, "days.parquet")
+        if os.path.isfile(path):
+            t = pq.read_table(path, columns=["date", "minute_rows"]).to_pandas()
+            out[sid] = {sm.as_date(d) for d, n in zip(t["date"], t["minute_rows"]) if n > 0}
+    return out
+
+
+def minute_gap_rows(folder, o, gap_rows, states, usable):
+    """The phase 2 download's corrections: days of KITE_MISSING_SESSION / EOD_EMPTY_DAYS rows that do have stored
+    1-minute candles leave the 1-minute part (BOTH -> EOD; a run where only some days have minutes is split), and
+    check/minute_empty_days.csv adds 1MIN / MINUTE_EMPTY_DAYS rows. Nothing stored yet -> the rows unchanged."""
+    have = stored_minute_days(folder)
+    out = []
+    for g in gap_rows:
+        if have and g["reason"] == "EOD_EMPTY_DAYS" and g["security_id"] in have:
+            sid, mins = g["security_id"], have[g["security_id"]]
+            a, b, missing = sm.as_date(g["need_from"]), sm.as_date(g["need_to"]), set(states[sid]["missing"])
+            days = [d for d in states[sid]["days"] if a <= d <= b and d in missing]
+            if not any(d in mins for d in days):
+                out.append(g)
+                continue
+            groups = []
+            for d in days:
+                if groups and groups[-1][0] == (d in mins):
+                    groups[-1][1].append(d)
+                else:
+                    groups.append([d in mins, [d]])
+            for with_min, ds in groups:
+                n = len(ds)
+                out.append(o.row("EOD" if with_min else "BOTH", sid, ds[0], ds[-1], "EOD_EMPTY_DAYS",
+                                 f"{n} bhavcopy day(s) without a Kite day candle" +
+                                 ("; Kite has 1-minute candles on them" if with_min else ""), trading_days=n))
+        elif have and g["reason"] == "KITE_MISSING_SESSION":
+            d = sm.as_date(g["need_from"])
+            lacking = [sid for sid in usable if d in states[sid].get("missing_all", states[sid]["missing"])]
+            k = sum(1 for sid in lacking if d in have.get(sid, ()))
+            if not k:
+                out.append(g)
+            elif k == len(lacking):
+                out.append({**g, "data_missing": "EOD",
+                            "note": g["note"] + f"; Kite has 1-minute candles for all {k:,} of them"})
+            else:
+                out.append({**g, "data_missing": "EOD",
+                            "note": g["note"] + f"; Kite has 1-minute candles for {k:,} of them"})
+                out.append({**g, "data_missing": "BOTH",
+                            "note": g["note"] + f"; {len(lacking) - k:,} of them have no 1-minute candles either"})
+        else:
+            out.append(g)
+    path = os.path.join(out_dir(folder), "check", "minute_empty_days.csv")
+    if os.path.isfile(path):
+        for r in pd.read_csv(path, dtype=str, keep_default_na=False).itertuples():
+            a, b, n = sm.as_date(r.from_date), sm.as_date(r.to_date), int(r.days)
+            if r.security_id:
+                if r.security_id in o.inp.by_id:
+                    out.append(o.row("1MIN", r.security_id, a, b, "MINUTE_EMPTY_DAYS", r.note, trading_days=n))
+            else:
+                out.append({"data_missing": "1MIN", "security_id": "", "symbols": "", "isins": "", "company_name": "",
+                            "need_from": iso(a), "need_to": iso(b), "trading_days": n, "reason": "MINUTE_EMPTY_DAYS",
+                            "exit_note": "", "indices": "", "median_turnover": None, "priority": 1, "note": r.note})
+    return out
 
 
 def gaps_of(o, s, u):

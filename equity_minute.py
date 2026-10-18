@@ -9,6 +9,12 @@ Downloads no candles to keep.
     python equity_minute.py gaps                  rebuild plan.csv, kite_gaps.csv, ... offline
     python equity_minute.py show RELIANCE         the plan, token, gaps and adjustment periods of one company
 
+Phase 2 (backfill/equity/minute_download.py), each with --folder:
+    python equity_minute.py download [--dry-run] [--priority 1|2|3] [--symbols A,B] [--limit N] [--speed 2.5]
+                                     [--workers 2]    the 1-minute history of every plan stock (resumable)
+    python equity_minute.py update [--speed 2.5] [--workers 2]   the evening update, after equity_update.py
+    python equity_minute.py status                progress, offline
+
 Every command takes --folder (absolute; default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data) and --include-etf.
 Output: <folder>/equity_1min/plan/. Only tokens (not --rematch) and probe use the network (Kite only; the token
 from .env is never printed). Exit codes: 0 done; 1 an input not built or stale, tokens not run yet (or no saved list
@@ -23,6 +29,7 @@ import pandas as pd
 from backfill.equity import adjustments as adj
 from backfill.equity import exits as ex
 from backfill.equity import index_membership as im
+from backfill.equity import minute_download as md
 from backfill.equity import minute_plan as mp
 from backfill.equity import security_master as sm
 from config import equity_data_dir
@@ -40,6 +47,27 @@ def fraction(text):
     if not 0 < v < 1:
         raise argparse.ArgumentTypeError("must be between 0 and 1")
     return v
+
+
+def positive(text):
+    v = int(text)
+    if v < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return v
+
+
+def run_result(stats, cmd):
+    """Exit code of a download / update run: 0 done or stopped by the user, 1 some chunks failed."""
+    print(f"{cmd}: {stats['stocks']:,} stocks, {stats['built']:,} built, {stats['chunks']:,} chunks, "
+          f"{stats['rows']:,} rows, {stats['requests']:,} requests, {stats['n429']:,} x 429, "
+          f"{stats['failed_chunks']:,} failed")
+    if stats["stopped"]:
+        print("Stopped, resume with the same command.", file=sys.stderr)
+        return 0
+    if stats["failed_chunks"]:
+        print("Some chunks FAILED: run the same command again to retry them.", file=sys.stderr)
+        return 1
+    return 0
 
 
 def show(key, folder):
@@ -99,6 +127,17 @@ def main(argv=None):
     for sp in sub.choices.values():
         sp.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
         sp.add_argument("--include-etf", action="store_true", help="also ETFs (rights entitlements never)")
+    dl = sub.add_parser("download", help="phase 2: the 1-minute history of every stock in plan.csv (resumable)")
+    dl.add_argument("--dry-run", action="store_true", help="show the work list figures only")
+    dl.add_argument("--priority", type=int, choices=(1, 2, 3), help="only this group (1 NIFTY 50, 2 NIFTY 500, 3 rest)")
+    dl.add_argument("--symbols", help="only these companies, comma-separated (any symbol they ever had)")
+    dl.add_argument("--limit", type=positive, help="at most this many stocks still to download")
+    up = sub.add_parser("update", help="phase 2: the evening update (after equity_update.py)")
+    st = sub.add_parser("status", help="phase 2: download progress, offline")
+    for sp in (dl, up, st):
+        sp.add_argument("--speed", type=speed, default=md.SPEED, help="requests per second (default 2.5, at most 3)")
+        sp.add_argument("--workers", type=int, choices=(1, 2), default=md.WORKERS, help="parallel workers (default 2)")
+        sp.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
     args = p.parse_args(argv)   # argparse errors exit with 2
     if args.folder and not os.path.isabs(args.folder):
         p.error("--folder must be an absolute path")
@@ -122,11 +161,23 @@ def main(argv=None):
             result = mp.gaps(folder, include_etf=args.include_etf)
             print(f"Written to {result['out']}")
             return 0
+        if args.cmd == "download":
+            symbols = [s.strip() for s in args.symbols.split(",") if s.strip()] if args.symbols else None
+            result = md.download(folder, priority=args.priority, symbols=symbols, limit=args.limit, speed=args.speed,
+                                 workers=args.workers, dry_run=args.dry_run)
+            if result["dry_run"]:
+                return 0
+            return run_result(result["stats"], "download")
+        if args.cmd == "update":
+            return run_result(md.update(folder, speed=args.speed, workers=args.workers)["stats"], "update")
+        if args.cmd == "status":
+            md.status(folder, speed=args.speed, workers=args.workers)
+            return 0
         return show(args.key, folder)
     except mp.SignInNeeded as e:
         print(f"Kite sign-in needed: {e}", file=sys.stderr)
         return 2
-    except (mp.LockBusy, mp.StoreBusy, mp.FnoBusy) as e:
+    except (mp.LockBusy, mp.StoreBusy, mp.FnoBusy, md.NotEnoughDisk) as e:
         print(f"Not run: {e}", file=sys.stderr)
         return 2
     except (mp.MinutePlanError, sm.SecurityMasterError, adj.AdjustmentError, ex.ExitsError,

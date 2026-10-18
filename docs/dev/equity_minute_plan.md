@@ -158,6 +158,9 @@ Every file is rebuilt in full and written atomically under `<folder>\equity_1min
     lists. `exit_note`: "into ACQUIRER, swap ratio" plus the exit list's note. `indices`: membership periods
     overlapping the gap, "(before reliable_from)" where so. `trading_days` and `median_turnover` (Rs crore per day)
     from the bhavcopy rows in the gap. `priority`: 1 in NIFTY 50 during the gap, 2 in NIFTY 500, else 3.
+  - After the phase 2 download (docs/dev/equity_minute_download.md): stored minutes take days out of the 1-minute
+    part of `KITE_MISSING_SESSION` / `EOD_EMPTY_DAYS` rows (`EOD`, or split), and `1MIN / MINUTE_EMPTY_DAYS` rows come
+    from `check/minute_empty_days.csv`. Without phase 2 files nothing changes.
 - **index_coverage.csv:** per covered index and trading day: members, members with Kite EOD (inside the Kite range
   and not missing), with 1-minute (also from the first minute day), and the symbols without each.
 - **build_report.txt / build_info.json:** counts per status, match status, match rule, reason, data_missing and

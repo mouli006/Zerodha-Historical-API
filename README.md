@@ -630,6 +630,27 @@ python equity_minute.py show RELIANCE
 - Kite only has stocks that trade today, so delisted and merged companies are always in the list. Kite has no 1-minute data before 2015-02-02 at all.
 - `probe` refuses while a Kite F&O download runs (they would share Kite's request limit). If the Kite session expires it stops; sign in again and run `probe` again: finished stocks are kept. Exit codes: 0 done, 1 not run, some stocks failed or stopped, 2 bad arguments, busy, or Kite sign-in needed.
 
+## Kite 1-minute history download
+`equity_minute.py download` fetches Kite's 1-minute candles for every stock in `plan.csv`, each from its own first minute day. The whole history takes about 13-14 hours with two workers, over several evenings; every finished 60-day chunk is kept, so you can stop with Ctrl+C and run the same command again. Each day is checked against Kite's day candle fetched in the same run. The data is about 20-27 GB in `<data folder>/equity_1min/data/<security_id>/`.
+
+```
+python equity_minute.py download --dry-run          # stocks, requests, hours and disk still needed
+python equity_minute.py download --priority 1       # NIFTY 50 members first (then 2 = NIFTY 500, 3 = the rest)
+python equity_minute.py download                    # everything left; --symbols A,B --limit N --speed 2.5 --workers 2
+python equity_minute.py status                      # progress, offline
+```
+
+Every evening, once the history is complete:
+
+```
+python equity_update.py                             # first: today's bhavcopy and the equity builds
+python equity_minute.py update                      # then: today's minutes for every stock, new listings, new tokens
+```
+
+- Kite's prices are adjusted by Kite's own rules, so the files keep Kite's candles unchanged plus, per day, the conversion back to the bhavcopy's raw prices. Read them in Python with `from backfill.equity.minute_store import load_minute`: `load_minute("RELIANCE", "2024-01-01", "2024-01-31", prices="raw")`. `prices="ours"` gives our split / bonus adjusted prices (for indicators), `prices="kite"` Kite's own.
+- Problem days are in `equity_1min/check/` (`minute_check.csv`, `minute_empty_days.csv`, `scale_steps.csv`, `summary.json`). Run `python equity_minute.py gaps` afterwards to add the days Kite has no minutes for to `kite_gaps.csv`.
+- During the history weeks, `download` rebuilds `plan.csv` itself (offline) after an `equity_update.py`. It refuses while a Kite F&O download runs. If the Kite session expires it stops: sign in (`python app.py`) and run the same command again. Exit codes: 0 done or stopped by you, 1 some chunks failed (run it again) or not ready, 2 bad arguments, busy, Kite sign-in needed or not enough disk.
+
 ## Credentials
 Your API keys, secrets and access tokens (Kite and Dhan) are stored only in a local `.env` file, which the app creates when you sign in. It is gitignored and never committed. `.env.example` shows the format.
 
