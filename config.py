@@ -1,4 +1,6 @@
 import os
+import threading
+import time
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ENV_PATH = os.path.join(BASE_DIR, ".env")
@@ -17,14 +19,45 @@ def load_env():
     return env
 
 
+# save_env() is called from request handlers, the job thread and secret_key(): one lock for the read-modify-write,
+# and the file is written to .env.tmp next to it and then replaced, so .env is never left half written.
+ENV_LOCK = threading.Lock()
+REPLACE_TRIES = 5
+REPLACE_WAIT = 0.1
+
+
 def save_env(updates):
-    """Write keys to .env; a value of None removes the key."""
-    env = load_env()
-    env.update(updates)
-    with open(ENV_PATH, "w", encoding="utf-8") as f:
-        for key, value in env.items():
-            if value is not None:
-                f.write(f"{key}={value}\n")
+    """Write keys to .env; a value of None removes the key. Atomic: .env.tmp is written, fsynced and replaces .env;
+    on any failure the temp file is removed and the old .env is left as it was."""
+    with ENV_LOCK:
+        env = load_env()
+        env.update(updates)
+        text = "".join(f"{key}={value}\n" for key, value in env.items() if value is not None)
+        tmp = ENV_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            replace_file(tmp, ENV_PATH)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+
+def replace_file(src, dst):
+    """os.replace, retried briefly while another program has dst open (Windows). The error names only the path."""
+    for attempt in range(REPLACE_TRIES):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == REPLACE_TRIES - 1:
+                raise OSError(f"could not replace {dst} (in use by another program?); it was left unchanged") from None
+            time.sleep(REPLACE_WAIT)
 
 
 def credentials():
