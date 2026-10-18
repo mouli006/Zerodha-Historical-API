@@ -1,0 +1,1121 @@
+"""Kite 1-minute and EOD plan, phase 1: which stocks to download from Kite, their instrument tokens, from which
+day Kite has day and minute candles, and the vendor list of every stock / period Kite does not have.
+
+Inputs, only read: the bhavcopy parquet (NSE_CM_bhav/<YYYY>.parquet), the security master, the adjustment factors,
+the exit list, the index membership and the NSE reference lists (company names). Network: Kite only, in
+tokens() (one instrument-list request) and probe() (day candles and single-day minute requests); gaps() is
+offline. Output: <folder>/equity_1min/plan/ (every file atomic):
+    kite_instruments_NSE_<IST date>.csv   Kite's NSE instrument list as received (tokens)
+    kite_tokens.csv / tokens_info.json    ACTIVE securities matched to a Kite tradingsymbol (tokens)
+    probe_progress.sqlite                 one row per probed security, committed after each (probe; resume)
+    kite_day/<security_id>.parquet        the day candles the probe fetched, so gaps() works offline
+    kite_vs_bhav.parquet                  every Kite day joined with the bhavcopy (ratio, differences)
+    kite_adjustment.csv                   periods where Kite's adjustment differs from our factors, with kind
+    eod_mismatch.csv                      real EOD differences (information only)
+    plan.csv / kite_gaps.csv / index_coverage.csv / build_report.txt / build_info.json
+<folder>/equity_1min/.lock: one tokens / probe / gaps run at a time (backfill.locks.RunLock).
+
+Findings this rests on (Part 0, 2026-10-18) are in PART0_FINDINGS; docs/dev/equity_minute_plan.md has the rules."""
+import json
+import os
+import sqlite3
+from bisect import bisect_left, bisect_right
+from datetime import date, datetime, time as dtime
+from glob import glob
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
+from kiteconnect import exceptions as kex
+
+import config
+from backfill.cm_bhav import store_dir
+from backfill.equity import adjustments as adj
+from backfill.equity import exits as ex
+from backfill.equity import index_membership as im
+from backfill.equity import security_master as sm
+from backfill.fetch import AuthStop, ChunkFailed, RateLimiter, StopJob, fetch_chunk, make_chunks
+from backfill.instruments import T2T_SERIES, series_suffix
+from backfill.locks import LockBusy, RunLock, held  # noqa: F401 - LockBusy is re-exported for the CLI
+
+IST = ZoneInfo("Asia/Kolkata")
+OUT = "equity_1min"
+PLAN = "plan"
+DATA_FROM = date(2015, 1, 1)
+KITE_MINUTE_FROM = date(2015, 2, 2)   # Part 0: no stock has Kite minute candles before this day
+LATER_DAYS = 5           # a first Kite day more than 5 trading days after the start is a gap row
+PRICE_TOL = 0.02         # probe: Kite day close vs bhavcopy close on the last bhavcopy day (identical in Part 0)
+SPEED = 2.5              # requests per second
+MAX_SPEED = 3.0
+ADJ_TOL = 0.005          # Kite's daily factor (bhav close / Kite close) off ours by more than 0.5%: an adjustment period
+STEP_TOL = 0.003         # a new period where Kite's factor and its additive difference both step by more than 0.3%
+STABLE_ABS = 0.02        # additive period: the difference varies by at most max(0.02, 0.3% of the price)
+AGREE_SHARE = 0.9        # a period's kind needs O/H/L to agree on at least 90% of its days
+PRICE_ABS = 0.011        # EOD check: a price off by more than max(0.011 on Kite's scale, 0.05%) ...
+PRICE_REL = 0.0005
+VOLUME_TOL = 0.01        # ... or a volume off raw x our factor and raw x Kite's factor by more than 1%
+SESSION_SHARE = 0.5      # a date Kite lacks for more than half the probed stocks that traded ...
+SESSION_MIN = 10         # ... out of at least 10, is a market-wide missing session
+MINUTES_PER_DAY = 375
+PARQUET_BYTES = 15       # estimated bytes per minute row (assumption, not measured)
+CSV_BYTES = 45
+TOP_GAPS = 20
+CRORE = 1e7
+
+INDEXES = list(im.INDEXES)
+PRIORITY_INDEX = [(1, "NIFTY 50"), (2, "NIFTY 500")]
+MATCHED = ("MATCHED", "MATCHED_UNCHECKED")
+EXIT_REASONS = {"MERGER": "MERGED", "VOLUNTARY_DELISTING": "DELISTED", "COMPULSORY_DELISTING": "DELISTED",
+                "UNKNOWN": "UNKNOWN_EXIT"}
+REFERENCE_NAMES = {"mergers.csv": ("old_symbol", "old_company"), "voluntary_delisting.csv": ("symbol", "company"),
+                   "delisting_circulars.csv": ("symbol", "company"), "compulsory_delisting.csv": ("symbol", "company"),
+                   "suspensions.csv": ("symbol", "company")}
+
+TOKEN_COLUMNS = ["security_id", "isin", "symbol", "series", "kite_tradingsymbol", "instrument_token", "kite_name",
+                 "kite_last_price", "bhav_close", "match_status", "note"]
+PLAN_COLUMNS = ["security_id", "symbols", "isins", "status", "exit_reason", "match_status", "instrument_token",
+                "need_from", "need_to", "eod_first_day", "eod_missing_days", "eod_mismatch_days", "minute_first_day",
+                "download_eod", "download_minute", "eod_requests", "minute_requests", "est_minute_rows", "note"]
+GAP_COLUMNS = ["data_missing", "security_id", "symbols", "isins", "company_name", "need_from", "need_to",
+               "trading_days", "reason", "exit_note", "indices", "median_turnover", "priority", "note"]
+ADJUSTMENT_COLUMNS = ["security_id", "symbol", "from_date", "to_date", "days", "kite_vs_ours", "median_ratio",
+                      "median_adj_difference", "our_factor", "kind", "agree_multiplicative", "agree_additive"]
+MISMATCH_COLUMNS = ["security_id", "symbol", "date", "field", "kite", "bhav", "factor", "kind"]
+COVERAGE_COLUMNS = ["index", "date", "members", "with_eod", "with_minute", "without_eod", "without_minute"]
+FIELDS = ["open", "high", "low", "close", "volume"]
+KINDS = ["MULTIPLICATIVE", "ADDITIVE", "MIXED"]
+
+PART0_FINDINGS = """Part 0 findings (Kite, 2026-10-18; see docs/dev/equity_minute_plan.md):
+- Instrument list: no ISIN column; last_price is 0 on every row (the price check uses the probe's day candle).
+- One instrument per stock: today's token covers renames, ISIN changes and every EQ / BE period.
+- Day candles from 2015-01-01; 1-minute candles from 2015-02-02 for every stock (January 2015: none).
+- Day and minute data start on the same day for listings after 2015; no day-only or minute-only days were seen.
+- Kite has no candles for the weekday Muhurat sessions 2017-10-19 and 2018-11-07.
+- Kite adjusts for splits / bonuses (volume too) and also for demergers, some dividends, and additively
+  (TATASTEEL before 2024): see kite_adjustment.csv. Recent days without later actions match the bhavcopy exactly."""
+
+
+class MinutePlanError(Exception):
+    pass
+
+
+class StoreBusy(MinutePlanError):
+    pass
+
+
+class FnoBusy(MinutePlanError):
+    pass
+
+
+class SignInNeeded(MinutePlanError):
+    pass
+
+
+class InputStale(MinutePlanError):
+    pass
+
+
+class NotBuilt(MinutePlanError):
+    pass
+
+
+def now_ist():
+    return datetime.now(IST)
+
+
+def out_dir(folder=None):
+    return os.path.join(folder or config.equity_data_dir(), OUT)
+
+
+def plan_dir(folder=None):
+    return os.path.join(out_dir(folder), PLAN)
+
+
+def lock_path(folder):
+    return os.path.join(out_dir(folder), ".lock")
+
+
+def iso(d):
+    return d.isoformat() if d else ""
+
+
+def write_json(path, data):
+    sm.write_text(path, json.dumps(data, indent=2, default=str) + "\n")
+
+
+# ---- Part 1: inputs and universe ----
+
+def input_paths(folder):
+    """{name: (lock, required files, build_info)} of every input build."""
+    master, factors, exits, index = sm.out_dir(folder), adj.out_dir(folder), ex.out_dir(folder), im.out_dir(folder)
+    return {
+        "security master": (os.path.join(master, ".lock"), adj.master_paths(folder),
+                            os.path.join(master, "build_info.json"), "security_master.py"),
+        "adjustments": (os.path.join(factors, ".lock"),
+                        [os.path.join(factors, n) for n in ("factors.parquet", "events.csv", "build_info.json")],
+                        os.path.join(factors, "build_info.json"), "adjustments.py"),
+        "exit list": (os.path.join(exits, ".lock"),
+                      [os.path.join(exits, n) for n in ("exits.parquet", "status.parquet", "calendar.csv",
+                                                        "build_info.json")],
+                      os.path.join(exits, "build_info.json"), "exits.py"),
+        "index membership": (os.path.join(index, ".lock"),
+                             [os.path.join(index, n) for n in ("nifty_membership.parquet", "amfi.parquet",
+                                                               "build_info.json")],
+                             os.path.join(index, "build_info.json"), "index_membership.py"),
+    }
+
+
+def check_inputs(folder):
+    """Refuse while a bhavcopy download or an input build holds its lock (StoreBusy), when an input is not built
+    (NotBuilt), or stale (InputStale): the master older than the newest bhavcopy year file, the adjustments older
+    than the master (the builds' own rules), the exit list older than the adjustments, the index membership
+    older than the master."""
+    store = store_dir(folder)
+    paths = input_paths(folder)
+    locks = [(os.path.join(store, ".lock"), "a bhavcopy download (cm_bhav.py)")] + \
+        [(lock, f"a {name} build ({cmd})") for name, (lock, _, _, cmd) in paths.items()]
+    for lock, what in locks:
+        if held(lock):
+            raise StoreBusy(f"{what} holds {lock}; run after it ends.")
+    for name, (_, need, _, cmd) in paths.items():
+        if not all(os.path.isfile(p) for p in need):
+            raise NotBuilt(f"No {name} in {os.path.dirname(need[0])}. Run: python {cmd} build")
+    years = sm.year_files(store)
+    if not years:
+        raise NotBuilt(f"No bhavcopy parquet files in {store}. Run cm_bhav.py first.")
+    newest = max(years, key=os.path.getmtime)
+    info = {name: p[2] for name, p in paths.items()}
+    cmds = {name: p[3] for name, p in paths.items()}
+    for name, older_than in (("security master", newest), ("adjustments", info["security master"]),
+                             ("exit list", info["adjustments"]), ("index membership", info["security master"])):
+        if os.path.getmtime(info[name]) < os.path.getmtime(older_than):
+            raise InputStale(f"The {name} ({info[name]}) is older than {older_than}. "
+                             f"Rebuild it first: python {cmds[name]} build")
+
+
+class Inputs:
+    """Everything the plan reads, loaded once: the universe, the master's history, the exit list, the bhavcopy rows
+    of the universe, the trading days, the factors, the index membership and company names."""
+
+    def __init__(self, folder, include_etf=False):
+        check_inputs(folder)
+        self.folder = folder
+        m = sm.load_master(folder)
+        kinds = ("STOCK", "ETF") if include_etf else ("STOCK",)
+        secs = m["securities"][m["securities"]["instrument_kind"].isin(kinds)]
+        e = ex.load_exits(folder)
+        self.days = list(e["calendar"].days)
+        self.status = e["status_by"]
+        self.exit = e["exit_by"]
+        rows = []
+        for r in secs.sort_values("security_id").itertuples():
+            first, last = sm.as_date(r.first_date), sm.as_date(r.last_date)
+            st = self.status.get(r.security_id, {})
+            rows.append({"security_id": r.security_id, "first_date": first, "last_date": last,
+                         "symbol": r.last_symbol, "series": r.last_series, "isin": r.last_isin,
+                         "last_close": float(r.last_close), "kind": r.instrument_kind,
+                         "status": st.get("status", ""),
+                         "exit_reason": (self.exit.get(r.security_id) or {}).get("reason", ""),
+                         "need_from": max(first, DATA_FROM), "need_to": last})
+        self.universe = rows
+        self.by_id = {u["security_id"]: u for u in rows}
+        hist = m["history"][m["history"]["security_id"].isin(self.by_id)]
+        self.history = {sid: g.sort_values("from_date") for sid, g in hist.groupby("security_id")}
+        self.bhav = read_bhav(folder, m, set(self.by_id))
+        self.factors = adj.load_factors(folder)["factors"]
+        built = im.load_built(folder)
+        self.membership = built["membership"]
+        self.coverage = built["info"]["coverage"]
+        self.names = company_names(folder)
+
+
+def read_bhav(folder, m, ids):
+    """The bhavcopy rows (master series) of the given securities, with security_id; one row per security and day."""
+    cols = ["date", "symbol", "series", "isin", "open", "high", "low", "close", "volume", "turnover"]
+    tables = [pq.read_table(f, columns=cols, filters=[("series", "in", list(m["info"]["series"]))])
+              for f in sm.year_files(store_dir(folder))]
+    df = pa.concat_tables(tables).to_pandas()
+    df["security_id"] = df["isin"].map(m["isin_owner"])
+    df = df[df["security_id"].isin(ids)]
+    df = df.sort_values(["security_id", "date"], kind="stable").drop_duplicates(["security_id", "date"])
+    return df.reset_index(drop=True)
+
+
+def company_names(folder):
+    """{symbol: company name} from the NSE reference lists (the latest non-blank row wins); missing lists are fine."""
+    names = {}
+    ref = os.path.join(store_dir(folder), "reference")
+    for name, (sym_col, name_col) in REFERENCE_NAMES.items():
+        path = os.path.join(ref, name)
+        if not os.path.isfile(path):
+            continue
+        df = pd.read_csv(path, dtype=str, keep_default_na=False)
+        if sym_col not in df or name_col not in df:
+            continue
+        for sym, company in zip(df[sym_col], df[name_col]):
+            if sym.strip() and company.strip():
+                names[sym.strip().upper()] = company.strip()
+    return names
+
+
+# ---- Part 2: Kite tokens ----
+
+def kite_client():
+    """KiteConnect from .env (KITE_API_KEY, KITE_ACCESS_TOKEN). The values are never printed."""
+    from kiteconnect import KiteConnect
+    env = config.load_env()
+    key, token = env.get("KITE_API_KEY", ""), env.get("KITE_ACCESS_TOKEN", "")
+    if not key or not token:
+        raise SignInNeeded("No Kite API key or access token in .env. Sign in to Kite (python app.py) first.")
+    kite = KiteConnect(api_key=key)
+    kite.set_access_token(token)
+    return kite
+
+
+def match_tokens(universe, instruments):
+    """kite_tokens.csv rows for the ACTIVE securities: today's symbol and series on both sides. Kite names a
+    trade-to-trade stock SYMBOL-BE / SYMBOL-BZ; one candidate with the expected name is a match, none is NO_TOKEN,
+    anything else (two candidates, only another series' name) is REVIEW. Never guessed."""
+    by_base = {}
+    for i in instruments:
+        if i.get("segment") != "NSE":
+            continue
+        ts, suffix = i["tradingsymbol"], series_suffix(i)
+        if suffix and suffix not in T2T_SERIES:
+            continue
+        by_base.setdefault(ts.rpartition("-")[0] if suffix else ts, []).append(i)
+    rows = []
+    for u in universe:
+        if u["status"] != "ACTIVE":
+            continue
+        sym, series = u["symbol"], u["series"]
+        expected = sym if series == "EQ" else f"{sym}-{series}"
+        row = {"security_id": u["security_id"], "isin": u["isin"], "symbol": sym, "series": series,
+               "kite_tradingsymbol": "", "instrument_token": "", "kite_name": "", "kite_last_price": "",
+               "bhav_close": u["last_close"], "match_status": "NO_TOKEN", "note": ""}
+        cands = by_base.get(sym, [])
+        if not cands:
+            row["note"] = f"no {sym} / {sym}-BE / {sym}-BZ in Kite's list"
+        elif len(cands) == 1 and cands[0]["tradingsymbol"] == expected:
+            c = cands[0]
+            row.update(kite_tradingsymbol=c["tradingsymbol"], instrument_token=int(c["instrument_token"]),
+                       kite_name=c.get("name") or "", kite_last_price=c.get("last_price"),
+                       match_status="MATCHED_UNCHECKED", note="price checked by probe")
+        else:
+            listed = ", ".join(f"{c['tradingsymbol']} ({c['instrument_token']})" for c in cands)
+            row["match_status"] = "REVIEW"
+            row["note"] = (f"{len(cands)} candidates: {listed}" if len(cands) > 1
+                           else f"only {listed} in Kite's list, bhavcopy series {series}")
+        rows.append(row)
+    return rows
+
+
+def tokens(folder=None, kite=None, include_etf=False, now=None, log=print):
+    """One instrument-list request: save it as received, match every ACTIVE security, write kite_tokens.csv."""
+    folder = folder or config.equity_data_dir()
+    inp = Inputs(folder, include_etf)
+    lock = RunLock(lock_path(folder)).acquire("equity_minute.py tokens")
+    try:
+        kite = kite or kite_client()
+        try:
+            instruments = kite.instruments("NSE")
+        except kex.TokenException as e:
+            raise SignInNeeded(f"Kite session expired or invalid ({type(e).__name__}). Sign in again (python app.py).")
+        out = plan_dir(folder)
+        os.makedirs(out, exist_ok=True)
+        day = (now or now_ist()).date()
+        name = f"kite_instruments_NSE_{day.isoformat()}.csv"
+        sm.write_csv(pd.DataFrame(instruments), os.path.join(out, name))
+        rows = match_tokens(inp.universe, instruments)
+        sm.write_csv(pd.DataFrame(rows, columns=TOKEN_COLUMNS), os.path.join(out, "kite_tokens.csv"))
+        counts = pd.Series([r["match_status"] for r in rows], dtype=object).value_counts().to_dict()
+        info = {"built_at": f"{now or now_ist():%Y-%m-%d %H:%M:%S}", "instruments_file": name,
+                "instruments_date": day.isoformat(), "instruments_rows": len(instruments),
+                "bhav_last": iso(inp.days[-1]), "calendar_days_between": int(np.busday_count(inp.days[-1], day)),
+                "active": len(rows), "match_status": counts}
+        write_json(os.path.join(out, "tokens_info.json"), info)
+        lines = [f"Kite instrument list {day}: {len(instruments):,} rows -> {name}",
+                 f"Latest bhavcopy day {inp.days[-1]} ({info['calendar_days_between']} weekdays before the list; "
+                 "a rename in between shows up as NO_TOKEN)",
+                 f"ACTIVE securities: {len(rows):,}"] + [f"  {k}: {v:,}" for k, v in sorted(counts.items())]
+        text = "\n".join(lines) + "\n"
+        log(text, end="")
+        return {"out": out, "rows": rows, "info": info, "report": text}
+    finally:
+        lock.release()
+
+
+def read_tokens(folder):
+    path = os.path.join(plan_dir(folder), "kite_tokens.csv")
+    if not os.path.isfile(path):
+        raise NotBuilt(f"No {path}. Run: python equity_minute.py tokens")
+    return pd.read_csv(path, dtype=str, keep_default_na=False)
+
+
+# ---- Part 3: probe ----
+
+def fno_locks(env):
+    """Every Kite F&O root's .lock (<root>/<UNDERLYING>_FnO_1min/.lock) under FNO_RAW_KITE / KITE_DATA_DIR."""
+    roots = {config.fno_raw_dir("kite", env=env), config.fno_raw_dir("kite", "with", env),
+             config.fno_raw_dir("kite", "without", env)}
+    return sorted(p for root in roots for p in glob(os.path.join(root, "*_FnO_1min", ".lock")))
+
+
+def check_fno(env):
+    for path in fno_locks(env):
+        if held(path):
+            raise FnoBusy(f"A Kite F&O run holds {path}; both would share Kite's request limit. Probe after it ends.")
+
+
+PROBE_SQL = """CREATE TABLE IF NOT EXISTS probes (
+    security_id TEXT PRIMARY KEY, instrument_token TEXT, status TEXT, need_from TEXT, need_to TEXT,
+    eod_first_day TEXT, eod_last_day TEXT, kite_days INTEGER, eod_missing TEXT, minute_first_day TEXT,
+    price_status TEXT, price_day TEXT, price_kite_close REAL, requests INTEGER, error TEXT, probed_at TEXT)"""
+PROBE_FIELDS = ["security_id", "instrument_token", "status", "need_from", "need_to", "eod_first_day", "eod_last_day",
+                "kite_days", "eod_missing", "minute_first_day", "price_status", "price_day", "price_kite_close",
+                "requests", "error", "probed_at"]
+
+
+def open_db(folder):
+    os.makedirs(plan_dir(folder), exist_ok=True)
+    db = sqlite3.connect(os.path.join(plan_dir(folder), "probe_progress.sqlite"))
+    db.execute(PROBE_SQL)
+    db.commit()
+    return db
+
+
+def read_probes(folder):
+    """{security_id: probe row} from probe_progress.sqlite ({} before the first probe)."""
+    path = os.path.join(plan_dir(folder), "probe_progress.sqlite")
+    if not os.path.isfile(path):
+        return {}
+    db = sqlite3.connect(path)
+    try:
+        db.execute(PROBE_SQL)
+        return {r[0]: dict(zip(PROBE_FIELDS, r)) for r in db.execute(f"SELECT {','.join(PROBE_FIELDS)} FROM probes")}
+    finally:
+        db.close()
+
+
+def save_probe(db, row):
+    db.execute(f"INSERT OR REPLACE INTO probes ({','.join(PROBE_FIELDS)}) VALUES ({','.join('?' * len(PROBE_FIELDS))})",
+               [row.get(k) for k in PROBE_FIELDS])
+    db.commit()
+
+
+def candle_day(value):
+    return value.date() if isinstance(value, datetime) else sm.as_date(value)
+
+
+def day_frame(candles):
+    df = pd.DataFrame([{"date": candle_day(c["date"]), **{f: c[f] for f in FIELDS}} for c in candles],
+                      columns=["date"] + FIELDS)
+    return df.drop_duplicates("date", keep="last").sort_values("date").reset_index(drop=True)
+
+
+class Prober:
+    """One security at a time: day candles in 2,000-day chunks, the price check, the first minute day."""
+
+    def __init__(self, kite, limiter):
+        self.kite, self.limiter, self.requests = kite, limiter, 0
+
+    def fetch(self, token, start, end, interval):
+        self.requests += 1
+        return fetch_chunk(self.kite, self.limiter, token, start, end, interval)
+
+    def has_minute(self, token, day):
+        return bool(self.fetch(token, datetime.combine(day, dtime.min), datetime.combine(day, dtime(23, 59, 59)),
+                               "minute"))
+
+    def minute_start(self, token, days):
+        """First day with minute candles among the security's Kite days: the first day, else the first day on or
+        after KITE_MINUTE_FROM, else a binary search on single days (None when even the last day has none)."""
+        if not days:
+            return None
+        if self.has_minute(token, days[0]):
+            return days[0]
+        lo = 0                                    # days[lo] has no minute candles
+        if days[0] < KITE_MINUTE_FROM:
+            j = bisect_left(days, KITE_MINUTE_FROM)
+            if j < len(days):
+                if self.has_minute(token, days[j]):
+                    return days[j]
+                lo = j
+        hi = len(days) - 1
+        if hi == lo or not self.has_minute(token, days[hi]):
+            return None
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if self.has_minute(token, days[mid]):
+                hi = mid
+            else:
+                lo = mid
+        return days[hi]
+
+    def probe(self, token, u, bhav_days, out, price_tol):
+        """Probe one security; writes kite_day/<security_id>.parquet and returns the probe row."""
+        self.requests = 0
+        candles = []
+        for start, end in make_chunks(u["need_from"], u["need_to"], "day"):
+            candles += self.fetch(token, start, end, "day")
+        df = day_frame(candles)
+        kdays = list(df["date"])
+        have = set(kdays)
+        missing = [d for d in bhav_days if d not in have]
+        last = bhav_days[-1] if bhav_days else None
+        hit = df[df["date"] == last]
+        price_status, kclose = "MATCHED_UNCHECKED", None
+        if len(hit) and u["last_close"]:
+            kclose = float(hit["close"].iloc[0])
+            ok = abs(kclose - u["last_close"]) / u["last_close"] <= price_tol
+            price_status = "MATCHED" if ok else "PRICE_MISMATCH"
+        minute = self.minute_start(token, kdays)
+        os.makedirs(os.path.join(out, "kite_day"), exist_ok=True)
+        sm.write_parquet(df, os.path.join(out, "kite_day", f"{u['security_id']}.parquet"))
+        return {"security_id": u["security_id"], "instrument_token": str(token), "status": "DONE",
+                "need_from": iso(u["need_from"]), "need_to": iso(u["need_to"]),
+                "eod_first_day": iso(kdays[0]) if kdays else "", "eod_last_day": iso(kdays[-1]) if kdays else "",
+                "kite_days": len(kdays), "eod_missing": json.dumps([iso(d) for d in missing]),
+                "minute_first_day": iso(minute), "price_status": price_status, "price_day": iso(last),
+                "price_kite_close": kclose, "requests": self.requests, "error": "",
+                "probed_at": f"{now_ist():%Y-%m-%d %H:%M:%S}"}
+
+
+def probe(folder=None, kite=None, speed=SPEED, force=False, price_tol=PRICE_TOL, include_etf=False, now=None,
+          log=print):
+    """Probe every MATCHED / MATCHED_UNCHECKED security not probed yet (or every one with force), then rebuild
+    the outputs. AuthStop stops cleanly (SignInNeeded); done securities are kept for the next run."""
+    folder = folder or config.equity_data_dir()
+    inp = Inputs(folder, include_etf)
+    toks = read_tokens(folder)
+    check_fno(config.load_env())
+    lock = RunLock(lock_path(folder)).acquire("equity_minute.py probe")
+    db = None
+    try:
+        kite = kite or kite_client()
+        db = open_db(folder)
+        done = read_probes(folder)
+        prober = Prober(kite, RateLimiter(speed))
+        out = plan_dir(folder)
+        todo = [r for r in toks.itertuples() if r.match_status in MATCHED and r.security_id in inp.by_id]
+        bhav_days = {sid: list(g["date"]) for sid, g in inp.bhav.groupby("security_id")}
+        stats = {"todo": len(todo), "probed": 0, "skipped": 0, "failed": 0, "requests": 0, "stopped": None}
+        for n, t in enumerate(todo, 1):
+            u = inp.by_id[t.security_id]
+            old = done.get(t.security_id)
+            if (not force and old and old["status"] == "DONE" and old["instrument_token"] == t.instrument_token
+                    and old["need_from"] == iso(u["need_from"]) and old["need_to"] == iso(u["need_to"])):
+                stats["skipped"] += 1
+                continue
+            try:
+                row = prober.probe(int(t.instrument_token), u, bhav_days.get(t.security_id, []), out, price_tol)
+                stats["probed"] += 1
+            except ChunkFailed as e:
+                row = {"security_id": t.security_id, "instrument_token": t.instrument_token, "status": "FAILED",
+                       "need_from": iso(u["need_from"]), "need_to": iso(u["need_to"]), "error": str(e),
+                       "requests": prober.requests, "probed_at": f"{now_ist():%Y-%m-%d %H:%M:%S}"}
+                stats["failed"] += 1
+                log(f"  {t.symbol}: FAILED {e}")
+            except AuthStop as e:
+                stats["requests"] += prober.requests
+                raise SignInNeeded(f"Kite sign-in needed ({e}). Sign in (python app.py) and run probe again; "
+                                   f"{stats['probed']:,} securities probed in this run are kept.")
+            except (StopJob, KeyboardInterrupt):
+                stats["stopped"] = t.symbol
+                break
+            stats["requests"] += prober.requests
+            save_probe(db, row)
+            if n % 50 == 0 or n == len(todo):
+                log(f"  {n:,} / {len(todo):,} ({stats['probed']:,} probed, {stats['skipped']:,} already done, "
+                    f"{stats['failed']:,} failed, {stats['requests']:,} requests, rate {prober.limiter.rate:g}/s)")
+        db.close()
+        db = None
+        result = build_outputs(folder, inp, now=now, log=log)
+        result["stats"] = stats
+        return result
+    finally:
+        if db is not None:
+            db.close()
+        lock.release()
+
+
+# ---- Part 4: outputs ----
+
+def gaps(folder=None, include_etf=False, now=None, log=print):
+    """Rebuild every output from the saved tokens, probe rows and day candles. Offline."""
+    folder = folder or config.equity_data_dir()
+    inp = Inputs(folder, include_etf)
+    lock = RunLock(lock_path(folder)).acquire("equity_minute.py gaps")
+    try:
+        return build_outputs(folder, inp, now=now, log=log)
+    finally:
+        lock.release()
+
+
+def with_factor(df, factors):
+    """df (security_id, date) plus our cumulative factor of that day (adjustments.factor_on, vectorised)."""
+    if df.empty:
+        return df.assign(our_factor=pd.Series(dtype=float))
+    f = factors[["security_id", "from_date", "factor"]].copy()
+    f["_from"] = pd.to_datetime(f["from_date"])
+    f = f.sort_values("_from")
+    d = df.copy()
+    d["_dt"] = pd.to_datetime(d["date"])
+    d = d.sort_values("_dt")
+    merged = pd.merge_asof(d, f[["security_id", "_from", "factor"]], left_on="_dt", right_on="_from",
+                           by="security_id", direction="backward")
+    first = f.groupby("security_id")["factor"].first()
+    merged["our_factor"] = merged["factor"].fillna(merged["security_id"].map(first)).fillna(1.0).astype(float)
+    return merged.drop(columns=["_dt", "_from", "factor"]).sort_values(["security_id", "date"]).reset_index(drop=True)
+
+
+def kite_vs_bhav(folder, inp, probed):
+    """Every Kite day of the probed securities joined with the bhavcopy row of that day."""
+    frames = []
+    for sid in sorted(probed):
+        path = os.path.join(plan_dir(folder), "kite_day", f"{sid}.parquet")
+        if os.path.isfile(path):
+            k = pq.read_table(path).to_pandas()
+            k.insert(0, "security_id", sid)
+            frames.append(k)
+    cols = ["security_id", "date"] + [f"kite_{f}" for f in FIELDS] + [f"bhav_{f}" for f in FIELDS] + \
+        ["our_factor", "ratio", "difference", "adj_difference"]
+    if not frames:
+        return pd.DataFrame(columns=cols + ["symbol"])
+    k = pd.concat(frames, ignore_index=True).rename(columns={f: f"kite_{f}" for f in FIELDS})
+    b = inp.bhav[["security_id", "date", "symbol"] + FIELDS].rename(columns={f: f"bhav_{f}" for f in FIELDS})
+    j = k.merge(b, on=["security_id", "date"], how="inner")
+    j = with_factor(j, inp.factors)
+    j["ratio"] = j["bhav_close"] / j["kite_close"]
+    j["difference"] = j["bhav_close"] - j["kite_close"]
+    j["adj_difference"] = j["bhav_close"] / j["our_factor"] - j["kite_close"]
+    return j[cols + ["symbol"]]
+
+
+def agreement(g):
+    """Per day: do O/H/L convert like the close, multiplicatively (ratio) and additively (adj_difference)?"""
+    mult = np.ones(len(g), dtype=bool)
+    add = np.ones(len(g), dtype=bool)
+    for f in ("open", "high", "low"):
+        kite, bhav = g[f"kite_{f}"].to_numpy(float), g[f"bhav_{f}"].to_numpy(float)
+        tol = np.maximum(PRICE_ABS, PRICE_REL * np.abs(kite))
+        mult &= np.abs(kite - bhav / g["ratio"].to_numpy(float)) <= tol
+        add &= np.abs(kite - (bhav / g["our_factor"].to_numpy(float) - g["adj_difference"].to_numpy(float))) <= tol
+    return mult, add
+
+
+def period_kind(p, mult, add):
+    """MULTIPLICATIVE when Kite's factor is stable and O/H/L agree with it, ADDITIVE when the difference is stable
+    and O/H/L agree with it, else MIXED. Both possible (flat prices, one day): the better agreement wins."""
+    q = p["ratio"] / p["our_factor"]
+    q_ok = q.max() / q.min() - 1 <= STEP_TOL
+    d = p["adj_difference"]
+    d_ok = d.max() - d.min() <= max(STABLE_ABS, STEP_TOL * float(p["kite_close"].median()))
+    m_share, a_share = float(mult.mean()), float(add.mean())
+    is_m, is_a = q_ok and m_share >= AGREE_SHARE, d_ok and a_share >= AGREE_SHARE
+    if is_m and (not is_a or m_share >= a_share):
+        return "MULTIPLICATIVE", m_share, a_share
+    if is_a:
+        return "ADDITIVE", m_share, a_share
+    return "MIXED", m_share, a_share
+
+
+def adjustments_and_mismatches(kvb, inp):
+    """kite_adjustment.csv periods, the day kind (OUR_FACTOR outside a period) and eod_mismatch.csv rows."""
+    periods, mismatches = [], []
+    kvb = kvb.reset_index(drop=True)
+    kvb["kind"] = "OUR_FACTOR"
+    if kvb.empty:
+        return pd.DataFrame(columns=ADJUSTMENT_COLUMNS), pd.DataFrame(columns=MISMATCH_COLUMNS), kvb
+    q = kvb["ratio"] / kvb["our_factor"]
+    flagged = ((q - 1).abs() > ADJ_TOL).to_numpy()
+    mult_all, add_all = agreement(kvb)
+    kinds = kvb["kind"].to_numpy(object)
+    for sid, idx in kvb.groupby("security_id").indices.items():
+        f = flagged[idx]
+        if not f.any():
+            continue
+        g = kvb.iloc[idx]
+        qq, dd, kc = (g["ratio"] / g["our_factor"]).to_numpy(), g["adj_difference"].to_numpy(), g["kite_close"].to_numpy()
+        runs, cur = [], None
+        for j in range(len(idx)):
+            if not f[j]:
+                cur = None
+                continue
+            step = cur is not None and abs(qq[j] / qq[j - 1] - 1) > STEP_TOL and \
+                abs(dd[j] - dd[j - 1]) > STEP_TOL * kc[j]
+            if cur is None or step:
+                cur = []
+                runs.append(cur)
+            cur.append(j)
+        for run in runs:
+            p = g.iloc[run]
+            mult, add = mult_all[idx[run]], add_all[idx[run]]
+            kind, m_share, a_share = period_kind(p, mult, add)
+            kinds[idx[run]] = kind
+            factors = sorted(set(p["our_factor"].round(6)))
+            periods.append({"security_id": sid, "symbol": inp.by_id[sid]["symbol"], "from_date": iso(p["date"].iloc[0]),
+                            "to_date": iso(p["date"].iloc[-1]), "days": len(p),
+                            "kite_vs_ours": round(float((p["ratio"] / p["our_factor"]).median()), 6),
+                            "median_ratio": round(float(p["ratio"].median()), 6),
+                            "median_adj_difference": round(float(p["adj_difference"].median()), 4),
+                            "our_factor": "|".join(f"{x:g}" for x in factors), "kind": kind,
+                            "agree_multiplicative": round(m_share, 3), "agree_additive": round(a_share, 3)})
+    kvb["kind"] = kinds
+    for f in ("open", "high", "low"):
+        kite, bhav = kvb[f"kite_{f}"].to_numpy(float), kvb[f"bhav_{f}"].to_numpy(float)
+        tol = np.maximum(PRICE_ABS, PRICE_REL * np.abs(kite))
+        m_bad = np.abs(kite - bhav / kvb["ratio"].to_numpy(float)) > tol
+        a_bad = np.abs(kite - (bhav / kvb["our_factor"].to_numpy(float) - kvb["adj_difference"].to_numpy(float))) > tol
+        bad = np.where(kinds == "ADDITIVE", a_bad, np.where(kinds == "MIXED", m_bad & a_bad, m_bad))
+        for r in kvb[bad].itertuples():
+            mismatches.append({"security_id": r.security_id, "symbol": r.symbol, "date": iso(r.date), "field": f,
+                               "kite": getattr(r, f"kite_{f}"), "bhav": getattr(r, f"bhav_{f}"),
+                               "factor": round(r.ratio, 6), "kind": r.kind})
+    kv, bv = kvb["kite_volume"].to_numpy(float), kvb["bhav_volume"].to_numpy(float)
+    off = [np.abs(kv - bv * x) > VOLUME_TOL * np.maximum(bv * x, 1.0)
+           for x in (kvb["our_factor"].to_numpy(float), kvb["ratio"].to_numpy(float))]
+    for r in kvb[off[0] & off[1]].itertuples():
+        mismatches.append({"security_id": r.security_id, "symbol": r.symbol, "date": iso(r.date), "field": "volume",
+                           "kite": r.kite_volume, "bhav": r.bhav_volume, "factor": round(r.our_factor, 6),
+                           "kind": r.kind})
+    mm = pd.DataFrame(mismatches, columns=MISMATCH_COLUMNS).sort_values(["security_id", "date", "field"], kind="stable")
+    return pd.DataFrame(periods, columns=ADJUSTMENT_COLUMNS), mm.reset_index(drop=True), kvb
+
+
+def spans(rows, field, a=None, b=None):
+    """'A 2015-01-01..2020-03-01; B 2020-03-02..2026-10-16' for a security's symbol (or ISIN) periods, clipped."""
+    out = []
+    for value, start, end in zip(rows[field], rows["from_date"], rows["to_date"]):
+        start, end = sm.as_date(start), sm.as_date(end)
+        if (a and end < a) or (b and start > b):
+            continue
+        start, end = max(start, a) if a else start, min(end, b) if b else end
+        if out and out[-1][0] == value:
+            out[-1][2] = end
+        else:
+            out.append([value, start, end])
+    return "; ".join(f"{v} {s}..{e}" for v, s, e in out)
+
+
+class Outputs:
+    """Shared lookups for the gap rows."""
+
+    def __init__(self, inp, tokens):
+        self.inp = inp
+        self.tokens = {r.security_id: r for r in tokens.itertuples()}
+        self.bhav = {sid: g for sid, g in inp.bhav.groupby("security_id")}
+        mem = inp.membership
+        self.member = {sid: g for sid, g in mem.groupby("security_id")}
+        self.reliable = {i: (sm.as_date(c["reliable_from"]) if c.get("reliable_from") else None)
+                         for i, c in inp.coverage.items()}
+
+    def stats(self, sid, a, b):
+        g = self.bhav.get(sid)
+        if g is None:
+            return 0, None
+        g = g[(g["date"] >= a) & (g["date"] <= b)]
+        return len(g), (round(float(g["turnover"].median()) / CRORE, 2) if len(g) else None)
+
+    def indices(self, sid, a, b):
+        g = self.member.get(sid)
+        if g is None:
+            return "", 3
+        parts, priority = [], 3
+        for r in g.sort_values(["index", "from_date"]).itertuples():
+            start, end = sm.as_date(r.from_date), sm.as_date(r.to_date) if r.to_date else b
+            if end < a or start > b:
+                continue
+            start, end = max(start, a), min(end, b)
+            rel = self.reliable.get(r.index)
+            note = " (before reliable_from)" if rel is None or start < rel else ""
+            parts.append(f"{r.index} {start}..{end}{note}")
+            for p, name in PRIORITY_INDEX:
+                if r.index == name:
+                    priority = min(priority, p)
+        return "; ".join(parts), priority
+
+    def company(self, sid):
+        t = self.tokens.get(sid)
+        if t is not None and t.kite_name:
+            return t.kite_name
+        rows = self.inp.history.get(sid)
+        syms = [self.inp.by_id[sid]["symbol"]] + (list(rows["symbol"])[::-1] if rows is not None else [])
+        return next((self.inp.names[s] for s in syms if s in self.inp.names), "")
+
+    def exit_note(self, sid):
+        e = self.inp.exit.get(sid)
+        if not e:
+            return ""
+        parts = []
+        if e.get("acquirer_symbol"):
+            parts.append(f"into {e['acquirer_symbol']}" + (f", {e['swap_ratio']}" if e.get("swap_ratio") else ""))
+        if e.get("note"):
+            parts.append(str(e["note"]))
+        return "; ".join(parts)
+
+    def row(self, data_missing, sid, a, b, reason, note="", trading_days=None):
+        rows = self.inp.history.get(sid)
+        n, turnover = self.stats(sid, a, b)
+        indices, priority = self.indices(sid, a, b)
+        return {"data_missing": data_missing, "security_id": sid,
+                "symbols": spans(rows, "symbol", a, b) if rows is not None else "",
+                "isins": spans(rows, "isin", a, b) if rows is not None else "", "company_name": self.company(sid),
+                "need_from": iso(a), "need_to": iso(b), "trading_days": n if trading_days is None else trading_days,
+                "reason": reason, "exit_note": self.exit_note(sid), "indices": indices, "median_turnover": turnover,
+                "priority": priority, "note": note}
+
+
+def runs_of(days, flags):
+    """[(first, last, count)] of consecutive flagged days."""
+    out, start, count = [], None, 0
+    for d, f in zip(days, flags):
+        if f:
+            if start is None:
+                start, count = d, 0
+            last, count = d, count + 1
+        elif start is not None:
+            out.append((start, last, count))
+            start = None
+    if start is not None:
+        out.append((start, last, count))
+    return out
+
+
+def sessions_of(states):
+    """Market-wide missing sessions: dates at least SESSION_MIN probed securities traded inside their Kite range,
+    more than SESSION_SHARE of them without a Kite day candle."""
+    traded, lacking = {}, {}
+    for s in states.values():
+        if not s.get("eod_first"):
+            continue
+        for d in s["days"]:
+            if s["eod_first"] <= d <= s["eod_last"]:
+                traded[d] = traded.get(d, 0) + 1
+        for d in s["missing"]:
+            if s["eod_first"] <= d <= s["eod_last"]:
+                lacking[d] = lacking.get(d, 0) + 1
+    return {d: (lacking[d], traded[d]) for d in sorted(lacking)
+            if traded.get(d, 0) >= SESSION_MIN and lacking[d] / traded[d] > SESSION_SHARE}
+
+
+def build_outputs(folder, inp, now=None, log=print):
+    """plan.csv, kite_gaps.csv, index_coverage.csv, kite_vs_bhav.parquet, kite_adjustment.csv, eod_mismatch.csv,
+    build_report.txt and build_info.json, rebuilt in full."""
+    out = plan_dir(folder)
+    os.makedirs(out, exist_ok=True)
+    toks = read_tokens(folder)
+    probes = read_probes(folder)
+    o = Outputs(inp, toks)
+    bhav_days = {sid: list(g["date"]) for sid, g in o.bhav.items()}
+
+    # the state of every security: token, probe, price check
+    states = {}
+    for u in inp.universe:
+        sid = u["security_id"]
+        t = o.tokens.get(sid)
+        p = probes.get(sid)
+        s = {"sid": sid, "u": u, "token": t.instrument_token if t is not None and t.instrument_token else "",
+             "match": t.match_status if t is not None else ("NO_TOKEN" if u["status"] == "ACTIVE" else ""),
+             "token_note": t.note if t is not None else "", "probed": False, "eod_first": None, "eod_last": None,
+             "missing": [], "minute_first": None, "days": bhav_days.get(sid, [])}
+        if (s["match"] in MATCHED and p and p["status"] == "DONE" and p["instrument_token"] == s["token"]):
+            s.update(probed=True, match=p["price_status"],
+                     eod_first=sm.as_date(p["eod_first_day"]) if p["eod_first_day"] else None,
+                     eod_last=sm.as_date(p["eod_last_day"]) if p["eod_last_day"] else None,
+                     missing=[sm.as_date(d) for d in json.loads(p["eod_missing"] or "[]")],
+                     minute_first=sm.as_date(p["minute_first_day"]) if p["minute_first_day"] else None)
+        elif s["match"] in MATCHED and p and p["status"] == "FAILED":
+            s["probe_error"] = p["error"]
+        states[sid] = s
+    usable = {sid for sid, s in states.items() if s["probed"] and s["match"] in MATCHED}
+
+    sessions = sessions_of({sid: states[sid] for sid in usable})
+    for sid in usable:
+        s = states[sid]
+        s["missing_all"] = s["missing"]                 # index coverage: Kite has no candle on a session either
+        s["missing"] = [d for d in s["missing"] if d not in sessions]
+
+    kvb = kite_vs_bhav(folder, inp, usable)
+    periods, mismatches, kvb = adjustments_and_mismatches(kvb, inp)
+    kite_days = {sid: list(g["date"]) for sid, g in kvb.groupby("security_id")} if len(kvb) else {}
+    sm.write_parquet(kvb.drop(columns=["symbol", "kind"]), os.path.join(out, "kite_vs_bhav.parquet"))
+    sm.write_csv(periods, os.path.join(out, "kite_adjustment.csv"))
+    sm.write_csv(mismatches, os.path.join(out, "eod_mismatch.csv"))
+    mismatch_days = mismatches.groupby("security_id")["date"].nunique().to_dict() if len(mismatches) else {}
+
+    # plan.csv and kite_gaps.csv
+    plan_rows, gap_rows = [], []
+    for u in inp.universe:
+        sid, s = u["security_id"], states[u["security_id"]]
+        rows = inp.history.get(sid)
+        a, b = u["need_from"], u["need_to"]
+        note = s.get("probe_error", "")
+        if s["match"] in MATCHED and not s["probed"]:
+            note = note or "not probed yet"
+        dl_eod = s["probed"] and s["match"] in MATCHED and s["eod_first"] is not None
+        dl_min = dl_eod and s["minute_first"] is not None
+        kd = kite_days.get(sid, [])
+        plan_rows.append({
+            "security_id": sid, "symbols": spans(rows, "symbol") if rows is not None else u["symbol"],
+            "isins": spans(rows, "isin") if rows is not None else u["isin"], "status": u["status"],
+            "exit_reason": u["exit_reason"], "match_status": s["match"], "instrument_token": s["token"],
+            "need_from": iso(a), "need_to": iso(b), "eod_first_day": iso(s["eod_first"]),
+            "eod_missing_days": len(s["missing"]) if s["probed"] else "",
+            "eod_mismatch_days": mismatch_days.get(sid, 0) if s["probed"] else "",
+            "minute_first_day": iso(s["minute_first"]), "download_eod": "Y" if dl_eod else "N",
+            "download_minute": "Y" if dl_min else "N",
+            "eod_requests": len(make_chunks(s["eod_first"], b, "day")) if dl_eod else 0,
+            "minute_requests": len(make_chunks(s["minute_first"], b, "minute")) if dl_min else 0,
+            "est_minute_rows": sum(1 for d in kd if d >= s["minute_first"]) * MINUTES_PER_DAY if dl_min else 0,
+            "note": note})
+        gap_rows += gaps_of(o, s, u)
+    for d, (lacking, traded) in sessions.items():
+        turnover = inp.bhav[(inp.bhav["date"] == d) & inp.bhav["security_id"].isin(usable)]["turnover"].sum()
+        gap_rows.append({"data_missing": "BOTH", "security_id": "", "symbols": "", "isins": "", "company_name": "",
+                         "need_from": iso(d), "need_to": iso(d), "trading_days": 1, "reason": "KITE_MISSING_SESSION",
+                         "exit_note": "", "indices": "", "median_turnover": round(float(turnover) / CRORE, 2),
+                         "priority": 1, "note": f"Kite has no day candle for {lacking:,} of {traded:,} probed "
+                                                "stocks that traded (market-wide)"})
+    early = [d for d in inp.days if d < KITE_MINUTE_FROM]
+    early_ids = [sid for sid in usable if states[sid]["eod_first"] and states[sid]["eod_first"] < KITE_MINUTE_FROM]
+    if early and early_ids:
+        gap_rows.append({"data_missing": "1MIN", "security_id": "", "symbols": "", "isins": "", "company_name": "",
+                         "need_from": iso(early[0]), "need_to": iso(early[-1]), "trading_days": len(early),
+                         "reason": "KITE_MINUTE_START", "exit_note": "", "indices": "", "median_turnover": None,
+                         "priority": 1, "note": f"Kite has no 1-minute candles before {KITE_MINUTE_FROM} for any "
+                                                f"stock; {len(early_ids):,} probed stocks traded then"})
+    plan = pd.DataFrame(plan_rows, columns=PLAN_COLUMNS)
+    gap = pd.DataFrame(gap_rows, columns=GAP_COLUMNS)
+    gap["_t"] = pd.to_numeric(gap["median_turnover"], errors="coerce")
+    gap = gap.sort_values(["priority", "_t", "security_id", "need_from"], ascending=[True, False, True, True],
+                          na_position="last", kind="stable").drop(columns="_t").reset_index(drop=True)
+    sm.write_csv(plan, os.path.join(out, "plan.csv"))
+    sm.write_csv(gap, os.path.join(out, "kite_gaps.csv"))
+
+    coverage = index_coverage(inp, states, usable)
+    sm.write_csv(coverage, os.path.join(out, "index_coverage.csv"))
+
+    extra = {"probe_failed": sum(1 for s in states.values() if s.get("probe_error")),
+             "not_probed": sum(1 for s in states.values() if s["match"] in MATCHED and not s["probed"]
+                               and not s.get("probe_error")),
+             "est_eod_rows": sum(len(kite_days.get(sid, [])) for sid in usable)}
+    info = build_info(folder, inp, plan, gap, periods, mismatches, sessions, extra, now)
+    text = report_text(info, gap, coverage)
+    sm.write_text(os.path.join(out, "build_report.txt"), text)
+    write_json(os.path.join(out, "build_info.json"), info)
+    log(text, end="")
+    return {"out": out, "plan": plan, "gaps": gap, "coverage": coverage, "periods": periods,
+            "mismatches": mismatches, "info": info, "report": text}
+
+
+def gaps_of(o, s, u):
+    """The kite_gaps.csv rows of one security."""
+    sid, a, b = u["security_id"], u["need_from"], u["need_to"]
+    if u["status"] == "EXITED":
+        reason = u["exit_reason"] or "UNKNOWN"
+        return [o.row("BOTH", sid, a, b, EXIT_REASONS.get(reason, reason))]
+    if u["status"] != "ACTIVE":
+        return [o.row("BOTH", sid, a, b, u["status"] or "NO_KITE_TOKEN", "not matched (only ACTIVE securities are)")]
+    if s["match"] == "NO_TOKEN":
+        return [o.row("BOTH", sid, a, b, "NO_KITE_TOKEN", s["token_note"])]
+    if s["match"] == "REVIEW":
+        return [o.row("BOTH", sid, a, b, "TOKEN_REVIEW", s["token_note"])]
+    if not s["probed"]:
+        return []
+    if s["match"] == "PRICE_MISMATCH":
+        return [o.row("BOTH", sid, a, b, "PRICE_MISMATCH", "Kite close differs from the bhavcopy on the last day")]
+    if s["eod_first"] is None:
+        return [o.row("BOTH", sid, a, b, "NO_KITE_DATA", "the token returned no day candles")]
+    out, days = [], s["days"]
+    missing = set(s["missing"])
+    before = [d for d in days if d < s["eod_first"]]
+    if len(before) > LATER_DAYS:
+        out.append(o.row("BOTH", sid, before[0], before[-1], "EOD_STARTS_LATER",
+                         f"Kite's first day candle {s['eod_first']}"))
+        missing -= set(before)
+    for first, last, n in runs_of(days, [d in missing for d in days]):
+        out.append(o.row("BOTH", sid, first, last, "EOD_EMPTY_DAYS", f"{n} bhavcopy day(s) without a Kite day candle",
+                         trading_days=n))
+    start = max(s["eod_first"], KITE_MINUTE_FROM)
+    kdays = [d for d in days if d >= start and d not in s["missing"]]
+    if s["minute_first"] is None:
+        if kdays:
+            out.append(o.row("1MIN", sid, kdays[0], kdays[-1], "MINUTE_STARTS_LATER", "no minute candles found"))
+    else:
+        lag = [d for d in kdays if d < s["minute_first"]]
+        if len(lag) > LATER_DAYS:
+            out.append(o.row("1MIN", sid, lag[0], lag[-1], "MINUTE_STARTS_LATER",
+                             f"Kite's first minute day {s['minute_first']}"))
+    return out
+
+
+def index_coverage(inp, states, usable):
+    """Per index and trading day in its coverage: members, members with Kite EOD / 1-minute, and those without."""
+    days = inp.days
+    pos = {d: i for i, d in enumerate(days)}
+    eod, minute = {}, {}
+    for sid in usable:
+        s = states[sid]
+        if s["eod_first"] is None:
+            continue
+        e = np.zeros(len(days), dtype=bool)
+        e[bisect_left(days, s["eod_first"]):bisect_right(days, s["eod_last"])] = True
+        for d in s.get("missing_all", s["missing"]):
+            if d in pos:
+                e[pos[d]] = False
+        eod[sid] = e
+        mn = e.copy()
+        mn[:bisect_left(days, s["minute_first"]) if s["minute_first"] else len(days)] = False
+        minute[sid] = mn
+    rows = []
+    for index in INDEXES:
+        c = inp.coverage.get(index) or {}
+        if not c.get("first"):
+            continue
+        first, last = bisect_left(days, sm.as_date(c["first"])), bisect_right(days, sm.as_date(c["last"])) - 1
+        n = last - first + 1
+        if n <= 0:
+            continue
+        members, with_e, with_m = np.zeros(n, int), np.zeros(n, int), np.zeros(n, int)
+        no_e, no_m = [[] for _ in range(n)], [[] for _ in range(n)]
+        mem = inp.membership[inp.membership["index"] == index]
+        for r in mem.itertuples():
+            i0 = max(bisect_left(days, sm.as_date(r.from_date)), first)
+            i1 = min(bisect_right(days, sm.as_date(r.to_date)) - 1 if r.to_date else last, last)
+            if i1 < i0:
+                continue
+            sl = slice(i0 - first, i1 - first + 1)
+            members[sl] += 1
+            e = eod.get(r.security_id, np.zeros(len(days), dtype=bool))[i0:i1 + 1]
+            mn = minute.get(r.security_id, np.zeros(len(days), dtype=bool))[i0:i1 + 1]
+            with_e[sl] += e
+            with_m[sl] += mn
+            for k in np.flatnonzero(~e):
+                no_e[i0 - first + k].append(r.symbol)
+            for k in np.flatnonzero(~mn):
+                no_m[i0 - first + k].append(r.symbol)
+        for k in range(n):
+            rows.append({"index": index, "date": iso(days[first + k]), "members": int(members[k]),
+                         "with_eod": int(with_e[k]), "with_minute": int(with_m[k]),
+                         "without_eod": ";".join(sorted(no_e[k])), "without_minute": ";".join(sorted(no_m[k]))})
+    return pd.DataFrame(rows, columns=COVERAGE_COLUMNS)
+
+
+def coverage_lines(coverage, index, kind, limit=None):
+    """'NIFTY 50: 1-minute 49 of 50 from a to b (HDFC)' per run of days with the same shortfall."""
+    c = coverage[coverage["index"] == index]
+    if c.empty:
+        return [f"{index}: not covered"]
+    col, without, label = ("with_eod", "without_eod", "EOD") if kind == "eod" else \
+        ("with_minute", "without_minute", "1-minute")
+    full = int((c[col] == c["members"]).sum())
+    lines = [f"{index}: {label} complete on {full:,} of {len(c):,} days"]
+    runs, prev = [], None
+    for r in c.itertuples():
+        key = (getattr(r, col), r.members, getattr(r, without))
+        if key[0] == key[1]:
+            prev = None
+            continue
+        if prev == key:
+            runs[-1][1] = r.date
+        else:
+            runs.append([r.date, r.date, key])
+        prev = key
+    for start, end, (have, members, names) in runs[:limit]:
+        span = start if start == end else f"{start} to {end}"
+        lines.append(f"  {label} {have} of {members} {'on' if start == end else 'from'} {span} ({names.replace(';', ', ')})")
+    if limit and len(runs) > limit:
+        lines.append(f"  ... {len(runs) - limit:,} more runs in index_coverage.csv")
+    return lines
+
+
+def counts(series):
+    return {str(k): int(v) for k, v in series.value_counts().sort_index().items()}
+
+
+def build_info(folder, inp, plan, gap, periods, mismatches, sessions, extra, now):
+    toks_info = {}
+    path = os.path.join(plan_dir(folder), "tokens_info.json")
+    if os.path.isfile(path):
+        with open(path, encoding="utf-8") as f:
+            toks_info = json.load(f)
+    eod_req, min_req = int(plan["eod_requests"].sum()), int(plan["minute_requests"].sum())
+    rows = int(plan["est_minute_rows"].sum())
+    return {
+        "built_at": f"{now or now_ist():%Y-%m-%d %H:%M:%S}", "bhav_first": iso(inp.days[0]), "bhav_last": iso(inp.days[-1]),
+        "instruments_date": toks_info.get("instruments_date", ""), "instruments_file": toks_info.get("instruments_file", ""),
+        "securities": len(plan), "status": counts(plan["status"]), "match_status": counts(plan["match_status"]),
+        "not_probed": extra["not_probed"], "probe_failed": extra["probe_failed"],
+        "download_eod": int((plan["download_eod"] == "Y").sum()), "download_minute": int((plan["download_minute"] == "Y").sum()),
+        "gap_rows": len(gap), "reason": counts(gap["reason"]), "data_missing": counts(gap["data_missing"]),
+        "priority": counts(gap["priority"].astype(str)),
+        "adjustment_periods": counts(periods["kind"]) if len(periods) else {},
+        "adjustment_securities": int(periods["security_id"].nunique()) if len(periods) else 0,
+        "eod_mismatch_rows": len(mismatches), "eod_mismatch_fields": counts(mismatches["field"]) if len(mismatches) else {},
+        "eod_mismatch_securities": int(mismatches["security_id"].nunique()) if len(mismatches) else 0,
+        "missing_sessions": {iso(d): {"lacking": a, "traded": b} for d, (a, b) in sessions.items()},
+        "kite_minute_from": iso(KITE_MINUTE_FROM),
+        "eod_requests": eod_req, "minute_requests": min_req,
+        "hours_at_2_5": round((eod_req + min_req) / SPEED / 3600, 1),
+        "est_minute_rows": rows, "est_eod_rows": extra["est_eod_rows"],
+        "est_disk_gb": {"parquet": round(rows * PARQUET_BYTES / 1e9, 1), "csv": round(rows * CSV_BYTES / 1e9, 1)},
+        "disk_assumption": f"{PARQUET_BYTES} bytes per minute row in parquet, {CSV_BYTES} in CSV (estimates)",
+        "parameters": {"price_tol_default": PRICE_TOL, "adj_tol": ADJ_TOL, "step_tol": STEP_TOL,
+                       "price_abs": PRICE_ABS, "price_rel": PRICE_REL, "volume_tol": VOLUME_TOL,
+                       "later_days": LATER_DAYS, "session_share": SESSION_SHARE, "session_min": SESSION_MIN},
+    }
+
+
+def report_text(info, gap, coverage):
+    def block(title, d):
+        return [title] + [f"  {k}: {v:,}" for k, v in d.items()]
+
+    lines = ["Kite 1-minute / EOD plan (phase 1)", f"Built {info['built_at']} IST",
+             f"Bhavcopy {info['bhav_first']} to {info['bhav_last']}; Kite instrument list {info['instruments_date'] or '-'}",
+             "", PART0_FINDINGS, "", f"Securities: {info['securities']:,}"]
+    lines += block("Status:", info["status"]) + block("Match status:", info["match_status"])
+    if info["not_probed"]:
+        lines.append(f"Not probed yet: {info['not_probed']:,} (run: python equity_minute.py probe)")
+    if info["probe_failed"]:
+        lines.append(f"Probe failed: {info['probe_failed']:,} (run probe again)")
+    lines += ["", f"Gap rows (kite_gaps.csv): {info['gap_rows']:,}"]
+    lines += block("Per reason:", info["reason"]) + block("Per data_missing:", info["data_missing"])
+    lines += block("Per priority:", info["priority"])
+    lines += ["", "Market-wide missing sessions: " + (", ".join(info["missing_sessions"]) or "none")]
+    lines += ["", f"Kite adjustment periods (kite_adjustment.csv): {sum(info['adjustment_periods'].values()):,} in "
+                  f"{info['adjustment_securities']:,} securities"] + \
+        [f"  {k}: {v:,}" for k, v in info["adjustment_periods"].items()]
+    lines += [f"EOD mismatches (eod_mismatch.csv): {info['eod_mismatch_rows']:,} rows in "
+              f"{info['eod_mismatch_securities']:,} securities"] + \
+        [f"  {k}: {v:,}" for k, v in info["eod_mismatch_fields"].items()]
+    lines += ["", "Index coverage (index_coverage.csv):"]
+    for index in INDEXES:
+        for kind in ("eod", "minute"):
+            lines += coverage_lines(coverage, index, kind, limit=None if index == "NIFTY 50" else 5)
+    lines += ["", "Later download:",
+              f"  EOD: {info['download_eod']:,} securities, {info['eod_requests']:,} requests, "
+              f"about {info['est_eod_rows']:,} rows",
+              f"  1-minute: {info['download_minute']:,} securities, {info['minute_requests']:,} requests, "
+              f"about {info['est_minute_rows']:,} rows",
+              f"  about {info['hours_at_2_5']:,} hours at {SPEED} requests/s",
+              f"  disk about {info['est_disk_gb']['parquet']} GB parquet / {info['est_disk_gb']['csv']} GB CSV "
+              f"({info['disk_assumption']})",
+              "  1-minute days missing inside a range can only be found by downloading it: the download task adds "
+              "them to the gap list."]
+    for p in (1, 2):
+        top = gap[gap["priority"] == p].head(TOP_GAPS)
+        lines += ["", f"Top {TOP_GAPS} gaps of priority {p}:"]
+        for r in top.itertuples():
+            lines.append(f"  {r.data_missing:4} {r.reason:20} {r.security_id or '-':8} {r.need_from}..{r.need_to} "
+                         f"{(r.symbols or r.note)[:60]} turnover {r.median_turnover if pd.notna(r.median_turnover) else '-'}")
+    return "\n".join(lines) + "\n"
+
+
+def read_built(folder, name):
+    path = os.path.join(plan_dir(folder), name)
+    if not os.path.isfile(path):
+        raise NotBuilt(f"No {path}. Run: python equity_minute.py gaps")
+    return pd.read_csv(path, dtype=str, keep_default_na=False)

@@ -615,6 +615,20 @@ python index_membership.py check                      # known cases (RELIANCE, H
 - **Your corrections** go in `<data folder>/index_membership/input/manual_changes.csv` (IN, OUT or IGNORE rows; created once with an example, never overwritten). Then run `build` again. `reference/manual_index_changes.csv` in this repo is its backup: after editing the data copy, copy it there and commit it.
 - **Files** in `<data folder>/index_membership/`: `nifty_membership.csv/.parquet`, `nifty_changes.csv`, `amfi.csv/.parquet`, `review.csv` (what needs a look: unmapped symbols, skipped changes, size mismatches, image-only notices, demerger notices) and `build_report.txt`. Build the security master again first after new bhavcopy days (the build refuses while it is older). Exit codes: 0 done, 1 not run, a download failed or `check` failed, 2 bad arguments or another run is going.
 
+## Kite 1-minute / EOD plan (which stocks Kite has)
+`equity_minute.py` prepares the later download of Kite 1-minute and day candles for every NSE stock since 2015. It downloads no candles to keep. It finds each stock's Kite token, checks from which day Kite has day and minute data, and writes the list of everything Kite lacks (to buy from a data vendor). Sign in to Kite first (`python app.py`).
+
+```
+python equity_minute.py tokens                 # Kite instrument list (one request) -> kite_tokens.csv
+python equity_minute.py probe                  # day candles + first minute day per stock (about an hour; --speed 2.5, resumable, --force)
+python equity_minute.py gaps                   # rebuild the outputs offline
+python equity_minute.py show RELIANCE
+```
+
+- **Files** in `<data folder>/equity_1min/plan/`: `kite_gaps.csv` (the shopping list: 1MIN, EOD or BOTH per stock and period, with reason, symbols, ISINs, indices and priority 1 = NIFTY 50, 2 = NIFTY 500), `plan.csv` (one row per stock: token, first days, requests for the download), `index_coverage.csv` (per index and day: members with Kite EOD / 1-minute), `kite_adjustment.csv` and `kite_vs_bhav.parquet` (how Kite's adjusted prices relate to the bhavcopy), `eod_mismatch.csv`, `build_report.txt`.
+- Kite only has stocks that trade today, so delisted and merged companies are always in the list. Kite has no 1-minute data before 2015-02-02 at all.
+- `probe` refuses while a Kite F&O download runs (they would share Kite's request limit). If the Kite session expires it stops; sign in again and run `probe` again: finished stocks are kept. Exit codes: 0 done, 1 not run, some stocks failed or stopped, 2 bad arguments, busy, or Kite sign-in needed.
+
 ## Credentials
 Your API keys, secrets and access tokens (Kite and Dhan) are stored only in a local `.env` file, which the app creates when you sign in. It is gitignored and never committed. `.env.example` shows the format.
 
