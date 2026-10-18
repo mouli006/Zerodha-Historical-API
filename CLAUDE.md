@@ -37,6 +37,7 @@ A local Flask app ("Kite Backfill", one machine) that:
 - `adjustments.py`: build / show / check split / bonus factors (price move confirmed by ISIN change or NSE CSV), fetch-actions (NSE corporate actions). See docs/dev/adjustments.md.
 - `exits.py`: build / show / check the exit list (status, exit reason, suggested treatment) and listing kinds. See docs/dev/exits.md.
 - `equity_update.py`: the daily equity update, runs cm_bhav / security_master / adjustments / exits (and nse_reference) in order. See docs/dev/equity_update.md.
+- `index_membership.py`: fetch (network) / build / members / show / check NIFTY index membership and AMFI categories, point in time. See docs/dev/index_membership.md.
 - Never run a CLI against real Kite or Dhan unless the user asks.
 
 ## Code map
@@ -64,6 +65,7 @@ Equity
 - `backfill/equity/adjustments.py` / `corp_actions.py` (+ `adjustments.py`): split / bonus factors, `factor_on`, `adjusted_history`; NSE corporate-actions download.
 - `backfill/equity/exits.py` (+ `exits.py`): exit list, listing kinds, `exit_info`, `exits_between`, `status_on`, `listing_info`.
 - `backfill/equity/update.py` (+ `equity_update.py`): runs the equity CLIs as subprocesses (`run_step`), up-to-date skips, log.
+- `backfill/equity/index_fetch.py` / `index_notices.py` / `index_membership.py` (+ `index_membership.py`): downloads, notice / AMFI parsers, build, `members`, `amfi_category`.
 - `backfill/instruments.py`, `storage.py`, `runner.py`: the Kite bulk candle download.
 
 Web
@@ -96,3 +98,4 @@ Web
 | split / bonus factors (detection, confirmation, manual overrides, loaders) | docs/dev/adjustments.md |
 | exit list and listing kinds (reasons, priority, treatments, loaders) | docs/dev/exits.md |
 | daily equity update (steps, up to date, warnings vs. failures, log) | docs/dev/equity_update.md |
+| index membership and AMFI categories (sources, notice parsing, walk, checks, loaders, limits) | docs/dev/index_membership.md |

@@ -596,6 +596,22 @@ python equity_update.py --from-step exits  # start at a step (after fixing a fai
 
 Each build runs only when its inputs are newer than its last build, and its known-case check runs right after it. A download that partly fails (a bhavcopy day, a corporate-action year, a reference file) is a **warning**: the update goes on with what is saved. A build or check that fails stops the update. The table at the end shows each step's result, time and key numbers. Every step's full output is in `<data folder>/equity_update.log`. No broker is used, and F&O is never touched. Exit codes: 0 all OK (warnings listed), 1 a build or check failed, 2 bad arguments or something else is running.
 
+## Index membership and AMFI categories
+`index_membership.py` says which companies were in NIFTY 50, Next 50, 100, 200, 500, Midcap 150, Smallcap 250 and Midcap 100 on any day, and which AMFI category (LARGE / MID / SMALL) a company had. It is not part of `equity_update.py` yet: run it by hand.
+
+```
+python index_membership.py fetch                      # download AMFI lists, current NIFTY lists, NSE Indices notices, archived lists (network)
+python index_membership.py build                      # offline rebuild; --amfi-lag 5 (trading days)
+python index_membership.py members "NIFTY 50" 2023-07-13
+python index_membership.py show HDFC                  # its NIFTY periods and AMFI categories
+python index_membership.py check                      # known cases (RELIANCE, HDFC -> LTIM, reviews per year, AMFI 100 / 150)
+```
+
+- **Point in time:** a company is in an index from the change's effective date (and out from the effective date of its exclusion). An AMFI list counts from the first trading day of the month after its half year plus 5 trading days. Asking for a date outside the covered range is an error, never a guess.
+- **Sources:** the current constituent lists from niftyindices.com, walked back through NSE Indices' change notices (PDF, since late 2014); the AMFI half-yearly Excel lists (since H2-2017). Wayback Machine copies of old lists are only used as a check.
+- **Your corrections** go in `<data folder>/index_membership/input/manual_changes.csv` (IN, OUT or IGNORE rows; created once with an example, never overwritten). Then run `build` again.
+- **Files** in `<data folder>/index_membership/`: `nifty_membership.csv/.parquet`, `nifty_changes.csv`, `amfi.csv/.parquet`, `review.csv` (what needs a look: unmapped symbols, skipped changes, size mismatches, image-only notices, demerger notices) and `build_report.txt`. Build the security master again first after new bhavcopy days (the build refuses while it is older). Exit codes: 0 done, 1 not run, a download failed or `check` failed, 2 bad arguments or another run is going.
+
 ## Credentials
 Your API keys, secrets and access tokens (Kite and Dhan) are stored only in a local `.env` file, which the app creates when you sign in. It is gitignored and never committed. `.env.example` shows the format.
 
