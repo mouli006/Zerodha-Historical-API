@@ -584,11 +584,11 @@ python exits.py check        # known cases (HDFC -> HDFCBANK, MINDTREE -> LTI, t
 - **Files** in `<data folder>/exits/`: `exits.csv/.parquet`, `status.csv/.parquet`, `listings.csv`, `review.csv` (large unknown exits, conflicting matches, acquirers not found, list rows that matched nothing) and `build_report.txt`. Build the security master and the adjustments again first after new bhavcopy days (the build refuses while they are older). Exit codes: 0 done, 1 not run or `check` failed, 2 bad arguments or another run is going.
 
 ## Daily equity update
-Instead of running `cm_bhav.py --missing`, `security_master.py build`, `adjustments.py fetch-actions`, `adjustments.py build` and `exits.py build` one by one, run one command (after 19:00 IST, by hand):
+Instead of running `cm_bhav.py --missing`, `security_master.py build`, `adjustments.py fetch-actions`, `adjustments.py build`, `exits.py build` and `index_membership.py build` one by one, run one command (after 19:00 IST, by hand):
 
 ```
 python equity_update.py                    # bhavcopy, security master, corporate actions, adjustments, exit list
-python equity_update.py --with-reference   # also refresh the NSE delisting / merger lists first
+python equity_update.py --with-reference   # monthly: also refresh the NSE delisting / merger lists and the index membership sources
 python equity_update.py --offline          # no network: rebuild only what is out of date from the saved files
 python equity_update.py --dry-run          # show what would run
 python equity_update.py --from-step exits  # start at a step (after fixing a failure); --force rebuilds everything
@@ -597,7 +597,7 @@ python equity_update.py --from-step exits  # start at a step (after fixing a fai
 Each build runs only when its inputs are newer than its last build, and its known-case check runs right after it. A download that partly fails (a bhavcopy day, a corporate-action year, a reference file) is a **warning**: the update goes on with what is saved. A build or check that fails stops the update. The table at the end shows each step's result, time and key numbers. Every step's full output is in `<data folder>/equity_update.log`. No broker is used, and F&O is never touched. Exit codes: 0 all OK (warnings listed), 1 a build or check failed, 2 bad arguments or something else is running.
 
 ## Index membership and AMFI categories
-`index_membership.py` says which companies were in NIFTY 50, Next 50, 100, 200, 500, Midcap 150, Smallcap 250 and Midcap 100 on any day, and which AMFI category (LARGE / MID / SMALL) a company had. It is not part of `equity_update.py` yet: run it by hand.
+`index_membership.py` says which companies were in NIFTY 50, Next 50, 100, 200, 500, Midcap 150, Smallcap 250 and Midcap 100 on any day, and which AMFI category (LARGE / MID / SMALL) a company had. `equity_update.py` rebuilds it when its inputs change, and fetches its sources with `--with-reference`.
 
 ```
 python index_membership.py fetch                      # download AMFI lists, current NIFTY lists, NSE Indices notices, archived lists (network)

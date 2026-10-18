@@ -19,34 +19,41 @@ python equity_update.py [--folder PATH] [--offline] [--with-reference] [--force]
 | 4 | `actions` | `adjustments.py fetch-actions` | yes | `--offline` |
 | 5 | `adjustments` | `adjustments.py build`, `adjustments.py check` | no | up to date |
 | 6 | `exits` | `exits.py build`, `exits.py check` | no | up to date |
+| 7 | `index_fetch` | `index_membership.py fetch` | yes (AMFI, niftyindices, web.archive.org) | always unless `--with-reference`; `--offline` |
+| 8 | `index` | `index_membership.py build`, `index_membership.py check` | no | up to date |
 
 `--folder` (absolute, like the other CLIs) is passed to every command when given. Lock, log and freshness use it,
 else `config.equity_data_dir()`.
 
 ## Options
-- `--offline`: skip 1, 2 and 4 (even with `--with-reference`) and rebuild from what is saved.
-- `--with-reference`: run step 1 first.
+- `--offline`: skip 1, 2, 4 and 7 (even with `--with-reference`) and rebuild from what is saved.
+- `--with-reference`: also run the monthly downloads: step 1 first and step 7 (`WITH_REFERENCE`).
 - `--force`: run every build even when up to date.
 - `--from-step NAME`: start there. Earlier steps show SKIPPED "before --from-step". An unknown name is an
   argparse error (2).
 - `--dry-run`: print each step, its commands, and whether it would run, be skipped or is up to date now. It runs
   nothing, takes no lock and writes no log.
 
-## Up to date (steps 3, 5, 6)
+## Up to date (steps 3, 5, 6, 8)
 A build is skipped, together with its check, when its `build_info.json` is at least as new (mtime) as every input
 file that exists (`inputs_of()`). It is evaluated when the step is reached, so a master rebuilt in this run makes
-the adjustments and exits stale. A missing `build_info.json` always runs.
+the adjustments, exits and index stale. A missing `build_info.json` always runs.
 
 | Build | Output | Inputs compared |
 |---|---|---|
 | master | `security_master\build_info.json` | every `NSE_CM_bhav\<YYYY>.parquet` |
 | adjustments | `adjustments\build_info.json` | `security_master\build_info.json`, every `adjustments\input\*.csv`, `adjustments\manual_factors.csv`, every year file |
 | exits | `exits\build_info.json` | `security_master\build_info.json`, `adjustments\build_info.json`, the six lists in `NSE_CM_bhav\reference\` (`exits.REFERENCE_FILES`, incl. `manual_mergers.csv`), every year file |
+| index | `index_membership\build_info.json` | `security_master\build_info.json`, every year file, every file under `index_membership\input\` at any depth (`amfi\`, `nifty_current\`, `nifty_changes\`, `snapshots\`, `manual_changes.csv`, the draft files) |
 
 These are the comparisons the builds themselves use for their stale refusals, plus their input folders.
 - `fetch-actions` always downloads the current year again and rewrites `corporate_actions_<year>.csv`, so an
   online run normally rebuilds adjustments and exits.
 - `--with-reference` rewrites the reference lists, so exits rebuild too.
+- `index_fetch` saves dated copies of the current constituent lists (and the listing pages, the Wayback indexes) on
+  every run, so a `--with-reference` run always rebuilds the index membership. Without it, `index` rebuilds only
+  after a new master build, a new bhavcopy year file, or an edit under `index_membership\input\` (e.g.
+  `manual_changes.csv`).
 
 ## Warnings vs. failures
 The exit codes are the CLIs' own (checked 2026-10-19):
@@ -61,15 +68,19 @@ The exit codes are the CLIs' own (checked 2026-10-19):
   - 0 done.
   - 1 not run / stale / bad input / check failed / a year not fetched.
   - 2 arguments or a lock busy.
+- `index_membership.py`:
+  - fetch: 0 done; 1 some files failed (each printed with the path to save it by hand); 2 arguments or its lock.
+  - build / check: 0 done; 1 not built / stale master / check failed; 2 arguments, its lock or a bhavcopy /
+    master lock busy.
 
 What the update does with them:
-- **Downloads** (`reference`, `bhavcopy`, `actions`):
+- **Downloads** (`reference`, `bhavcopy`, `actions`, `index_fetch`):
   - 0 -> OK.
   - 1 -> **WARNING**: some days, years or files failed (e.g. a bhavcopy day that failed its checks, a blocked
     corporate-action year, nse_reference's broken Cora Hub PDF link). The step's last 20 output lines are shown,
     and the update goes on: the builds work on what is saved.
   - An output containing `Traceback (most recent call last)` is a crash, not "some items failed": FAILED.
-- **Builds and checks** (`master`, `adjustments`, `exits`): any non-zero exit is FAILED and stops the update at
+- **Builds and checks** (`master`, `adjustments`, `exits`, `index`): any non-zero exit is FAILED and stops the update at
   that step. The later steps show "not run".
 - **Exit 2** from any step (a lock busy, arguments) stops the update.
 
@@ -94,7 +105,8 @@ published yet. cm_bhav marks it pending; this is only a hint.
     or not run.
   - A list of the warnings, then the log path.
 - **Key numbers** (`NUMBERS`): the last line of the step's output that matches; "-" in place of a number when
-  none matches.
+  none matches. Two other kinds of spec: `("sum", regex, format)` adds each group over every matching line;
+  `("count", [regex, ...], format)` counts the lines matching each regex.
 
   | Step | Line | Shown |
   |---|---|---|
@@ -104,6 +116,8 @@ published yet. cm_bhav marks it pending; this is only a hint.
   | actions | `saved A, skipped B, failed C (years ...)` | `saved A, skipped B, failed C` |
   | adjustments | `  applied: N (...` | `applied N` |
   | exits | `  EXITED: N`, `Review rows: N` | `exited N; review N` |
+  | index_fetch | `<part>: saved A, refreshed B, skipped C, not found D, failed E` (part = amfi, nifty, changes, snapshots), summed (`FETCH_PART`) | `saved A, failed E` |
+  | index | the report's "Reliable from" lines `  <index> <date>    <why>` (a date then 3+ spaces, `RELIABLE`) and `  <index> not reliable  <why>` (`UNRELIABLE`), counted; `Review rows: N` | `reliable A of B; review N` |
 
   Steps with a check add `check ok` when the last `Check: ok` / `Known-case checks: all found` line says so,
   else `check -`.
@@ -115,7 +129,8 @@ published yet. cm_bhav marks it pending; this is only a hint.
 
 ## Daily routine
 - Every evening after 19:00 IST: `python equity_update.py`.
-- Now and then (or when new delistings / mergers are expected): `python equity_update.py --with-reference`.
+- Monthly (or when new delistings / mergers / index changes are expected): `python equity_update.py
+  --with-reference` (the NSE reference lists and the index membership sources).
 - No network: `python equity_update.py --offline`.
 - After fixing a failed step: `python equity_update.py --from-step <step>`.
 - Run by hand; no cron.
@@ -127,6 +142,10 @@ outputs have set mtimes in `tmp_path`, and `config.load_env` is stubbed.
 
 Covers:
 - the order of steps, `--with-reference`, `--offline`, `--folder` on every command;
+- `index_fetch` / `index`: the order, skipped without `--with-reference` and offline, a fetch warning (the build
+  still runs), a fetch crash and exit 2, build and check failures, each input kind making `index` stale
+  (incl. a new file in a sub-folder and a fetch in the same run), `--from-step index_fetch` / `index`, the key
+  numbers and their "-";
 - the `run_step` argv (same Python, no shell, repo cwd);
 - download warnings, including the last 20 lines;
 - a crash, build and check failures, exit 2 from any kind of step;

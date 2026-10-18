@@ -2,7 +2,9 @@
 
 Point-in-time membership of eight NIFTY indices and the AMFI large / mid / small cap lists
 (`backfill/equity/index_fetch.py`, `index_notices.py`, `index_membership.py`; CLI `index_membership.py`). Only
-`fetch` uses the network. The build and the loaders are offline. Not part of `equity_update.py` yet.
+`fetch` uses the network. The build and the loaders are offline. `equity_update.py` runs `fetch` with
+`--with-reference` (step `index_fetch`) and `build` + `check` when the inputs changed (step `index`; see
+docs/dev/equity_update.md).
 
 ## Sources (checked 2026-10-17)
 

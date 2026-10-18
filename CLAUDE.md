@@ -36,7 +36,7 @@ A local Flask app ("Kite Backfill", one machine) that:
 - `security_master.py`: build / show / check the security master (one `security_id` per company). See docs/dev/security_master.md.
 - `adjustments.py`: build / show / check split / bonus factors (price move confirmed by ISIN change or NSE CSV), fetch-actions (NSE corporate actions). See docs/dev/adjustments.md.
 - `exits.py`: build / show / check the exit list (status, exit reason, suggested treatment) and listing kinds. See docs/dev/exits.md.
-- `equity_update.py`: the daily equity update, runs cm_bhav / security_master / adjustments / exits (and nse_reference) in order. See docs/dev/equity_update.md.
+- `equity_update.py`: the daily equity update, runs cm_bhav / security_master / adjustments / exits / index_membership (and nse_reference, index fetch) in order. See docs/dev/equity_update.md.
 - `index_membership.py`: fetch (network) / build / members / show / check NIFTY index membership and AMFI categories, point in time. See docs/dev/index_membership.md.
 - Never run a CLI against real Kite or Dhan unless the user asks.
 

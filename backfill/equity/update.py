@@ -6,6 +6,8 @@
     actions      adjustments.py fetch-actions                       (network)
     adjustments  adjustments.py build, adjustments.py check
     exits        exits.py build, exits.py check
+    index_fetch  index_membership.py fetch                          (only with --with-reference; network)
+    index        index_membership.py build, index_membership.py check
 
 No rule or data logic of its own: every decision is the step's. It only decides what to run (--offline skips the
 network steps; a build whose build_info.json is newer than all its inputs is "up to date"), classifies the exit
@@ -21,6 +23,7 @@ from glob import glob
 from backfill.cm_bhav import READY_AT, now_ist, store_dir
 from backfill.equity import adjustments as adj
 from backfill.equity import exits as ex
+from backfill.equity import index_membership as im
 from backfill.equity import security_master as sm
 from backfill.locks import LockBusy, RunLock  # noqa: F401 - LockBusy is re-exported for the CLI
 from config import equity_data_dir
@@ -39,11 +42,22 @@ STEPS = [
     ("actions", True, [["adjustments.py", "fetch-actions"]]),
     ("adjustments", False, [["adjustments.py", "build"], ["adjustments.py", "check"]]),
     ("exits", False, [["exits.py", "build"], ["exits.py", "check"]]),
+    ("index_fetch", True, [["index_membership.py", "fetch"]]),
+    ("index", False, [["index_membership.py", "build"], ["index_membership.py", "check"]]),
 ]
 STEP_NAMES = [s[0] for s in STEPS]
+WITH_REFERENCE = ("reference", "index_fetch")   # monthly downloads: only with --with-reference
 
 N = r"(\d(?:[\d,]*\d)?)"     # a number as the CLIs print it (1,234), never a trailing comma
-# key numbers: (regex, format) on the last matching line of the step's output; "-" when nothing matches
+FETCH_PART = r"^(?:amfi|nifty|changes|snapshots): saved " + N + r", refreshed " + N + r", skipped " + N + \
+    r", not found " + N + r", failed " + N
+# index_membership's report: the "Reliable from" lines are "  <index padded> <date padded to 12>  <why>" (a date then
+# 3+ spaces; the coverage lines have "DATE to DATE", the snapshot lines "DATE (file")
+RELIABLE = r"^  NIFTY [A-Z0-9 ]+? +\d{4}-\d{2}-\d{2} {3,}\S"
+UNRELIABLE = r"^  NIFTY [A-Z0-9 ]+? +not reliable  "
+# key numbers. (regex, format): the last matching line of the step's output, "-" when nothing matches.
+# ("sum", regex, format): every matching line, each group summed. ("count", [regex, ...], format): the number of
+# lines matching each regex. Both give "-" when no line matches.
 NUMBERS = {
     "reference": [(r"Downloaded " + N + r" new file\(s\)", "downloads {0}")],
     "bhavcopy": [(r"This run: ok " + N + r", holidays " + N + r", failed " + N + r", pending " + N,
@@ -52,6 +66,9 @@ NUMBERS = {
     "actions": [(r"^saved " + N + r", skipped " + N + r", failed " + N, "saved {0}, skipped {1}, failed {2}")],
     "adjustments": [(r"^  applied: " + N + r" \(", "applied {0}")],
     "exits": [(r"^  EXITED: " + N, "exited {0}"), (r"^Review rows: " + N, "review {0}")],
+    "index_fetch": [("sum", FETCH_PART, "saved {0}, failed {4}")],
+    "index": [("count", [RELIABLE, RELIABLE + "|" + UNRELIABLE], "reliable {0} of {1}"),
+              (r"^Review rows: " + N, "review {0}")],
 }
 CHECK_LINE = re.compile(r"^(Check: (?:ok|FAILED)|Known-case checks: (?:all found|SOME NOT FOUND))\s*$", re.M)
 
@@ -72,6 +89,11 @@ def inputs_of(folder, name):
     if name == "adjustments":
         return factors, [master] + sorted(glob(os.path.join(adj.out_dir(folder), adj.INPUT, "*.csv"))) \
             + [os.path.join(adj.out_dir(folder), adj.MANUAL)] + years
+    if name == "index":
+        inputs = []
+        for base, _, files in os.walk(os.path.join(im.out_dir(folder), "input")):
+            inputs += [os.path.join(base, n) for n in files]
+        return os.path.join(im.out_dir(folder), "build_info.json"), [master] + years + sorted(inputs)
     refs = [os.path.join(ex.reference_dir(folder), n) for n in ex.REFERENCE_FILES]
     return os.path.join(ex.out_dir(folder), "build_info.json"), [master, factors] + refs + years
 
@@ -115,7 +137,18 @@ def run_step(name, argv, log):
 def key_numbers(name, outputs):
     text = "\n".join(outputs)
     parts = []
-    for rx, fmt in NUMBERS[name]:
+    for spec in NUMBERS[name]:
+        if spec[0] == "count":
+            counts = [len(re.findall(rx, text, re.M)) for rx in spec[1]]
+            parts.append(spec[2].format(*(counts if any(counts) else ["-"] * len(counts))))
+            continue
+        if spec[0] == "sum":
+            found = re.findall(spec[1], text, re.M)
+            groups = re.compile(spec[1]).groups
+            values = [sum(int(f[k].replace(",", "")) for f in found) for k in range(groups)] if found else ["-"] * groups
+            parts.append(spec[2].format(*values))
+            continue
+        rx, fmt = spec
         found = re.findall(rx, text, re.M)
         values = (found[-1] if isinstance(found[-1], tuple) else (found[-1],)) if found else ("-",) * re.compile(rx).groups
         parts.append(fmt.format(*values))
@@ -140,7 +173,7 @@ def plan(offline=False, with_reference=False, from_step=None):
         reason = None
         if i < start:
             reason = "before --from-step"
-        elif name == "reference" and not with_reference:
+        elif name in WITH_REFERENCE and not with_reference:
             reason = "not asked; add --with-reference"
         elif network and offline:
             reason = "--offline"
