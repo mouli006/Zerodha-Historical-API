@@ -39,6 +39,9 @@ DATE_TEXT = r"([A-Z][a-z]{2,8}\.?\s+\d{1,2}\s*,?\s*\d{4})"
 WEEKDAY = r"(?:(?:mon|tues|wednes|thurs|fri|satur|sun)day\s*,?\s*)?"
 BECOME = re.compile(r"(?:become|be)\s+effective\s+(?:from|on|w\.e\.f\.?)\s*" + WEEKDAY + DATE_TEXT, re.I)
 EFFECTIVE = re.compile(r"effective\s+(?:from|on)\s*" + WEEKDAY + DATE_TEXT, re.I)
+# "The changes in all indices listed above (excluding Nifty Midcap Select index) shall become effective from DATE"
+LISTED_ABOVE = re.compile(r"indices\s+listed\s+above.{0,120}?effective\s+(?:from|on)\s*" + WEEKDAY + DATE_TEXT,
+                          re.I | re.S)
 WEF = re.compile(r"w\.?\s?e\.?\s?f\.?\s*" + WEEKDAY + DATE_TEXT, re.I)
 HEADING = re.compile(r"^\(?(\d{1,2}|[a-z]{1,4})\)\s*(.+?)\s*$")   # 2) Nifty 500, (1) CNX Nifty, a) Nifty 50
 SECTION = re.compile(r"^([A-H])\.\s+(.*)$")
@@ -51,6 +54,9 @@ REPLACES = re.compile(r"stands?\s+replaced|shall\s+stand\s+replaced", re.I)   # 
 SYMBOL_NAMED = re.compile(r"\(\s*symbol\s*:\s*([A-Z0-9][A-Z0-9&\-]*)\s*\)", re.I)
 LIST_OUT = re.compile(r"\bexcluded\s+from\b", re.I)
 LIST_IN = re.compile(r"\bincluded\s+in\b", re.I)
+# "Index Name | Security Name | Symbol | Remarks" tables (a revision of an earlier notice, e.g. ind_prs19032024.pdf,
+# ind_prs25092024.pdf): Remarks -> action; REVOKE_* cancels the earlier notice's row (index_membership)
+REMARKS = {"inclusion": "IN", "exclusion": "OUT", "inclusion revoked": "REVOKE_IN", "exclusion revoked": "REVOKE_OUT"}
 NO_TEXT = 200   # characters: a notice with less text is an image PDF (text drawn as pictures)
 
 
@@ -186,6 +192,11 @@ def is_stock_header(row):
     return any("symbol" in c for c in cells) and any(("name" in c) or ("company" in c) or ("scrip" in c) for c in cells)
 
 
+def is_revision_table(row):
+    cells = [c.lower() for c in row]
+    return all(any(k in c for c in cells) for k in ("index name", "symbol", "remarks"))
+
+
 def is_index_list(row):
     cells = [c.lower() for c in row]
     return any("index name" in c for c in cells) and not any("symbol" in c for c in cells)
@@ -193,7 +204,9 @@ def is_index_list(row):
 
 def parse_notice(items, announced, title="", file=""):
     """{"changes", "not_applied", "unresolved", "dates", "review", "headings", "demerger", "replaces", "no_text"}.
-    A change: index, effective_date, action (IN / OUT), symbol, company, announced_date, file. not_applied: indices
+    A change: index, effective_date, action (IN / OUT, or REVOKE_IN / REVOKE_OUT from a revision table: the earlier
+    notice's IN / OUT of that index, symbol and date is cancelled), symbol, company, announced_date, file.
+    odd_rows: revision-table rows of our indices with an unknown remark. not_applied: indices
     named in an "Index Name" table (a corporate action without a stock table). replaces: the notice says an earlier
     list "stands replaced" (its lists replace the earlier notices' lists of the same indices and date)."""
     text = stream_text(items)
@@ -201,16 +214,19 @@ def parse_notice(items, announced, title="", file=""):
     per_index = section_dates(items) if len(dates) > 1 else {}
     out = {"changes": [], "not_applied": [], "unresolved": [], "dates": dates, "review": bool(REVIEW.search(text)),
            "headings": [], "demerger": bool(DEMERGER.search(text) or DEMERGER.search(title)),
-           "replaces": bool(REPLACES.search(text)), "no_text": len(text) < NO_TEXT}
+           "replaces": bool(REPLACES.search(text)), "no_text": len(text) < NO_TEXT, "odd_rows": []}
+
+    listed_above = dates_in(LISTED_ABOVE, text) if len(dates) > 1 else []
 
     def when(index):
         if len(dates) == 1:
             return dates[0]
-        return per_index.get(index)
+        return per_index.get(index) or (listed_above[0] if len(listed_above) == 1 else None)
 
     index, action, symbol_col = None, None, None
     unresolved, block = set(), set()
     context = []   # text lines since the last table (an index-name table is explained just above it)
+    revision_index = None   # carried down the blank Index Name cells of a revision table, across page breaks
 
     def add(symbol, company):
         day = when(index)
@@ -247,6 +263,26 @@ def parse_notice(items, announced, title="", file=""):
         rows = it["table"]
         above, context = " ".join(context), []
         if not rows:
+            continue
+        if is_revision_table(rows[0]):
+            head = [c.lower() for c in rows[0]]
+            ci, cn, cs, cr = (next(j for j, c in enumerate(head) if k in c)
+                              for k in ("index name", "security", "symbol", "remarks"))
+            for r in rows[1:]:
+                if len(r) <= max(ci, cn, cs, cr):
+                    continue
+                if r[ci].strip():
+                    revision_index = map_name(r[ci])
+                if revision_index is None:
+                    continue
+                remark = re.sub(r"[^a-z ]", "", r[cr].lower()).strip()
+                act = REMARKS.get(remark)
+                if act is None:
+                    out["odd_rows"].append(f"{revision_index} {clean_symbol(r[cs])}: remark {r[cr]!r}")
+                    continue
+                index, action, block = revision_index, act, set()
+                add(r[cs], r[cn])
+            index, action = None, None
             continue
         if is_index_list(rows[0]):
             # one stock entering / leaving the listed indices. Applied when the text names it ("(Symbol: X) shall be

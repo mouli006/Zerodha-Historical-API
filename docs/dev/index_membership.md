@@ -65,6 +65,13 @@ table are dropped. The build caches it in `index_membership\text_cache\<file>.js
     indices" (ind_prs23082024_1.pdf), and the notice is not a demerger.
   - A demerger's spun-off company (JIOFIN 2023, ...) is never applied (review `not_applied`; your decision,
     2026-10-17).
+- **Revision tables** "Index Name | Security Name | Symbol | Remarks" (`is_revision_table`; 3 notices since 2015:
+  ind_prs19032024, ind_prs23092024, ind_prs25092024):
+  - The index name is carried down blank cells (also across a page break).
+  - Remarks map through `REMARKS`: Inclusion → IN, Exclusion → OUT, Inclusion revoked → REVOKE_IN, Exclusion
+    revoked → REVOKE_OUT. Any other remark on one of our indices → `odd_rows` (review `not_parsed`).
+  - When a notice has several dates, "all indices listed above ... effective from DATE" (`LISTED_ABOVE`) gives
+    the date of the indices without their own section date (ind_prs25092024: Midcap Select alone was postponed).
 - `replaces`: the text says an earlier list "stands replaced" (ind_prs15092021.pdf).
 - `no_text`: less than `NO_TEXT` characters, an image-only PDF (ind_prs23082021.pdf, the Sept 2021 review).
 
@@ -96,6 +103,10 @@ table are dropped. The build caches it in `index_membership\text_cache\<file>.js
 
 **Changes** (`assemble_changes`)
 - Parsed rows, deduplicated per file.
+- **Revoked:** a REVOKE_IN / REVOKE_OUT row cancels the earlier-announced parsed IN / OUT of the same index, symbol
+  and effective date. The cancelled row gets status `revoked`; the revoke row gets status `revocation` (never
+  walked). A revocation matching nothing → review `conflict`. (IREDA's inclusion, March 2024; Vodafone Idea's
+  exclusion and Central Bank's moves, Sept 2024.)
 - **Superseded:** the same index + symbol + action announced again before the first one's effective date → the
   earlier row is `superseded` (Yes Bank 2020: 18 Feb for 27 Mar, then 16 Mar for 19 Mar).
 - A `replaces` notice supersedes the earlier same-index, same-date rows of the indices it lists.
@@ -212,6 +223,9 @@ table are dropped. The build caches it in `index_membership\text_cache\<file>.js
     then copied to `manual_changes.csv`.
   - Its 500 / Midcap 150 / Smallcap 250 lists were replaced by ind_prs15092021.pdf (parsed), so they are not
     drafted.
+- **ind_prs21022018.pdf**, the April 2018 one-time Midcap 100 recomposition, sits under a sentence heading ("11)
+  IISL had announced revision of criteria ...") with the index name on a bullet line. It is the only notice like
+  that since 2015, so it isn't parsed: its 92 rows are drafted in `input\draft_rows_2018-04.csv`.
 - A missed change makes every earlier date of that index wrong for the stocks involved. The snapshots, the size
   check and `undo_mismatch` show where; fix it with manual rows.
 

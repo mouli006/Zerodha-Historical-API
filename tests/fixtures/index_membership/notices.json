@@ -2552,5 +2552,746 @@
    "top": 784.3,
    "text": "2"
   }
+ ],
+ "ind_prs19032024.pdf": [
+  {
+   "page": 1,
+   "top": 134.0,
+   "text": "PRESS RELEASE"
+  },
+  {
+   "page": 1,
+   "top": 163.2,
+   "text": "Mumbai, March 19, 2024"
+  },
+  {
+   "page": 1,
+   "top": 213.5,
+   "text": "Replacements in indices"
+  },
+  {
+   "page": 1,
+   "top": 252.7,
+   "text": "The Index Maintenance Sub-Committee (Equity) of NSE Indices Limited has decided to make changes"
+  },
+  {
+   "page": 1,
+   "top": 267.6,
+   "text": "in various indices as listed hereunder. These changes shall become effective from March 28, 2024 (close"
+  },
+  {
+   "page": 1,
+   "top": 282.5,
+   "text": "of March 27, 2024)."
+  },
+  {
+   "page": 1,
+   "top": 312.1,
+   "text": "A. Replacement on account of non-compliance of SEBI Portfolio Concentration Norms:"
+  },
+  {
+   "page": 1,
+   "top": 339.7,
+   "text": "On February 28, 2024, as part of periodic review of various indices, the Index Maintenance Sub-"
+  },
+  {
+   "page": 1,
+   "top": 353.3,
+   "text": "Committee (Equity) of NSE Indices Limited had announced inclusion of Indian Renewable Energy"
+  },
+  {
+   "page": 1,
+   "top": 367.3,
+   "text": "Development Agency Ltd. (IREDA) in Nifty 500, Nifty Midcap 150, Nifty Midcap 100, Nifty 200,"
+  },
+  {
+   "page": 1,
+   "top": 381.0,
+   "text": "Nifty LargeMidcap 250, Nifty MidSmallcap 400, Nifty Total Market and Nifty500 Multicap 50:25:25"
+  },
+  {
+   "page": 1,
+   "top": 394.9,
+   "text": "indices with effect from March 28, 2024."
+  },
+  {
+   "page": 1,
+   "top": 422.5,
+   "text": "As IREDA breached one of the requirements of SEBI Portfolio Concentration Norms for Equity"
+  },
+  {
+   "page": 1,
+   "top": 436.2,
+   "text": "Exchange Traded Funds (ETFs) and Index Funds related to impact cost, the Committee has decided to"
+  },
+  {
+   "page": 1,
+   "top": 450.1,
+   "text": "revoke its earlier decision to include IREDA announced on February 28, 2024."
+  },
+  {
+   "page": 1,
+   "top": 477.7,
+   "text": "Following changes shall be made in various indices as a result of revocation of IREDA’s inclusion in"
+  },
+  {
+   "page": 1,
+   "top": 491.4,
+   "text": "various indices:"
+  },
+  {
+   "page": 1,
+   "top": 517.6,
+   "table": [
+    [
+     "Sr. No.",
+     "Index Name",
+     "Security Name",
+     "Symbol",
+     "Remarks"
+    ],
+    [
+     "1",
+     "Nifty 500",
+     "Indian Renewable Energy Dev. Agency Ltd.",
+     "IREDA",
+     "Inclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "V-Guard Industries Ltd.",
+     "VGUARD",
+     "Exclusion revoked"
+    ],
+    [
+     "2",
+     "Nifty Midcap 150",
+     "Indian Renewable Energy Dev. Agency Ltd.",
+     "IREDA",
+     "Inclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "BSE Ltd.",
+     "BSE",
+     "Inclusion"
+    ],
+    [
+     "3",
+     "Nifty Smallcap 250",
+     "BSE Ltd.*",
+     "BSE",
+     "Exclusion"
+    ],
+    [
+     "",
+     "",
+     "V-Guard Industries Ltd.",
+     "VGUARD",
+     "Exclusion revoked"
+    ],
+    [
+     "4",
+     "Nifty Midcap 100",
+     "Indian Renewable Energy Dev. Agency Ltd.",
+     "IREDA",
+     "Inclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "BSE Ltd.",
+     "BSE",
+     "Inclusion"
+    ]
+   ]
+  },
+  {
+   "page": 2,
+   "top": 109.0,
+   "table": [
+    [
+     "Sr. No.",
+     "Index Name",
+     "Security Name",
+     "Symbol",
+     "Remarks"
+    ],
+    [
+     "5",
+     "Nifty 200",
+     "Indian Renewable Energy Dev. Agency Ltd.",
+     "IREDA",
+     "Inclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "BSE Ltd.",
+     "BSE",
+     "Inclusion"
+    ],
+    [
+     "6",
+     "Nifty LargeMidcap 250",
+     "Indian Renewable Energy Dev. Agency Ltd.",
+     "IREDA",
+     "Inclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "BSE Ltd.",
+     "BSE",
+     "Inclusion"
+    ],
+    [
+     "7",
+     "Nifty Smallcap 50",
+     "BSE Ltd.*",
+     "BSE",
+     "Inclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Blue Star Ltd.",
+     "BLUESTARCO",
+     "Inclusion"
+    ],
+    [
+     "8",
+     "Nifty Smallcap 100",
+     "BSE Ltd.*",
+     "BSE",
+     "Exclusion"
+    ],
+    [
+     "",
+     "",
+     "Blue Star Ltd.",
+     "BLUESTARCO",
+     "Inclusion"
+    ],
+    [
+     "9",
+     "Nifty MidSmallcap 400",
+     "Indian Renewable Energy Dev. Agency Ltd.",
+     "IREDA",
+     "Inclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "V-Guard Industries Ltd.",
+     "VGUARD",
+     "Exclusion revoked"
+    ],
+    [
+     "10",
+     "Nifty Microcap 250",
+     "V-Guard Industries Ltd.",
+     "VGUARD",
+     "Inclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Jyoti CNC Automation Ltd.",
+     "JYOTICNC",
+     "Inclusion"
+    ],
+    [
+     "11",
+     "Nifty Total Market",
+     "Indian Renewable Energy Dev. Agency Ltd.",
+     "IREDA",
+     "Inclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Jyoti CNC Automation Ltd.",
+     "JYOTICNC",
+     "Inclusion"
+    ],
+    [
+     "12",
+     "Nifty Consumer Durables",
+     "V.I.P. Industries Ltd.",
+     "VIPIND",
+     "Inclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "V-Guard Industries Ltd.",
+     "VGUARD",
+     "Exclusion revoked"
+    ]
+   ]
+  },
+  {
+   "page": 2,
+   "top": 429.5,
+   "text": "*On account of inclusion in Nifty Midcap 150."
+  },
+  {
+   "page": 2,
+   "top": 456.1,
+   "text": "The above change in Nifty 500 index will also be applicable to Nifty500 Multicap 50:25:25 index."
+  },
+  {
+   "page": 2,
+   "top": 483.7,
+   "text": "This press release should be read in consonance with the press release issued on February 28, 2024. All"
+  },
+  {
+   "page": 2,
+   "top": 497.4,
+   "text": "other replacements announced on February 28, 2024 shall remain unchanged."
+  },
+  {
+   "page": 2,
+   "top": 525.0,
+   "text": "B. Replacements on account of monthly review of Nifty Shariah indices:"
+  },
+  {
+   "page": 2,
+   "top": 552.6,
+   "text": "On account of monthly review of Shariah compliance, replacement of stocks in Nifty Shariah indices"
+  },
+  {
+   "page": 2,
+   "top": 566.5,
+   "text": "shall be made as listed hereunder:"
+  },
+  {
+   "page": 2,
+   "top": 594.1,
+   "text": "1) Nifty50 Shariah"
+  },
+  {
+   "page": 2,
+   "top": 621.7,
+   "text": "The following company is being excluded on account of exclusion from Nifty 50:"
+  },
+  {
+   "page": 2,
+   "top": 648.0,
+   "table": [
+    [
+     "Sr. No.",
+     "Company Name",
+     "Symbol"
+    ],
+    [
+     "1",
+     "UPL Ltd.",
+     "UPL"
+    ]
+   ]
+  },
+  {
+   "page": 2,
+   "top": 698.1,
+   "text": "No inclusion is being made in the index."
+  }
+ ],
+ "ind_prs25092024.pdf": [
+  {
+   "page": 1,
+   "top": 134.0,
+   "text": "PRESS RELEASE"
+  },
+  {
+   "page": 1,
+   "top": 163.2,
+   "text": "Mumbai, September 25, 2024"
+  },
+  {
+   "page": 1,
+   "top": 195.5,
+   "text": "Replacements in indices"
+  },
+  {
+   "page": 1,
+   "top": 234.6,
+   "text": "The Index Maintenance Sub-Committee (Equity) of NSE Indices Limited has decided to make the"
+  },
+  {
+   "page": 1,
+   "top": 249.5,
+   "text": "following changes in various Nifty equity indices as listed hereunder."
+  },
+  {
+   "page": 1,
+   "top": 278.2,
+   "text": "A. Revocation of exclusion of Vodafone Idea Ltd. (IDEA) in Nifty indices:"
+  },
+  {
+   "page": 1,
+   "top": 305.8,
+   "text": "On August 23, 2024, as part of periodic review of various indices, the Index Maintenance Sub-"
+  },
+  {
+   "page": 1,
+   "top": 319.6,
+   "text": "Committee (Equity) of NSE Indices Limited had announced exclusion of Vodafone Idea Ltd. (IDEA)"
+  },
+  {
+   "page": 1,
+   "top": 333.4,
+   "text": "from various Nifty indices with effect from September 30, 2024 on account of non-compliance with"
+  },
+  {
+   "page": 1,
+   "top": 347.2,
+   "text": "impact cost criteria. The Committee has decided to revoke its decision to exclude IDEA from various"
+  },
+  {
+   "page": 1,
+   "top": 361.0,
+   "text": "indices following the recalculation of security’s impact cost by NSE."
+  },
+  {
+   "page": 1,
+   "top": 388.6,
+   "text": "Following changes shall be made in various indices as a result of revocation of Vodafone Idea Ltd.’s"
+  },
+  {
+   "page": 1,
+   "top": 402.4,
+   "text": "exclusion from various indices:"
+  },
+  {
+   "page": 1,
+   "top": 428.5,
+   "table": [
+    [
+     "Sr. No.",
+     "Index Name",
+     "Security Name",
+     "Symbol",
+     "Remarks"
+    ],
+    [
+     "1",
+     "Nifty 500",
+     "Vodafone Idea Ltd.",
+     "IDEA",
+     "Exclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Prism Johnson Ltd.",
+     "PRSMJOHNSN",
+     "Exclusion"
+    ],
+    [
+     "2",
+     "Nifty Midcap 150",
+     "Vodafone Idea Ltd.",
+     "IDEA",
+     "Exclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Central Bank of India",
+     "CENTRALBK",
+     "Inclusion revoked"
+    ],
+    [
+     "3",
+     "Nifty Smallcap 250",
+     "Central Bank of India",
+     "CENTRALBK",
+     "Exclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Prism Johnson Ltd.*",
+     "PRSMJOHNSN",
+     "Exclusion"
+    ],
+    [
+     "4",
+     "Nifty Midcap Select##",
+     "Vodafone Idea Ltd.",
+     "IDEA",
+     "Exclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Astral Ltd.",
+     "ASTRAL",
+     "Exclusion"
+    ],
+    [
+     "5",
+     "Nifty Midcap 50",
+     "Vodafone Idea Ltd.",
+     "IDEA",
+     "Exclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Sona BLW Precision Forgings Ltd.",
+     "SONACOMS",
+     "Inclusion revoked"
+    ],
+    [
+     "6",
+     "Nifty Midcap 100",
+     "Vodafone Idea Ltd.",
+     "IDEA",
+     "Exclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Central Bank of India",
+     "CENTRALBK",
+     "Inclusion revoked"
+    ],
+    [
+     "7",
+     "Nifty Smallcap 100",
+     "Central Bank of India#",
+     "CENTRALBK",
+     "Exclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Graphite India Ltd.",
+     "GRAPHITE",
+     "Exclusion"
+    ],
+    [
+     "8",
+     "Nifty 200",
+     "Vodafone Idea Ltd.",
+     "IDEA",
+     "Exclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Central Bank of India",
+     "CENTRALBK",
+     "Inclusion revoked"
+    ]
+   ]
+  },
+  {
+   "page": 2,
+   "top": 109.0,
+   "table": [
+    [
+     "Sr. No.",
+     "Index Name",
+     "Security Name",
+     "Symbol",
+     "Remarks"
+    ],
+    [
+     "9",
+     "Nifty LargeMidcap 250",
+     "Vodafone Idea Ltd.",
+     "IDEA",
+     "Exclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Central Bank of India",
+     "CENTRALBK",
+     "Inclusion revoked"
+    ],
+    [
+     "10",
+     "Nifty MidSmallcap 400",
+     "Vodafone Idea Ltd.",
+     "IDEA",
+     "Exclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Prism Johnson Ltd.",
+     "PRSMJOHNSN",
+     "Exclusion"
+    ],
+    [
+     "11",
+     "Nifty Total Market",
+     "Vodafone Idea Ltd.",
+     "IDEA",
+     "Exclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Prism Johnson Ltd.",
+     "PRSMJOHNSN",
+     "Exclusion"
+    ],
+    [
+     "12",
+     "Nifty MidSmall IT & Telecom",
+     "Vodafone Idea Ltd.",
+     "IDEA",
+     "Exclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Happiest Minds Technologies Ltd.",
+     "HAPPSTMNDS",
+     "Exclusion"
+    ],
+    [
+     "13",
+     "Nifty India Digital",
+     "Vodafone Idea Ltd.",
+     "IDEA",
+     "Exclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Happiest Minds Technologies Ltd.",
+     "HAPPSTMNDS",
+     "Exclusion"
+    ],
+    [
+     "14",
+     "Nifty Rural",
+     "Vodafone Idea Ltd.",
+     "IDEA",
+     "Exclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "Bayer Cropscience Ltd.",
+     "BAYERCROP",
+     "Exclusion"
+    ],
+    [
+     "15",
+     "Nifty500 Multicap Infrastructure 50:30:20",
+     "Vodafone Idea Ltd.",
+     "IDEA",
+     "Exclusion revoked"
+    ],
+    [
+     "",
+     "",
+     "CG Power and Industrial Solutions Ltd.",
+     "CGPOWER",
+     "Inclusion revoked"
+    ]
+   ]
+  },
+  {
+   "page": 2,
+   "top": 399.8,
+   "text": "*On account of exclusion from Nifty 500."
+  },
+  {
+   "page": 2,
+   "top": 411.0,
+   "text": "#On account of revocation of exclusion from Nifty Smallcap 250."
+  },
+  {
+   "page": 2,
+   "top": 439.0,
+   "text": "The above change in Nifty 500 index will also be applicable to Nifty500 Multicap 50:25:25, Nifty500"
+  },
+  {
+   "page": 2,
+   "top": 452.8,
+   "text": "LargeMidSmall Equal-Cap Weighted and Nifty500 Equal Weight indices."
+  },
+  {
+   "page": 2,
+   "top": 480.4,
+   "text": "The changes in all indices listed above (excluding Nifty Midcap Select index) shall become effective"
+  },
+  {
+   "page": 2,
+   "top": 495.4,
+   "text": "from September 30, 2024 (close of September 27, 2024). This press release should be read in"
+  },
+  {
+   "page": 2,
+   "top": 510.3,
+   "text": "consonance with the press release issued on August 23, 2024."
+  },
+  {
+   "page": 2,
+   "top": 540.0,
+   "text": "## Nifty Midcap Select index:"
+  },
+  {
+   "page": 2,
+   "top": 554.9,
+   "text": "With an aim to provide prior communication of 4 weeks in case of changes in Nifty Midcap Select"
+  },
+  {
+   "page": 2,
+   "top": 569.8,
+   "text": "index, which is available for trading under F&O segment at NSE, the effective date for changes in the"
+  },
+  {
+   "page": 2,
+   "top": 584.7,
+   "text": "index announced earlier on August 23, 2024 has been postponed. The changes shall now become"
+  },
+  {
+   "page": 2,
+   "top": 599.6,
+   "text": "effective from October 25, 2024 (close of October 24, 2024) instead of September 30, 2024 as"
+  },
+  {
+   "page": 2,
+   "top": 614.5,
+   "text": "announced earlier. Details of replacements in the index are given below:"
+  },
+  {
+   "page": 2,
+   "top": 645.5,
+   "text": "The following companies are being excluded from Nifty Midcap Select index:"
+  },
+  {
+   "page": 2,
+   "top": 673.8,
+   "table": [
+    [
+     "Sr. No.",
+     "Company Name",
+     "Symbol"
+    ],
+    [
+     "1",
+     "Jubilant Foodworks Ltd.",
+     "JUBLFOOD"
+    ],
+    [
+     "2",
+     "Page Industries Ltd.",
+     "PAGEIND"
+    ]
+   ]
+  }
  ]
 }

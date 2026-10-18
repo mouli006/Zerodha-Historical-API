@@ -69,3 +69,14 @@ NIFTY 200,2021-09-30,IN,INDIANB,INE562A01011,ind_prs23082021.pdf p14: Indian Ban
 NIFTY 200,2021-09-30,IN,IRFC,INE053F01010,ind_prs23082021.pdf p14: Indian Railway Finance Corporation Ltd.
 NIFTY 200,2021-09-30,IN,NATIONALUM,INE139A01034,ind_prs23082021.pdf p14: National Aluminium Co. Ltd.
 NIFTY 200,2021-09-30,IN,TATACOMM,INE151A01013,ind_prs23082021.pdf p14: Tata Communications Ltd.
+# Sept 2024 revision (ind_prs25092024.pdf): Prism Johnson excluded instead of Vodafone Idea; Central Bank moves revoked. Checked by the user 2026-10-18
+NIFTY 500,2024-09-30,OUT,PRSMJOHNSN,INE010A01011,ind_prs25092024.pdf p1: Prism Johnson Ltd. Exclusion (instead of IDEA); in NIFTY 500 snapshots 2018-10-04..2024-02-08
+NIFTY 500,2024-09-30,IGNORE,IDEA,,ind_prs25092024.pdf p1: Vodafone Idea exclusion revoked (row of ind_prs23082024.pdf)
+NIFTY SMALLCAP 250,2024-09-30,OUT,PRSMJOHNSN,INE010A01011,ind_prs25092024.pdf p1: Prism Johnson Ltd.* Exclusion (on account of exclusion from Nifty 500); in Smallcap 250 snapshots 2018-03-09..2024-07-08
+NIFTY SMALLCAP 250,2024-09-30,IGNORE,CENTRALBK,,ind_prs25092024.pdf p1: Central Bank of India exclusion revoked
+NIFTY MIDCAP 150,2024-09-30,IGNORE,IDEA,,ind_prs25092024.pdf p1: Vodafone Idea exclusion revoked
+NIFTY MIDCAP 150,2024-09-30,IGNORE,CENTRALBK,,ind_prs25092024.pdf p1: Central Bank of India inclusion revoked
+NIFTY MIDCAP 100,2024-09-30,IGNORE,IDEA,,ind_prs25092024.pdf p1: Vodafone Idea exclusion revoked
+NIFTY MIDCAP 100,2024-09-30,IGNORE,CENTRALBK,,ind_prs25092024.pdf p1: Central Bank of India inclusion revoked
+NIFTY 200,2024-09-30,IGNORE,IDEA,,ind_prs25092024.pdf p1: Vodafone Idea exclusion revoked
+NIFTY 200,2024-09-30,IGNORE,CENTRALBK,,ind_prs25092024.pdf p1: Central Bank of India inclusion revoked

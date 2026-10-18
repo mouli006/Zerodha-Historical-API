@@ -68,6 +68,7 @@ REVIEW_KINDS = ["unmapped_current", "unmapped_change", "undo_mismatch", "not_par
                 "amfi_count"]
 MANUAL_COLUMNS = ["index", "effective_date", "action", "symbol", "isin", "note"]
 MANUAL_ACTIONS = ("IN", "OUT", "IGNORE")
+REVOKES = {"REVOKE_IN": "IN", "REVOKE_OUT": "OUT"}   # revision-table action -> the action it cancels
 MANUAL_TEMPLATE = (
     "index,effective_date,action,symbol,isin,note\n"
     "# Manual index changes, added to the parsed notices (index_membership.py build). Lines starting with # are\n"
@@ -322,7 +323,7 @@ def read_notices(folder, log=print):
         ours = sorted({idx for _, idx in p["headings"] if idx})
         notices.append({"file": n, "announced_date": str(day), "title": titles.get(n, ""),
                         "dates": [str(d) for d in p["dates"]], "review": p["review"], "demerger": p["demerger"],
-                        "replaces": p["replaces"], "no_text": p["no_text"],
+                        "replaces": p["replaces"], "no_text": p["no_text"], "odd_rows": p["odd_rows"],
                         "indexes": ours, "unresolved": p["unresolved"], "changes": len(p["changes"]),
                         "not_applied": p["not_applied"]})
         changes += p["changes"]
@@ -472,6 +473,19 @@ def assemble_changes(parsed, manual, bad_manual, master, cal, review, replacing=
             continue
         seen.add(key)
         out.append({**c, "isin": "", "security_id": "", "source": "file", "note": "", "status": "applied"})
+    # a revision table's "Inclusion revoked" / "Exclusion revoked" cancels the earlier notice's IN / OUT of the same
+    # index, symbol and effective date; the revocation row itself is kept for the record and never walked
+    for r in [c for c in out if c["action"] in REVOKES]:
+        r["status"] = "revocation"
+        target = [c for c in out if c["source"] == "file" and c["action"] == REVOKES[r["action"]]
+                  and c["index"] == r["index"] and c["symbol"] == r["symbol"]
+                  and c["effective_date"] == r["effective_date"] and c["announced_date"] < r["announced_date"]]
+        for c in target:
+            c["status"] = "revoked"
+            c["note"] = f"revoked by {r['file']}"
+        if not target:
+            review.append(row("conflict", r["index"], r["effective_date"], "", r["symbol"],
+                              f"{r['action']} in {r['file']}: the revocation matches no earlier parsed row"))
     # superseded: the same index + symbol + action announced again before the first one's effective date
     groups = {}
     for c in out:
@@ -489,7 +503,8 @@ def assemble_changes(parsed, manual, bad_manual, master, cal, review, replacing=
         keys = {(c["index"], c["effective_date"]) for c in mine}
         when = min((c["announced_date"] for c in mine), default=None)
         for c in out:
-            if c["file"] != f and (c["index"], c["effective_date"]) in keys and c["announced_date"] < when                     and c["status"] == "applied":
+            if c["file"] != f and (c["index"], c["effective_date"]) in keys and c["announced_date"] < when \
+                    and c["status"] == "applied":
                 c["status"] = "superseded"
                 c["note"] = f"list replaced by {f}"
     for k, e in bad_manual:
@@ -1023,6 +1038,8 @@ def _build(folder, out, amfi_lag, now, log):
     for f, e in problems:
         review.append(row("not_parsed", "", fe.notice_date(f) or "", "", "", f"{f}: {e}"))
     for n in notices:
+        for x in n["odd_rows"]:
+            review.append(row("not_parsed", "", n["announced_date"], "", "", f"{n['file']}: revision table row {x}"))
         if n["no_text"]:
             review.append(row("not_parsed", "", n["announced_date"], "", "",
                               f"{n['file']} ({n['title'] or 'no title'}): no text layer (image PDF); add its changes to "

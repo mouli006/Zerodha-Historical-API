@@ -376,6 +376,63 @@ def test_parse_symbol_named_index_list_is_applied():
         {("NIFTY 100", "OUT", "TATAMTRDVR"), ("NIFTY 200", "OUT", "TATAMTRDVR"), ("NIFTY 500", "OUT", "TATAMTRDVR")}
 
 
+def test_parse_revision_tables():
+    s = streams()
+    p = nt.parse_notice(s["ind_prs19032024.pdf"], date(2024, 3, 19))
+    got = {(c["index"], str(c["effective_date"]), c["action"], c["symbol"]) for c in p["changes"]}
+    assert {("NIFTY MIDCAP 150", "2024-03-28", "IN", "BSE"), ("NIFTY SMALLCAP 250", "2024-03-28", "OUT", "BSE"),
+            ("NIFTY MIDCAP 100", "2024-03-28", "IN", "BSE"), ("NIFTY 200", "2024-03-28", "IN", "BSE"),
+            ("NIFTY 500", "2024-03-28", "REVOKE_IN", "IREDA"), ("NIFTY 500", "2024-03-28", "REVOKE_OUT", "VGUARD")} <= got
+    assert not any(c["symbol"] == "BLUESTARCO" for c in p["changes"])        # Smallcap 50 / 100: not ours
+    # two dates (Sept 30, and Oct 25 for Midcap Select only): "all indices listed above ... effective from" decides
+    p = nt.parse_notice(s["ind_prs25092024.pdf"], date(2024, 9, 25))
+    assert not p["unresolved"] and not p["odd_rows"]
+    got = {(c["index"], str(c["effective_date"]), c["action"], c["symbol"]) for c in p["changes"]}
+    assert got == {("NIFTY 500", "2024-09-30", "REVOKE_OUT", "IDEA"), ("NIFTY 500", "2024-09-30", "OUT", "PRSMJOHNSN"),
+                   ("NIFTY MIDCAP 150", "2024-09-30", "REVOKE_OUT", "IDEA"),
+                   ("NIFTY MIDCAP 150", "2024-09-30", "REVOKE_IN", "CENTRALBK"),
+                   ("NIFTY SMALLCAP 250", "2024-09-30", "REVOKE_OUT", "CENTRALBK"),
+                   ("NIFTY SMALLCAP 250", "2024-09-30", "OUT", "PRSMJOHNSN"),
+                   ("NIFTY MIDCAP 100", "2024-09-30", "REVOKE_OUT", "IDEA"),
+                   ("NIFTY MIDCAP 100", "2024-09-30", "REVOKE_IN", "CENTRALBK"),
+                   ("NIFTY 200", "2024-09-30", "REVOKE_OUT", "IDEA"), ("NIFTY 200", "2024-09-30", "REVOKE_IN", "CENTRALBK")}
+
+
+def revision(eff, rows):
+    """A revision notice: [(index, symbol, remark)] in an Index Name | Security Name | Symbol | Remarks table."""
+    table = [["Sr. No.", "Index Name", "Security Name", "Symbol", "Remarks"]]
+    last = None
+    for k, (index, sym, remark) in enumerate(rows, 1):
+        table.append([str(k) if index != last else "", index if index != last else "", f"{sym} Ltd.", sym, remark])
+        last = index
+    return [{"page": 1, "top": 10, "text": f"These changes shall become effective from {eff:%B} {eff.day}, {eff.year}."},
+            {"page": 1, "top": 20, "table": table}, {"page": 1, "top": 30, "text": "x" * 300}]
+
+
+def test_revocation_cancels_the_earlier_row(world):
+    notices = base_notices()
+    eff = DAYS[110]
+    notices[notice_name(DAYS[100])] = stream(eff, [("Nifty 50", [("OUT", ["AAA"]), ("IN", ["DDD"])])])
+    notices[notice_name(DAYS[105])] = revision(eff, [("Nifty 50", "DDD", "Inclusion revoked"),
+                                                     ("Nifty 50", "AAA", "Exclusion revoked"),
+                                                     ("Nifty 50", "SPLIT", "Inclusion revoked"),       # nothing to revoke
+                                                     ("Nifty 50", "BBB", "Weight capped"),             # unknown remark
+                                                     ("Nifty Bank", "AAA", "Exclusion")])               # not ours
+    f = world(notices=notices)
+    build(f)
+    ch = read(f, "nifty_changes.csv")
+    early = ch[ch["file"] == notice_name(DAYS[100])]
+    assert set(early["status"]) == {"revoked"} and set(early["note"]) == {f"revoked by {notice_name(DAYS[105])}"}
+    rev = ch[ch["file"] == notice_name(DAYS[105])]
+    assert set(rev["status"]) == {"revocation"} and set(rev["action"]) == {"REVOKE_IN", "REVOKE_OUT"}
+    assert im.members("NIFTY 50", DAYS[-1], f) == sorted([sid(f, "AAA"), sid(f, "CCC")])
+    rv = read(f, "review.csv")
+    assert rv.query("kind == 'undo_mismatch'").empty
+    assert any("matches no earlier parsed row" in d and "SPLIT" in s
+               for d, s in zip(rv["details"], rv["symbol"]))
+    assert any("revision table row NIFTY 50 BBB: remark 'Weight capped'" in d for d in rv["details"])
+
+
 def test_parse_replacing_and_image_notices():
     s = streams()
     assert nt.parse_notice(s["ind_prs15092021.pdf"], date(2021, 9, 15))["replaces"]
