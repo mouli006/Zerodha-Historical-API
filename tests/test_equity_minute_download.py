@@ -836,9 +836,11 @@ def test_inputs_unchanged(planned, downloaded):
 def test_cli(world, monkeypatch, capsys):
     assert cli.main(["download", "--dry-run", "--folder", world]) == 0
     assert "Requests left" in capsys.readouterr().out
-    with pytest.raises(SystemExit) as e:
-        cli.main(["download", "--workers", "3", "--folder", world])
-    assert e.value.code == 2
+    for bad in ("5", "0"):                                                  # 1..4 (MAX_WORKERS)
+        with pytest.raises(SystemExit) as e:
+            cli.main(["download", "--workers", bad, "--folder", world])
+        assert e.value.code == 2
+    assert cli.main(["download", "--dry-run", "--workers", "4", "--folder", world]) == 0
     with pytest.raises(SystemExit) as e:
         cli.main(["download", "--speed", "4", "--folder", world])
     assert e.value.code == 2
@@ -852,3 +854,140 @@ def test_cli(world, monkeypatch, capsys):
     assert cli.main(["download", "--folder", world, "--symbols", "GEN4"]) == 0      # stopped by the user
     assert "resume with the same command" in capsys.readouterr().err
 
+
+# ---- workers 1..4, CLOSING_AUCTION, checks ----
+
+def test_four_workers_no_chunk_lost_or_twice(world, downloaded):
+    kite = FakeKite()
+    res = dl(world, kite, workers=4)
+    st = res["stats"]
+    assert st["built"] == 13 and st["failed_chunks"] == 0 and not st["stopped"]
+    calls = [(c[0], c[1]) for c in kite.minute_calls()]
+    assert len(calls) == len(set(calls)) == 26                                # every chunk exactly once
+    chunks, stocks, runs = md.read_progress(world)
+    assert len(chunks) == 26 and all(c["status"] == "DONE" for c in chunks)
+    assert len(stocks) == 13 and all(s["status"] == "DONE" for s in stocks.values())
+    assert runs[-1]["requests"] == 39 and not os.listdir(md.staging_dir(world))
+    cols = [c for c in md.DAY_COLUMNS if c not in ("date", "fetched_at", "run_id")]
+    for sym in PLANNED:                                                       # the same stocks as with 2 workers
+        pd.testing.assert_frame_equal(days_of(world, sym)[cols], days_of(downloaded[0], sym)[cols])
+        p = os.path.join(ms.stock_dir(world, sid(world, sym)), "2015.parquet")
+        pd.testing.assert_frame_equal(pq.read_table(p).to_pandas(),
+                                      pq.read_table(p.replace(world, downloaded[0])).to_pandas())
+    with pytest.raises(ValueError):
+        dl(world, kite, workers=5)
+
+
+def test_shared_limiter_with_four_threads():
+    lim = md.SharedLimiter(50)
+    starts, lock = [], threading.Lock()
+
+    def worker():
+        for _ in range(10):
+            lim.wait()
+            with lock:
+                starts.append(time.monotonic())
+            lim.on_success()
+
+    threads = [threading.Thread(target=worker) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    starts.sort()
+    assert lim.requests == 40 and len(starts) == 40
+    assert min(b - a for a, b in zip(starts, starts[1:])) >= 1 / 50 - 0.003   # one cap across all workers
+    lim.on_429()
+    assert lim.rate == 25 and lim.n429 == 1                                   # halved for every worker
+
+
+def auction_store(f, day=42, last_bar="15:14"):
+    """EMPTYCO's stored days with the CLOSE_DIFF day's minutes ending at last_bar, still labelled the old way."""
+    path = ms.stock_dir(f, sid(f, "EMPTYCO"))
+    d = ms.read_days(path)
+    i = d.index[d["date"] == DAYS[day]][0]
+    assert d.at[i, "check"] == "CLOSE_DIFF"
+    d.at[i, "last_bar"] = last_bar
+    ms.write_days(d, os.path.join(path, ms.DAYS_FILE))
+    return path
+
+
+def store_hashes(f):
+    return {k: v for k, v in hashes(f, ("equity_1min",)).items()}
+
+
+def test_closing_auction_label(done_copy):
+    calc = md.Calc(done_copy, mp.Inputs(done_copy, bhav=False), write=False)
+    stored = ms.read_days(ms.stock_dir(done_copy, sid(done_copy, "EMPTYCO")))
+    i = stored.index[stored["date"] == DAYS[42]][0]
+    ok = stored.index[stored["date"] == DAYS[41]][0]
+    for bar, want in (("15:14", "CLOSING_AUCTION"), ("15:00", "CLOSING_AUCTION"), ("15:29", "CLOSE_DIFF"),
+                      ("11:43", "CLOSE_DIFF"), ("14:59", "CLOSE_DIFF")):
+        inp = stored[md.INPUT_COLUMNS].copy()
+        inp.loc[[i, ok], "last_bar"] = bar
+        d = calc.derive(sid(done_copy, "EMPTYCO"), inp)
+        assert d.at[i, "check"] == want, bar
+        assert d.at[ok, "check"] == "OK"                     # the close inside the minute range: never an auction
+    assert md.CHECKS.index("CLOSING_AUCTION") == md.CHECKS.index("CLOSE_DIFF") + 1
+
+
+def test_checks_dry_run_then_apply(done_copy, capsys):
+    path = auction_store(done_copy)
+    before = store_hashes(done_copy)
+    old = ms.read_days(path)
+    res = md.checks(done_copy, log=q)
+    assert res["changed"] == [(sid(done_copy, "EMPTYCO"), "EMPTYCO", 1)] and not res["refused"]
+    assert res["after"]["CLOSING_AUCTION"] == 1 and res["after"].get("CLOSE_DIFF", 0) == res["before"]["CLOSE_DIFF"] - 1
+    assert store_hashes(done_copy) == before                                  # the dry run writes nothing
+    assert cli.main(["checks", "--folder", done_copy]) == 0
+    assert "CLOSING_AUCTION" in capsys.readouterr().out and store_hashes(done_copy) == before
+    res = md.checks(done_copy, apply=True, log=q)
+    new = ms.read_days(path)
+    i = new.index[new["date"] == DAYS[42]][0]
+    assert new.at[i, "check"] == "CLOSING_AUCTION"
+    pd.testing.assert_frame_equal(new.drop(columns="check"), old.drop(columns="check"))   # only the label changed
+    assert (new["check"] != old["check"]).sum() == 1
+    s = res["summary"]
+    assert s["closing_auction"] == [{"security_id": sid(done_copy, "EMPTYCO"), "symbol": "EMPTYCO",
+                                     "first_date": DAYS[42].isoformat(), "days": 1}]
+    assert s["checks"]["CLOSING_AUCTION"] == 1
+    with open(os.path.join(mp.out_dir(done_copy), "check", "summary.json"), encoding="utf-8") as fh:
+        assert json.load(fh)["closing_auction"][0]["first_date"] == DAYS[42].isoformat()
+    chk = pd.read_csv(os.path.join(mp.out_dir(done_copy), "check", "minute_check.csv"), dtype=str)
+    assert chk.loc[chk["date"] == DAYS[42].isoformat(), "check"].tolist() == ["CLOSING_AUCTION"]
+    again = md.checks(done_copy, log=q)                                       # nothing left to change
+    assert again["changed"] == [] and again["before"] == again["after"]
+
+
+def test_checks_refuses_when_other_columns_differ(done_copy):
+    path = ms.stock_dir(done_copy, sid(done_copy, "BIG"))
+    d = ms.read_days(path)
+    d.loc[d.index[5], "ratio"] = 9.99                                          # not what the rules give
+    ms.write_days(d, os.path.join(path, ms.DAYS_FILE))
+    data = os.path.join(done_copy, "equity_1min", "data")
+    before = hashes(done_copy, (os.path.relpath(data, done_copy),))
+    res = md.checks(done_copy, apply=True, log=q)
+    assert res["refused"] == [f"BIG ({sid(done_copy, 'BIG')})"]
+    assert ms.read_days(path)["ratio"].iat[5] == 9.99                         # not written
+    assert hashes(done_copy, (os.path.relpath(data, done_copy),)) == before
+    assert cli.main(["checks", "--apply", "--folder", done_copy]) == 1
+
+
+def test_checks_dry_run_needs_current_cache(done_copy):
+    info = os.path.join(md.cache_dir(done_copy), "cache_info.json")
+    os.remove(info)
+    with pytest.raises(md.CacheStale):
+        md.checks(done_copy, log=q)
+    assert not os.path.exists(info)                                           # still nothing written
+    assert cli.main(["checks", "--folder", done_copy]) == 1
+    assert md.checks(done_copy, apply=True, log=q)["refused"] == [] and os.path.isfile(info)
+
+
+def test_checks_lock(done_copy):
+    lock = RunLock(mp.lock_path(done_copy)).acquire("test")
+    try:
+        with pytest.raises(mp.LockBusy):
+            md.checks(done_copy, apply=True, log=q)
+        md.checks(done_copy, log=q)                                           # the dry run takes no lock
+    finally:
+        lock.release()

@@ -39,7 +39,7 @@ A local Flask app ("Kite Backfill", one machine) that:
 - `equity_update.py`: the daily equity update, runs cm_bhav / security_master / adjustments / exits / index_membership (and nse_reference, index fetch) in order. See docs/dev/equity_update.md.
 - `index_membership.py`: fetch (network) / build / members / show / check NIFTY index membership and AMFI categories, point in time. See docs/dev/index_membership.md.
 - `equity_minute.py`: Kite 1-minute / EOD plan: tokens / probe (Kite network) / gaps / show -> the vendor gap list. See docs/dev/equity_minute_plan.md.
-- `equity_minute.py download / update / status`: phase 2, the Kite 1-minute history (2 workers, resumable) and evening update; `load_minute` loader. See docs/dev/equity_minute_download.md.
+- `equity_minute.py download / update / status / checks`: phase 2, the Kite 1-minute history (2 workers, resumable) and evening update; `load_minute` loader. See docs/dev/equity_minute_download.md.
 - Never run a CLI against real Kite or Dhan unless the user asks.
 
 ## Code map

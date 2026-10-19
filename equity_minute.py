@@ -14,6 +14,9 @@ Phase 2 (backfill/equity/minute_download.py), each with --folder:
                                      [--workers 2]    the 1-minute history of every plan stock (resumable)
     python equity_minute.py update [--speed 2.5] [--workers 2]   the evening update, after equity_update.py
     python equity_minute.py status                progress, offline
+    python equity_minute.py checks [--apply]      the check labels of the built stocks with the current rules,
+                                                  offline (dry run unless --apply)
+--workers is 1 to 4 (default 2); all workers share one --speed limit.
 
 Every command takes --folder (absolute; default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data) and --include-etf.
 Output: <folder>/equity_1min/plan/. Only tokens (not --rematch) and probe use the network (Kite only; the token
@@ -134,9 +137,13 @@ def main(argv=None):
     dl.add_argument("--limit", type=positive, help="at most this many stocks still to download")
     up = sub.add_parser("update", help="phase 2: the evening update (after equity_update.py)")
     st = sub.add_parser("status", help="phase 2: download progress, offline")
+    ck = sub.add_parser("checks", help="phase 2: the check labels of the built stocks again, offline")
+    ck.add_argument("--apply", action="store_true", help="rewrite the changed labels (default: dry run)")
+    ck.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
     for sp in (dl, up, st):
         sp.add_argument("--speed", type=speed, default=md.SPEED, help="requests per second (default 2.5, at most 3)")
-        sp.add_argument("--workers", type=int, choices=(1, 2), default=md.WORKERS, help="parallel workers (default 2)")
+        sp.add_argument("--workers", type=int, choices=range(1, md.MAX_WORKERS + 1), default=md.WORKERS,
+                        metavar="1-4", help="parallel workers sharing the --speed limit (default 2)")
         sp.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
     args = p.parse_args(argv)   # argparse errors exit with 2
     if args.folder and not os.path.isabs(args.folder):
@@ -173,6 +180,8 @@ def main(argv=None):
         if args.cmd == "status":
             md.status(folder, speed=args.speed, workers=args.workers)
             return 0
+        if args.cmd == "checks":
+            return 1 if md.checks(folder, apply=args.apply)["refused"] else 0
         return show(args.key, folder)
     except mp.SignInNeeded as e:
         print(f"Kite sign-in needed: {e}", file=sys.stderr)

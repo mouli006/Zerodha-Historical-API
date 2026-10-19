@@ -638,6 +638,7 @@ python equity_minute.py download --dry-run          # stocks, requests, hours an
 python equity_minute.py download --priority 1       # NIFTY 50 members first (then 2 = NIFTY 500, 3 = the rest)
 python equity_minute.py download                    # everything left; --symbols A,B --limit N --speed 2.5 --workers 2
 python equity_minute.py status                      # progress, offline
+python equity_minute.py checks                      # the check labels again with the current rules (dry run; --apply)
 ```
 
 Every evening, once the history is complete:
@@ -648,6 +649,8 @@ python equity_minute.py update                      # then: today's minutes for 
 ```
 
 - Kite's prices are adjusted by Kite's own rules, so the files keep Kite's candles unchanged plus, per day, the conversion back to the bhavcopy's raw prices. Read them in Python with `from backfill.equity.minute_store import load_minute`: `load_minute("RELIANCE", "2024-01-01", "2024-01-31", prices="raw")`. `prices="ours"` gives our split / bonus adjusted prices (for indicators), `prices="kite"` Kite's own.
+- `--workers` takes 1 to 4 (default 2); all workers share the one `--speed` limit, so more workers only help while Kite is slow to answer.
+- From 2026-08-03 F&O stocks' minutes end at 15:14 (NSE's closing auction); days whose official close is outside the minute range are labelled `CLOSING_AUCTION`. On those days the last minute bar is not the close: backtests must take the close from the bhavcopy.
 - Problem days are in `equity_1min/check/` (`minute_check.csv`, `minute_empty_days.csv`, `scale_steps.csv`, `summary.json`). Run `python equity_minute.py gaps` afterwards to add the days Kite has no minutes for to `kite_gaps.csv`.
 - Memory stays under about 1.5 GB with two workers (the bhavcopy is read one stock at a time); the progress lines and `status` show the memory used. A run whose process was killed (for example by Windows for low memory) shows in `status` as `ABORTED` after the next `download` or `update` starts; nothing is lost, the same command resumes it.
 - During the history weeks, `download` rebuilds `plan.csv` itself (offline) after an `equity_update.py`. It refuses while a Kite F&O download runs. If the Kite session expires it stops: sign in (`python app.py`) and run the same command again. Exit codes: 0 done or stopped by you, 1 some chunks failed (run it again) or not ready, 2 bad arguments, busy, Kite sign-in needed or not enough disk.

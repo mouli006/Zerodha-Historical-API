@@ -53,7 +53,7 @@ from backfill.locks import RunLock
 SPEED = mp.SPEED                 # requests per second, shared by all workers
 MAX_SPEED = mp.MAX_SPEED
 WORKERS = 2                      # Part 0: a minute request takes ~0.8 s, so one worker reaches only ~1.3 req/s
-MAX_WORKERS = 2
+MAX_WORKERS = 4                  # priority 1 measured ~1.5 s per minute request: 2 workers reach only ~1.1 req/s
 MINUTE_SECONDS = 0.79            # Part 0 median time of a minute request (used until 200 requests are timed)
 DAY_SECONDS = 0.12               # ... of a day request
 TIMED_MIN = 200
@@ -73,7 +73,10 @@ ACTION_DAYS = 5                  # a scale step with a corporate action within 5
 EMPTY_SHARE = 0.5                # a date more than half of 10+ downloaded stocks with a day candle have no minutes
 EMPTY_MIN = 10                   # ... for is one market-wide minute_empty_days row
 PROGRESS_EVERY = 10
-CHECKS = ["EXTRA_SESSION", "DAY_EMPTY", "MINUTE_EMPTY", "HIGHLOW_DIFF", "CLOSE_DIFF", "VOLUME_DIFF", "SCALE_STEP"]
+AUCTION_FROM, AUCTION_TO = "15:00", "15:29"   # CLOSING_AUCTION: the last minute bar in [15:00, 15:29) (F&O stocks end
+#                                               at 15:14 from 2026-08-03; the 2021-02-24 outage ended 11:43)
+CHECKS = ["EXTRA_SESSION", "DAY_EMPTY", "MINUTE_EMPTY", "HIGHLOW_DIFF", "CLOSE_DIFF", "CLOSING_AUCTION", "VOLUME_DIFF",
+          "SCALE_STEP"]
 FIELDS = mp.FIELDS
 
 INPUT_COLUMNS = ["date"] + [f"kite_{f}" for f in FIELDS] + \
@@ -98,7 +101,7 @@ PART0_FINDINGS = """Part 0 findings (Kite, 2026-10-19; see docs/dev/equity_minut
   volume is 0.5-1.5% below the day volume (pre-open / closing session), up to 15-27% on some days.
 - Kite's minute and day histories are not always on one scale: RELIANCE day / minute = 1.00945 until 2020-05-13.
 - Kite has minutes without a day candle (Muhurat 2017-10-19, 2018-11-07; ENERGYDEV 2018-12) and day candles
-  without minutes (2016-01-01). F&O stocks end at 15:14 from August 2026 (closing auction)."""
+  without minutes (2016-01-01). F&O stocks end at 15:14 from August 2026 (closing auction: CLOSING_AUCTION)."""
 
 
 class NotEnoughDisk(mp.MinutePlanError):
@@ -110,6 +113,10 @@ class HistoryNotDone(mp.MinutePlanError):
 
 
 class NoBhavToday(mp.MinutePlanError):
+    pass
+
+
+class CacheStale(mp.MinutePlanError):
     pass
 
 
@@ -446,12 +453,14 @@ def file_key(path):
     return [st.st_size, st.st_mtime_ns]
 
 
-def bhav_cache(folder, inp, log=quiet):
+def bhav_cache(folder, inp, log=quiet, write=True):
     """bhav_cache/<year>.parquet: the bhavcopy rows of the universe by security_id (bhav_year), rebuilt for the year
     files that changed since (size, mtime), all of them when the master or the universe changed. The caller holds
-    equity_1min/.lock. Returns the cache's year file paths."""
+    equity_1min/.lock. Returns the cache's year file paths. write=False (a dry run): writes nothing and raises
+    CacheStale when a year would be rebuilt."""
     out = cache_dir(folder)
-    os.makedirs(out, exist_ok=True)
+    if write:
+        os.makedirs(out, exist_ok=True)
     info_path = os.path.join(out, "cache_info.json")
     try:
         with open(info_path, encoding="utf-8") as f:
@@ -468,12 +477,16 @@ def bhav_cache(folder, inp, log=quiet):
         years[year] = file_key(path)
         if same and old.get("years", {}).get(year) == years[year] and os.path.isfile(dst):
             continue
+        if not write:
+            raise CacheStale(f"The bhavcopy cache is older than the store ({year}): run with --apply, which rebuilds "
+                             "it first.")
         keys = keys or bhav_keys(folder, inp)
         t, _ = bhav_year(path, *keys, CACHE_COLUMNS)
         sm.write_atomic(dst, lambda tmp: pq.write_table(t, tmp, row_group_size=CACHE_ROW_GROUP, compression="zstd"))
         built.append(year)
         del t
-    mp.write_json(info_path, {**base, "years": years})
+    if write:
+        mp.write_json(info_path, {**base, "years": years})
     if built:
         log(f"Bhavcopy cache: {len(built)} year file(s) rebuilt ({', '.join(built)}).")
     return [os.path.join(out, f"{y}.parquet") for y in sorted(years)]
@@ -730,10 +743,10 @@ class Calc:
     """What every stock's days need: the bhavcopy rows (read per stock from bhav_cache), factors and corporate
     actions (from minute_plan.Inputs). Building it refreshes the cache: the caller holds equity_1min/.lock."""
 
-    def __init__(self, folder, inp, log=quiet):
+    def __init__(self, folder, inp, log=quiet, write=True):
         self.inp = inp
         self.days = inp.days
-        self.cache = bhav_cache(folder, inp, log)
+        self.cache = bhav_cache(folder, inp, log, write)
         self.actions = corporate_actions(folder, inp)
 
     def bhav_of(self, sid):
@@ -831,9 +844,11 @@ class Calc:
             cl = both & ((kc > mh * scale + tol_c) | (kc < ml * scale - tol_c))
             vs = mv * d["minute_volume_scale"].to_numpy(float)
             vol = both & ((vs > kv * VOLUME_HIGH + 1) | (vs < kv * VOLUME_LOW))
+        last_bar = d["last_bar"].fillna("").astype(str).to_numpy(object)
+        auction = cl & (last_bar >= AUCTION_FROM) & (last_bar < AUCTION_TO)    # the close came from the auction
         flags = {"EXTRA_SESSION": ~has_bhav, "DAY_EMPTY": has_min & has_bhav & ~has_day,
-                 "MINUTE_EMPTY": has_day & has_bhav & ~has_min, "HIGHLOW_DIFF": hl, "CLOSE_DIFF": cl,
-                 "VOLUME_DIFF": vol, "SCALE_STEP": np.zeros(n, bool)}
+                 "MINUTE_EMPTY": has_day & has_bhav & ~has_min, "HIGHLOW_DIFF": hl, "CLOSE_DIFF": cl & ~auction,
+                 "CLOSING_AUCTION": auction, "VOLUME_DIFF": vol, "SCALE_STEP": np.zeros(n, bool)}
         notes = [[] for _ in range(n)]
         vscale = d["minute_volume_scale"].to_numpy(float)
         for i in range(1, n):
@@ -1190,7 +1205,7 @@ def rebuild_checks(folder, prio):
     empty, steps = {}, []
     counts = {}
     with_day, no_min = {}, {}
-    not_one, vol_steps = [], []
+    not_one, vol_steps, auction = [], [], []
     total_days = 0
     try:
         for sid in sids:
@@ -1223,7 +1238,10 @@ def rebuild_checks(folder, prio):
             if (days["minute_volume_scale"] != 1.0).any():
                 vol_steps.append({"security_id": sid, "symbol": symbol,
                                   "periods": spans_of(days, "minute_volume_scale")})
-            del days, bad, me
+            ca = days.loc[days["check"].str.contains("CLOSING_AUCTION"), "date"]
+            if len(ca):
+                auction.append({"security_id": sid, "symbol": symbol, "first_date": iso(ca.min()), "days": len(ca)})
+            del days, bad, me, ca
         os.replace(tmp, check_path)
     except BaseException:
         if os.path.exists(tmp):
@@ -1247,7 +1265,7 @@ def rebuild_checks(folder, prio):
                "checks_per_priority": dict(sorted(counts.items())),
                "checks": {k: sum(c.get(k, 0) for c in counts.values()) for k in ["OK"] + CHECKS},
                "minute_empty_market_days": [iso(d) for d in sorted(market)],
-               "minute_scale_not_one": not_one, "volume_steps": vol_steps,
+               "minute_scale_not_one": not_one, "volume_steps": vol_steps, "closing_auction": auction,
                "scale_steps_flagged": sum(1 for s in steps if s["flagged"] == "Y")}
     mp.write_json(os.path.join(out, "summary.json"), summary)
     return summary
@@ -1264,6 +1282,11 @@ def spans_of(days, col):
 
 
 # ---- commands ----
+
+def check_workers(workers):
+    if not 1 <= workers <= MAX_WORKERS:
+        raise ValueError(f"workers must be 1 to {MAX_WORKERS}, not {workers}")
+
 
 def _prepare(folder, command, log, dry_run=False):
     """The inputs without the bhavcopy rows (read per stock later); a real run also takes the lock, marks runs left
@@ -1301,6 +1324,7 @@ def download(folder=None, kite=None, priority=None, symbols=None, limit=None, sp
              dry_run=False, log=print):
     """The history download of the work list (Parts 1-3). dry_run: figures only, nothing written or fetched."""
     folder = folder or config.equity_data_dir()
+    check_workers(workers)
     inp, lock = _prepare(folder, "download", log, dry_run)
     try:
         items = work_list(folder, inp, priority, symbols)
@@ -1346,6 +1370,7 @@ def download(folder=None, kite=None, priority=None, symbols=None, limit=None, sp
 def update(folder=None, kite=None, speed=SPEED, workers=WORKERS, now=None, log=print):
     """The evening update (Part 5): new tokens / listings, then each DONE stock from its next day to today."""
     folder = folder or config.equity_data_dir()
+    check_workers(workers)
     inp, lock = _prepare(folder, "update", log)
     try:
         today = (now or now_ist()).date()
@@ -1471,3 +1496,68 @@ def status(folder=None, speed=SPEED, workers=WORKERS, log=print):
     log(text, end="")
     return {"estimate": est, "failed_chunks": failed, "rows": done_rows, "staged_rows": staged, "n429": n429,
             "runs": runs, "aborted": len(aborted), "report": text}
+
+
+def same_column(a, b):
+    """Two days.parquet columns hold the same values (NaN equal to NaN)."""
+    try:
+        return np.array_equal(a.to_numpy(float), b.to_numpy(float), equal_nan=True)
+    except (TypeError, ValueError):
+        return [str(x) for x in a] == [str(x) for x in b]
+
+
+def checks(folder=None, apply=False, log=print):
+    """Offline: the check labels of every built stock again with the current rules, re-derived from its stored
+    days.parquet input columns (as update's append does). Only `check` may change: a stock where any other column
+    would differ is listed and never written. Dry run (default) writes nothing; apply takes equity_1min/.lock,
+    rewrites the days.parquet files whose labels changed, then rebuilds check/."""
+    folder = folder or config.equity_data_dir()
+    lock = RunLock(mp.lock_path(folder)).acquire("equity_minute.py checks --apply") if apply else None
+    try:
+        inp = mp.Inputs(folder, bhav=False)
+        calc = Calc(folder, inp, log, write=apply)
+        base = ms.data_dir(folder)
+        sids = sorted(n for n in os.listdir(base) if os.path.isfile(os.path.join(base, n, ms.DAYS_FILE))) \
+            if os.path.isdir(base) else []
+        before, after, changed, refused = {}, {}, [], []
+        for sid in sids:
+            path = ms.stock_dir(folder, sid)
+            stored = ms.read_days(path)
+            new = calc.derive(sid, stored[INPUT_COLUMNS])
+            for counts, labels in ((before, stored["check"]), (after, new["check"])):
+                for chk in labels:
+                    for x in chk.split("|"):
+                        counts[x] = counts.get(x, 0) + 1
+            symbol = stored["symbol"].iat[-1] if len(stored) else ""
+            other = [c for c in DAY_COLUMNS if c not in ("check", "date")]
+            if len(new) != len(stored) or list(new["date"]) != list(stored["date"]) or \
+                    not all(same_column(stored[c], new[c]) for c in other):
+                refused.append(f"{symbol} ({sid})")
+            else:
+                n = int((stored["check"].to_numpy(object) != new["check"].to_numpy(object)).sum())
+                if n:
+                    changed.append((sid, symbol, n))
+                    if apply:
+                        ms.write_days(new, os.path.join(path, ms.DAYS_FILE))
+            del stored, new
+        keys = ["OK"] + CHECKS
+        log(f"Checks of {len(sids):,} built stocks with the current rules ({'applied' if apply else 'dry run'}):")
+        for k in keys:
+            if before.get(k, 0) or after.get(k, 0):
+                log(f"  {k:<16} {before.get(k, 0):>9,} -> {after.get(k, 0):,}")
+        log(f"{len(changed):,} stock(s) with new labels ({sum(n for _, _, n in changed):,} days)"
+            + (": " + ", ".join(f"{s} {n}" for _, s, n in changed[:20]) + (" ..." if len(changed) > 20 else "")
+               if changed else ""))
+        if refused:
+            log(f"Not changed, other columns would differ (a newer bhavcopy or rule): {', '.join(refused)}")
+        summary = None
+        if apply:
+            prio = priorities(inp.membership)
+            summary = rebuild_checks(folder, {sid: prio.get(sid, 3) for sid in sids})
+            for a in summary["closing_auction"]:
+                log(f"  CLOSING_AUCTION {a['symbol']} ({a['security_id']}): first {a['first_date']}, {a['days']:,} days")
+        return {"applied": apply, "before": before, "after": after, "changed": changed, "refused": refused,
+                "summary": summary}
+    finally:
+        if lock:
+            lock.release()

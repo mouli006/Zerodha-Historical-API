@@ -4,7 +4,8 @@ Downloads Kite's 1-minute candles for every stock in phase 1's `plan.csv`, each 
 over several evenings (resumable). Each day is checked against Kite's day candle fetched in the same run, the data is
 stored by `security_id`, and a loader rebuilds raw or adjusted prices. A small daily `update` follows. Code:
 `backfill/equity/minute_download.py` (work list, download, build, checks, update, status) and
-`backfill/equity/minute_store.py` (file layout, `load_minute`); CLI `equity_minute.py download | update | status`.
+`backfill/equity/minute_store.py` (file layout, `load_minute`); CLI `equity_minute.py download | update | status |
+checks`.
 Not part of `equity_update.py` (it needs a Kite sign-in); no dashboard UI.
 
 ## Part 0 findings (Kite, 2026-10-19, 214 requests; also `PART0_FINDINGS`)
@@ -38,9 +39,12 @@ Not part of `equity_update.py` (it needs a Kite sign-in); no dashboard UI.
   (`volume_levels()`).
 - A scale step of either kind with no corporate action within ±5 trading days is `SCALE_STEP`. Actions are the applied
   events in `adjustments/events.csv` plus every row of the corporate-actions CSVs (rights, dividends, demergers, ...).
-- `--workers 1|2` (default 2): workers take whole stocks from one queue, so never the same stock. One locked
-  `SharedLimiter` (start-to-start spacing across workers, halves on 429, counts requests and 429s). sqlite in WAL mode,
-  every statement under one lock.
+- `--workers 1..4` (default 2; `MAX_WORKERS`): workers take whole stocks from one queue, so never the same stock.
+  One locked `SharedLimiter` (start-to-start spacing across all workers, so `--speed` (≤3) caps them together; halves
+  on 429, counts requests and 429s). sqlite in WAL mode, every statement under one lock. Priority 1 measured ~1.5 s
+  per minute request (not Part 0's 0.79), so 2 workers reached only ~1.1 req/s; more workers only shorten the wait
+  for Kite's answers, never the spacing.
+- `download` / `update` raise `ValueError` for other worker counts (the CLI exits 2).
 - `plan.csv` older than the security master or adjustments `build_info.json` (after an evening `equity_update.py`)
   is rebuilt by `download` / `update` themselves, with phase 1's offline gaps step (`mp.build_outputs`, no Kite
   request), and they say so.
@@ -113,7 +117,8 @@ reading the 12 year files), `Calc` grouped it again, and a build held all of a s
   kite_multiplier x (p' + kite_difference). Volume = Kite minute volume x minute_volume_scale x vol_ratio.
 
 ## Checks (per day; tolerance 0.05% + half of Kite's rounding unit)
-`OK`, `CLOSE_DIFF` (the day close outside the scaled minute low..high), `HIGHLOW_DIFF` (the scaled minute high above
+`OK`, `CLOSE_DIFF` (the day close outside the scaled minute low..high), `CLOSING_AUCTION` (the same, on a day whose
+last minute bar is in 15:00..15:28), `HIGHLOW_DIFF` (the scaled minute high above
 the day high, or the low below the day low; a wider day range is normal), `VOLUME_DIFF` (scaled minute volume >
 day x 1.01 + 1 or < day x 0.5), `MINUTE_EMPTY` (a day candle and a bhavcopy row, no minutes), `DAY_EMPTY` (minutes
 and a bhavcopy row, no day candle), `EXTRA_SESSION` (no bhavcopy row), `SCALE_STEP`. A day can carry several,
@@ -122,7 +127,24 @@ and a bhavcopy row, no day candle), `EXTRA_SESSION` (no bhavcopy row), `SCALE_ST
 - `minute_empty_days.csv`: runs of MINUTE_EMPTY days per stock. A date that more than half of 10+ downloaded stocks
   with a day candle lack minutes for becomes one market-wide row;
 - `scale_steps.csv`: every scale step, its near action and whether it is flagged;
-- `summary.json`: counts per check and priority, stocks with minute_scale ≠ 1, volume steps.
+- `summary.json`: counts per check and priority, stocks with minute_scale ≠ 1, volume steps, and `closing_auction`
+  (per stock its first CLOSING_AUCTION date and count).
+
+**CLOSING_AUCTION.** From 2026-08-03 NSE's F&O stocks trade continuously only to 15:14 and close in an auction:
+Kite's minutes end at 15:14 and the official close (Kite's day candle = the bhavcopy close) is often outside the
+minute range. On those days **the last minute bar is not the close; backtests must take the close from the
+bhavcopy** (or Kite's day candle). The rule needs no F&O list (equity code imports no F&O module): the 15:14 end
+itself marks the stock. The window starts at 15:00 so that days cut short for other reasons stay CLOSE_DIFF: the
+2021-02-24 NSE outage (minutes to 11:43, 18 priority 1 days) and half-day sessions (12:29, 14:44; EXTRA_SESSION).
+Priority 1 (80 stocks): 77 stocks end at 15:14 from 2026-08-03 (ACC, SAMMAANCAP, ZEEL still end at 15:29); 517 of
+589 CLOSE_DIFF days became CLOSING_AUCTION.
+
+**`checks [--apply]`** (offline) re-derives every built stock's days from its stored `days.parquet` input columns
+with `Calc.derive` (as `update` does) and relabels them with the current rules. Only `check` may change: a stock where
+any other column would differ (e.g. a newer bhavcopy) is listed and never written (exit 1). The dry run (default)
+prints the counts per check before -> after and writes nothing; it needs a current bhavcopy cache (`CacheStale`,
+exit 1, otherwise). `--apply` takes `.lock`, rewrites the changed `days.parquet` atomically, rebuilds `check/` and
+prints each stock's first CLOSING_AUCTION date.
 
 ## Phase 1's gaps (the approved change in `minute_plan.py`)
 `build_outputs` calls `minute_gap_rows()`:
@@ -159,8 +181,8 @@ built and staged, disk used, 429s, ABORTED runs and the last run (with its peak 
 - a stock without data raises `NoMinuteData`: "exited ...; use the bhavcopy" for exited stocks.
 
 ## CLI and exit codes
-`download [--dry-run] [--priority N] [--symbols A,B] [--limit N] [--speed 2.5] [--workers 2]`, `update`, `status`,
-each with `--folder`. Exit codes: 0 done / stopped by the user / dry run; 1 FAILED chunks, not built, stale input,
+`download [--dry-run] [--priority N] [--symbols A,B] [--limit N] [--speed 2.5] [--workers 1-4]`, `update`, `status`,
+`checks [--apply]`, each with `--folder`. Exit codes: 0 done / stopped by the user / dry run; 1 FAILED chunks, not built, stale input,
 history not done, no bhavcopy for today; 2 arguments, a lock busy, a Kite F&O run, Kite sign-in needed, not enough
 disk.
 
@@ -171,7 +193,10 @@ disk.
 missing minute days, a market-wide day without minutes, a session without day candles, a weekend session, bad
 high / close / volume days, a token error, a failing chunk, Ctrl+C, 429s, a whole-history re-adjustment between two
 runs and the update day with a new listing and a changed token. `backfill.fetch.STOP` is replaced by `FastStop` (no
-back-off wait).
+back-off wait). Also: 4 workers (every chunk once, the same files as 2 workers, 5 refused), `SharedLimiter` from 4
+threads (one spacing, halved on 429), the CLOSING_AUCTION window (15:14 / 15:00 yes; 15:29, 14:59, 11:43 no; a close
+inside the range stays OK), `checks` dry run (writes nothing) / apply (only `check` changes, summary first date) /
+refusal when another column differs / stale cache / lock.
 `tests/test_equity_minute_memory.py`: worlds of 10 and 40 plain stocks over two years (`PlainKite`), the
 tracemalloc peak of a two-worker download plus check rebuild must not grow with the stocks (40 ≤ 10 x 1.15 +
 0.5 MB; the old code grew 2.97 -> 7.43 MB and fails it, the new one 2.76 -> 3.05 MB); the cache rows equal
