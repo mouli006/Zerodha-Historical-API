@@ -357,7 +357,7 @@ def nearest_change(changes, di):
 def event_from_row(x, i):
     row = dict.fromkeys(EVENT_COLUMNS)
     r = x.iloc[i]
-    row.update(security_id=r.security_id, ex_date=r.date, symbol=r.symbol, isin=r.isin, series=r.series,
+    row.update(security_id=r.security_id, ex_date=r.date, symbol=r.symbol, isin=r["isin"], series=r.series,
                prev_day=r.prev_day, gap=int(r.gap) if pd.notna(r.gap) else None, close_prev_day=r.close_prev_day,
                prev_close=r.prev_close, ratio_prev_close=_round(r.ratio_prev_close), open=r.open, close=r.close,
                ratio=_round(r.ratio), close_move=_round(r.close_move), applied="N", confirmed_by="", source="detected")

@@ -165,6 +165,26 @@ def test_bonus_without_isin_change(tmp_path):
     assert list(lk["kind"]) == ["event_no_isin_change"]
 
 
+def test_events_isin_is_the_isin_traded_on_the_ex_date(tmp_path, monkeypatch, capsys):
+    # earlier builds wrote the text of the pandas method Series.isin here (r.isin on a row), not the ISIN
+    rows = (trade("OLD", "INE000031011", r(0, 20), close=1000.0)             # the old ISIN trades the split price
+            + trade("OLD", "INE000031011", [20], close=100.0, prev=1000.0, opn=98.0)
+            + trade("OLD", "INE000031029", r(21, 40), close=100.0)
+            + split("NEW", "INE000032011", 20, 500.0, 100.0, new_isin="INE000032029")
+            + split("BNS", "INE000033011", 20, 1000.0, 500.0))
+    build(tmp_path, rows, ca=[("OLD", SPLIT_10, DAYS[20]), ("BNS", "Bonus 1:1", DAYS[20])])
+    ev = events(tmp_path)
+    assert dict(zip(ev["symbol"], ev["isin"])) == {"OLD": "INE000031011", "NEW": "INE000032029",
+                                                   "BNS": "INE000033011"}
+    assert list(ev["applied"]) == ["Y", "Y", "Y"]
+    assert ev["isin"].str.fullmatch(r"IN[A-Z0-9]{10}").all()
+    assert not ev["isin"].str.contains("bound method").any()
+    monkeypatch.setattr(cli, "equity_data_dir", lambda: str(tmp_path))
+    assert cli.main(["show", "NEW"]) == 0
+    out = capsys.readouterr().out
+    assert "INE000032029" in out and "bound method" not in out
+
+
 def test_split_and_bonus_on_one_day(tmp_path):
     ca = [("BAJ", "Bonus 4:1", DAYS[20]), ("BAJ", "Face Value Split (Sub-Division) - From Rs 2/- Per Share To Rs 1/- "
                                            "Per Share", DAYS[20]), ("BAJ", "Dividend - Rs 5 Per Share", DAYS[20])]

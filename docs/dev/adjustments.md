@@ -95,6 +95,7 @@ are computed when loading. Dividends are not adjusted.
 ## Files `<EQUITY_DATA_DIR>\adjustments\` (atomic, rebuilt in full)
 - `events.csv` (`EVENT_COLUMNS`): candidates and confirmed events, with ratio_prev_close (information),
   near_isin_change / isin_change_distance, and ca_ex_date / ca_purpose.
+  `isin` is the ISIN traded on the ex-date; builds before 2026-10-19 wrote the pandas `Series.isin` method text there (bug; rebuild).
 - `factors.parquet/.csv` (`FACTOR_COLUMNS`).
 - `review.csv` (`REVIEW_KINDS`).
 - `links.csv`: ISIN changes with no event within 10 days, and applied events of factor ≥ 2 with no ISIN change
