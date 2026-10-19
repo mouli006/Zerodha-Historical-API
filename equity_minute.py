@@ -60,7 +60,7 @@ def run_result(stats, cmd):
     """Exit code of a download / update run: 0 done or stopped by the user, 1 some chunks failed."""
     print(f"{cmd}: {stats['stocks']:,} stocks, {stats['built']:,} built, {stats['chunks']:,} chunks, "
           f"{stats['rows']:,} rows, {stats['requests']:,} requests, {stats['n429']:,} x 429, "
-          f"{stats['failed_chunks']:,} failed")
+          f"{stats['failed_chunks']:,} failed, peak memory {stats.get('peak_mb', 0) / 1e3:.2f} GB")
     if stats["stopped"]:
         print("Stopped, resume with the same command.", file=sys.stderr)
         return 0

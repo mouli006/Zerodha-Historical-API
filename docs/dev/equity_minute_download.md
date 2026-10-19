@@ -62,7 +62,11 @@ Not part of `equity_update.py` (it needs a Kite sign-in); no dashboard UI.
 - Refuses: `equity_1min/.lock` busy (shared with phase 1), a Kite F&O run (`mp.check_fno`), an input lock.
 - `download_progress.sqlite`: `chunks` (security_id, token, chunk_from, chunk_to, rows, status, fetched_at, run_id,
   seconds, error), `day_fetches`, `stocks` (token, status, first/last day, days, minute_rows, bytes, built_at),
-  `runs` (command, started, ended, requests, n429, result).
+  `runs` (command, started, ended, requests, n429, result, peak_mb; `peak_mb` is added to older files by the next
+  real run, never by `status` or a dry run).
+- **ABORTED:** once `download` / `update` hold `.lock` (an OS lock, gone with its process), every `runs` row still
+  `running` belonged to a killed process: it becomes `ABORTED` (`ended` stays empty) and the run logs it. A dry run
+  marks nothing.
 - Per stock: the first time a run fetches any of its chunks, it fetches the stock's day candles for the whole range
   and stages them as `staging/<sid>/day_<run_id>.parquet`. Then each chunk not DONE with this token (and with its
   staged files) goes to `staging/<sid>/m_<from>.parquet` and is committed. Each day takes its Kite day candle from
@@ -75,7 +79,29 @@ Not part of `equity_update.py` (it needs a Kite sign-in); no dashboard UI.
 - Stops: `AuthStop` stops both workers (`SignInNeeded`, exit 2, finished chunks kept). Ctrl+C / `StopJob` ends the
   in-flight chunk, then exit 0 "stopped, resume with the same command". `ChunkFailed` marks the chunk FAILED and the
   run goes on (exit 1; a re-run retries it).
-- A progress line every 10 stocks and at a priority change: stocks, chunks, rows, req/s, 429s, ETA, disk.
+- A progress line every 10 stocks and at a priority change: stocks, chunks, rows, req/s, 429s, ETA, disk, memory
+  (current and peak). `disk_used` skips a file the other worker removed meanwhile (a built stock's staging).
+
+## Memory
+The first real `--priority 1` run (2026-10-19) was killed by Windows for low memory (5.9 GB machine) after 63
+chunks: phase 1's `Inputs` loaded the whole bhavcopy (5.1M rows, 0.76 GB as pandas, 1.66 GB process peak while
+reading the 12 year files), `Calc` grouped it again, and a build held all of a stock's minutes. Now:
+- `Inputs(bhav=False)`: no bhavcopy rows. `turnover_medians()` (work-list order) streams the year files, two
+  columns at a time, and writes nothing (dry run).
+- `bhav_cache/<year>.parquet` (+ `cache_info.json`): the universe's master-series rows with security_id, sorted by
+  security_id and date, 20,000-row groups; built by `Calc` under the lock, one year at a time; a year is rebuilt
+  when its store file's size / mtime changed, all years when the master's build_info or the universe changed.
+  `read_cached_bhav(paths, sid)` reads one stock (row-group filter). The rows equal `mp.read_bhav`'s.
+- The build reads staged chunks one at a time (`minute_aggregates` per chunk; a chunk never splits a day), holding
+  at most one year of one stock for its year file; frames are freed after each stock.
+- `rebuild_checks` goes stock by stock: problem rows are appended to `minute_check.csv.tmp` (numeric columns as
+  float64) and renamed at the end; only per-date counts, steps and MINUTE_EMPTY dates are kept, and the
+  `minute_empty_days` runs re-read only the `date` column of the stocks that have any.
+- A stale `plan.csv` still needs the whole bhavcopy (phase 1's gaps step): `ensure_plan` loads a full `Inputs` for
+  it only, frees it, and logs memory before / peak / after (measured: 0.41 GB after freeing, so it stays in
+  process).
+- `memory()`: the working set via `GetProcessMemoryInfo` (ctypes, no psutil), `ru_maxrss` elsewhere. `runs.peak_mb`
+  and the CLI's last line give each run's peak.
 
 ## days.parquet and the conversion
 - Kite-vs-bhav rows (days with a day candle and a bhavcopy row) go through phase 1's functions: `with_factor`, ratio,
@@ -121,7 +147,8 @@ With no phase 2 files, the output is byte for byte phase 1's.
 
 ## Status (`status`, offline)
 Per priority DONE / partly / not started, minute and day requests left, hours, disk, chunks DONE / FAILED, rows
-built and staged, disk used, 429s and the last run.
+built and staged, disk used, 429s, ABORTED runs and the last run (with its peak memory; a `running` row prints
+"running now" while the lock is held, else that the next download / update marks it ABORTED).
 
 ## Loader
 `minute_store.load_minute(security_id_or_symbol, start=None, end=None, prices="raw"|"ours"|"kite", folder=None)`:
@@ -145,3 +172,9 @@ missing minute days, a market-wide day without minutes, a session without day ca
 high / close / volume days, a token error, a failing chunk, Ctrl+C, 429s, a whole-history re-adjustment between two
 runs and the update day with a new listing and a changed token. `backfill.fetch.STOP` is replaced by `FastStop` (no
 back-off wait).
+`tests/test_equity_minute_memory.py`: worlds of 10 and 40 plain stocks over two years (`PlainKite`), the
+tracemalloc peak of a two-worker download plus check rebuild must not grow with the stocks (40 ≤ 10 x 1.15 +
+0.5 MB; the old code grew 2.97 -> 7.43 MB and fails it, the new one 2.76 -> 3.05 MB); the cache rows equal
+`read_bhav`, only changed years rebuild, the dry run writes no cache; ABORTED marking by download and update (not
+a dry run), status text, an old progress file without `peak_mb`; the stale-plan memory line; `disk_used` with a
+file removed meanwhile.

@@ -69,6 +69,8 @@ These decide the rules below; they are also printed in every `build_report.txt` 
 - Everything is loaded once: the bhavcopy rows of the universe in the master's series (one row per security and
   day), the trading days (the exit list's `calendar.csv`), factors, membership periods and coverage, company names
   from the reference lists (`company` / `old_company` columns, by symbol).
+- `Inputs(folder, include_etf=False, bhav=True)`: phase 2's download / update pass `bhav=False` (`inp.bhav` is
+  then None) and read the bhavcopy one stock at a time (docs/dev/equity_minute_download.md, "Memory").
 
 ## Part 2: `tokens` (one `kite.instruments("NSE")` request)
 - Saved as received: `plan\kite_instruments_NSE_<IST date>.csv`.

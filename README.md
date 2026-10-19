@@ -649,6 +649,7 @@ python equity_minute.py update                      # then: today's minutes for 
 
 - Kite's prices are adjusted by Kite's own rules, so the files keep Kite's candles unchanged plus, per day, the conversion back to the bhavcopy's raw prices. Read them in Python with `from backfill.equity.minute_store import load_minute`: `load_minute("RELIANCE", "2024-01-01", "2024-01-31", prices="raw")`. `prices="ours"` gives our split / bonus adjusted prices (for indicators), `prices="kite"` Kite's own.
 - Problem days are in `equity_1min/check/` (`minute_check.csv`, `minute_empty_days.csv`, `scale_steps.csv`, `summary.json`). Run `python equity_minute.py gaps` afterwards to add the days Kite has no minutes for to `kite_gaps.csv`.
+- Memory stays under about 1.5 GB with two workers (the bhavcopy is read one stock at a time); the progress lines and `status` show the memory used. A run whose process was killed (for example by Windows for low memory) shows in `status` as `ABORTED` after the next `download` or `update` starts; nothing is lost, the same command resumes it.
 - During the history weeks, `download` rebuilds `plan.csv` itself (offline) after an `equity_update.py`. It refuses while a Kite F&O download runs. If the Kite session expires it stops: sign in (`python app.py`) and run the same command again. Exit codes: 0 done or stopped by you, 1 some chunks failed (run it again) or not ready, 2 bad arguments, busy, Kite sign-in needed or not enough disk.
 
 ## Credentials

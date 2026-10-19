@@ -209,9 +209,10 @@ def check_inputs(folder):
 
 class Inputs:
     """Everything the plan reads, loaded once: the universe, the master's history, the exit list, the bhavcopy rows
-    of the universe, the trading days, the factors, the index membership and company names."""
+    of the universe, the trading days, the factors, the index membership and company names. bhav=False skips the
+    bhavcopy rows (phase 2 reads them per stock; self.bhav is then None)."""
 
-    def __init__(self, folder, include_etf=False):
+    def __init__(self, folder, include_etf=False, bhav=True):
         check_inputs(folder)
         self.folder = folder
         m = sm.load_master(folder)
@@ -235,7 +236,7 @@ class Inputs:
         self.by_id = {u["security_id"]: u for u in rows}
         hist = m["history"][m["history"]["security_id"].isin(self.by_id)]
         self.history = {sid: g.sort_values("from_date") for sid, g in hist.groupby("security_id")}
-        self.bhav = read_bhav(folder, m, set(self.by_id))
+        self.bhav = read_bhav(folder, m, set(self.by_id)) if bhav else None
         self.factors = adj.load_factors(folder)["factors"]
         built = im.load_built(folder)
         self.membership = built["membership"]
