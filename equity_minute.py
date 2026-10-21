@@ -16,12 +16,16 @@ Phase 2 (backfill/equity/minute_download.py), each with --folder:
     python equity_minute.py status                progress, offline
     python equity_minute.py checks [--apply]      the check labels of the built stocks with the current rules,
                                                   offline (dry run unless --apply)
+    python equity_minute.py retoken [--apply]     match the stocks not DONE again in Kite's list (one request, a
+                                                  price check per new token): dry run unless --apply, which writes
+                                                  update/tokens.csv and marks NO_KITE_DATA stocks
 --workers is 1 to 4 (default 2); all workers share one --speed limit.
 
 Every command takes --folder (absolute; default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data) and --include-etf.
 Output: <folder>/equity_1min/plan/. Only tokens (not --rematch) and probe use the network (Kite only; the token
 from .env is never printed). Exit codes: 0 done; 1 an input not built or stale, tokens not run yet (or no saved list
-for --rematch), some probes failed or the probe stopped, show found nothing; 2 bad arguments, a lock busy, an input
+for --rematch), some probes failed or the probe stopped, show found nothing, retoken left a stock to REVIEW; 2 bad
+arguments, a lock busy, an input
 build or bhavcopy download running, a Kite F&O run busy, or Kite sign-in needed."""
 import argparse
 import os
@@ -140,6 +144,10 @@ def main(argv=None):
     ck = sub.add_parser("checks", help="phase 2: the check labels of the built stocks again, offline")
     ck.add_argument("--apply", action="store_true", help="rewrite the changed labels (default: dry run)")
     ck.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
+    rt = sub.add_parser("retoken", help="phase 2: match the stocks not DONE again in Kite's list (dry run)")
+    rt.add_argument("--apply", action="store_true", help="write the checked tokens and NO_KITE_DATA states")
+    rt.add_argument("--speed", type=speed, default=md.SPEED, help="requests per second (default 2.5, at most 3)")
+    rt.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
     for sp in (dl, up, st):
         sp.add_argument("--speed", type=speed, default=md.SPEED, help="requests per second (default 2.5, at most 3)")
         sp.add_argument("--workers", type=int, choices=range(1, md.MAX_WORKERS + 1), default=md.WORKERS,
@@ -182,6 +190,8 @@ def main(argv=None):
             return 0
         if args.cmd == "checks":
             return 1 if md.checks(folder, apply=args.apply)["refused"] else 0
+        if args.cmd == "retoken":
+            return 1 if md.retoken(folder, apply=args.apply, speed=args.speed)["review"] else 0
         return show(args.key, folder)
     except mp.SignInNeeded as e:
         print(f"Kite sign-in needed: {e}", file=sys.stderr)

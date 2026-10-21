@@ -4,8 +4,8 @@ Downloads Kite's 1-minute candles for every stock in phase 1's `plan.csv`, each 
 over several evenings (resumable). Each day is checked against Kite's day candle fetched in the same run, the data is
 stored by `security_id`, and a loader rebuilds raw or adjusted prices. A small daily `update` follows. Code:
 `backfill/equity/minute_download.py` (work list, download, build, checks, update, status) and
-`backfill/equity/minute_store.py` (file layout, `load_minute`); CLI `equity_minute.py download | update | status |
-checks`.
+`backfill/equity/minute_store.py` (file layout, `load_minute`, `clean_bars`); CLI `equity_minute.py download | update |
+status | checks | retoken`.
 Not part of `equity_update.py` (it needs a Kite sign-in); no dashboard UI.
 
 ## Part 0 findings (Kite, 2026-10-19, 214 requests; also `PART0_FINDINGS`)
@@ -65,9 +65,12 @@ Not part of `equity_update.py` (it needs a Kite sign-in); no dashboard UI.
 ## Download
 - Refuses: `equity_1min/.lock` busy (shared with phase 1), a Kite F&O run (`mp.check_fno`), an input lock.
 - `download_progress.sqlite`: `chunks` (security_id, token, chunk_from, chunk_to, rows, status, fetched_at, run_id,
-  seconds, error), `day_fetches`, `stocks` (token, status, first/last day, days, minute_rows, bytes, built_at),
-  `runs` (command, started, ended, requests, n429, result, peak_mb; `peak_mb` is added to older files by the next
-  real run, never by `status` or a dry run).
+  seconds, error), `day_fetches`, `stocks` (token, status DONE / NO_KITE_DATA, first/last day, days, minute_rows,
+  bytes, built_at, reason, reason_at), `runs` (command, started, ended, requests, n429, result, peak_mb), `errors`
+  (security_id, token, run_id, kind `DAY_CANDLES` / `UPDATE`, chunk_from, error, at: the text of a failed day-candle
+  request or update, which before went only to the console; a failed minute chunk keeps it in `chunks.error`).
+  `peak_mb`, `errors` and `reason` / `reason_at` are added to older files by the next real run or `retoken --apply`,
+  never by `status` or a dry run.
 - **ABORTED:** once `download` / `update` hold `.lock` (an OS lock, gone with its process), every `runs` row still
   `running` belonged to a killed process: it becomes `ABORTED` (`ended` stays empty) and the run logs it. A dry run
   marks nothing.
@@ -85,6 +88,33 @@ Not part of `equity_update.py` (it needs a Kite sign-in); no dashboard UI.
   run goes on (exit 1; a re-run retries it).
 - A progress line every 10 stocks and at a priority change: stocks, chunks, rows, req/s, 429s, ETA, disk, memory
   (current and peak). `disk_used` skips a file the other worker removed meanwhile (a built stock's staging).
+
+## Failed stocks, `retoken` and NO_KITE_DATA (2026-10-21)
+The full download left 21 stocks not DONE: a 502 on one chunk (token unchanged), a new Kite token, Kite listing only
+`SYMBOL-BE`, and 14 weekly-auction BE/BZ stocks gone from Kite's list (their old tokens answer `InputException:
+invalid token`).
+- **`retoken [--apply]`**: every plan stock whose `stocks` row is not DONE (NO_KITE_DATA included) is matched again
+  in one `kite.instruments("NSE")` list with phase 1's `match_tokens` (exact symbol, then SERIES_SWITCH):
+  `SAME_TOKEN`, `NEW_TOKEN`, `SERIES_SWITCH`, `NO_KITE_DATA` (not in the list) or `REVIEW` (several candidates, not
+  ACTIVE, a failed price check; never guessed). `NEW_TOKEN` / `SERIES_SWITCH` need `price_check`: one day-candle
+  request (10 days to the stock's last bhavcopy day); Kite's close that day within 2% (`mp.PRICE_TOL`) of the
+  bhavcopy close. No candle that day or a failed request is REVIEW too.
+- The dry run (default) prints the table (symbol, old / new token, Kite tradingsymbol, result, price check, note, what
+  `--apply` would do) and writes nothing. `--apply` (takes `.lock`) makes the same requests, then saves
+  `update/kite_instruments_NSE_<date>.csv`, merges the checked tokens into `update/tokens.csv` (`MATCHED`, other rows
+  kept; `read_plan` and `update` use them), marks NO_KITE_DATA stocks, clears the state of NO_KITE_DATA stocks found
+  again, and writes `check/no_kite_data.csv` and `update/retoken_<date>.csv`. Phase 1's plan folder is not touched.
+  DONE stocks are never candidates; a DONE stock whose token changes still goes to `archive/` (download / update).
+- **NO_KITE_DATA** (`stocks.status`, `reason` "not in Kite's NSE list of <date>", `reason_at`): `download` skips it
+  (also with `--symbols`; the work list says so), `estimate` counts it apart, `status` shows it on its own line, and
+  `update` does not wait for it (it still refuses for any other stock not DONE). `check/no_kite_data.csv`
+  (security_id, symbol, isin, last_bhav_day, reason) feeds phase 1's gaps (below).
+- **Back in the list:** when `update`'s token match finds a NO_KITE_DATA stock again, it gets the same price check
+  (`back_in_list`). Passed: the `stocks` row is dropped (its chunks stay) and it gets a full download in that update.
+  Failed or no candle: it stays NO_KITE_DATA and the log says `REVIEW <symbol> ... stays NO_KITE_DATA` with the
+  reason. `retoken --apply` also clears a stock found again (SAME_TOKEN / NEW_TOKEN / SERIES_SWITCH).
+- **status** lists unresolved failures with their error text (a FAILED chunk, or a stock's newest `errors` row newer
+  than its `built_at`; NO_KITE_DATA stocks left out), at most 30 lines.
 
 ## Memory
 The first real `--priority 1` run (2026-10-19) was killed by Windows for low memory (5.9 GB machine) after 63
@@ -151,16 +181,19 @@ prints each stock's first CLOSING_AUCTION date.
 - days with stored minutes (`data/<sid>/days.parquet`, `minute_rows > 0`) leave the 1-minute part of
   `KITE_MISSING_SESSION` and `EOD_EMPTY_DAYS` rows. Where every day has minutes the row becomes `EOD` (a new
   `data_missing` value); where only some do, it splits into `EOD` and `BOTH` rows;
-- `check/minute_empty_days.csv` adds `1MIN / MINUTE_EMPTY_DAYS` rows.
+- `check/minute_empty_days.csv` adds `1MIN / MINUTE_EMPTY_DAYS` rows;
+- `check/no_kite_data.csv` (retoken) adds a `BOTH / NO_KITE_DATA` row per stock over its `need_from..need_to`, so they
+  are on the vendor list.
 With no phase 2 files, the output is byte for byte phase 1's.
 
 ## Update (`update`, every evening after `python equity_update.py`)
-- Refuses: a plan stock not DONE (`HistoryNotDone`, exit 1); the newest bhavcopy day before today IST (`NoBhavToday`,
+- Refuses: a plan stock not DONE and not NO_KITE_DATA (`HistoryNotDone`, exit 1); the newest bhavcopy day before today IST (`NoBhavToday`,
   exit 1); the same locks and F&O check as download.
 - One `kite.instruments("NSE")` request, matched with `mp.match_tokens`. It writes
   `update/kite_instruments_NSE_<date>.csv` and `update/tokens.csv`. A matched security absent from phase 1's
   `kite_tokens.csv` is a new listing (`update/new_listings.csv`, first minute day = its first bhavcopy day). New
-  listings and changed tokens get a full history.
+  listings and changed tokens get a full history. NO_KITE_DATA stocks matched again get the price check first (see
+  above); the others are skipped.
 - Every other DONE stock: day and minute candles from the day after its last stored day to today. The new days are
   derived with the stored days as neighbours, and the stored rows are kept as they are. The year file and
   `days.parquet` are rewritten atomically (days last).
@@ -169,21 +202,33 @@ With no phase 2 files, the output is byte for byte phase 1's.
 
 ## Status (`status`, offline)
 Per priority DONE / partly / not started, minute and day requests left, hours, disk, chunks DONE / FAILED, rows
-built and staged, disk used, 429s, ABORTED runs and the last run (with its peak memory; a `running` row prints
+built and staged, disk used, 429s, unresolved failures with their error text, NO_KITE_DATA stocks, ABORTED runs and
+the last run (with its peak memory; a `running` row prints
 "running now" while the lock is held, else that the next download / update marks it ABORTED).
 
 ## Loader
-`minute_store.load_minute(security_id_or_symbol, start=None, end=None, prices="raw"|"ours"|"kite", folder=None)`:
+`minute_store.load_minute(security_id_or_symbol, start=None, end=None, prices="raw"|"ours"|"kite", folder=None,
+clean=True)`:
 - the key is an id or any symbol / ISIN ever used (`sm.lookup`; a name shared by several companies is resolved at
   `start`);
 - returns `ts, open, high, low, close, volume, security_id, symbol` (that day's symbol);
 - `ours` = raw / today's cumulative factor of the day (`mp.with_factor` on `adjustments.load_factors`), volume x it;
-- a stock without data raises `NoMinuteData`: "exited ...; use the bhavcopy" for exited stocks.
+- a stock without data raises `NoMinuteData`: "exited ...; use the bhavcopy" for exited stocks;
+- `clean=True` (default): the stored Kite bars go through `clean_bars` before the conversion. Bars with any of
+  open / high / low / close <= 0 are dropped (Kite pads some sessions with all-zero bars: 1,060,588 bars in 898
+  stock-years in the final report), a negative volume becomes 0 (192 bars), and high / low are widened to contain
+  open / close (372 bars). `attrs["clean"]` = {bars, dropped_nonpositive, volume_set_zero, highlow_widened}.
+  `clean=False` returns the stored bars exactly (no attrs). The stored files are never rewritten.
+- The day checks use the same cleaned bars: `minute_aggregates` (new builds and `update`'s new days) runs on
+  `clean_bars`, so zero bars do not count in `minute_rows`, `first_bar`, OHLC or volume, and a day of only zero bars
+  is MINUTE_EMPTY. Days already stored keep their aggregates (`checks` re-derives from them). `stocks.minute_rows`
+  stays the number of stored bars.
 
 ## CLI and exit codes
 `download [--dry-run] [--priority N] [--symbols A,B] [--limit N] [--speed 2.5] [--workers 1-4]`, `update`, `status`,
-`checks [--apply]`, each with `--folder`. Exit codes: 0 done / stopped by the user / dry run; 1 FAILED chunks, not built, stale input,
-history not done, no bhavcopy for today; 2 arguments, a lock busy, a Kite F&O run, Kite sign-in needed, not enough
+`checks [--apply]`, `retoken [--apply] [--speed 2.5]`, each with `--folder`. Exit codes: 0 done / stopped by the user /
+dry run; 1 FAILED chunks, not built, stale input, history not done, no bhavcopy for today, retoken left a stock to
+REVIEW; 2 arguments, a lock busy, a Kite F&O run, Kite sign-in needed, not enough
 disk.
 
 ## Tests
@@ -197,6 +242,13 @@ back-off wait). Also: 4 workers (every chunk once, the same files as 2 workers, 
 threads (one spacing, halved on 429), the CLOSING_AUCTION window (15:14 / 15:00 yes; 15:29, 14:59, 11:43 no; a close
 inside the range stays OK), `checks` dry run (writes nothing) / apply (only `check` changes, summary first date) /
 refusal when another column differs / stale cache / lock.
+`tests/test_equity_minute_fixes.py` (the same world; `FixKite` drops stocks from the list, lists them as `SYM-BE`,
+answers old tokens with `InputException`, has tokens without day candles, shifted prices and BIG's zero bars): error
+text in `errors` and `status`, an old progress file not changed by `status`; retoken's dry run (every result, nothing
+written, CLI exit codes), `--apply` then `download` with the new tokens (stored stocks unchanged); NO_KITE_DATA in the
+db, `no_kite_data.csv`, `status`, skipped by `download`, `update` refusing only for other stocks, running with it,
+bringing it back (price ok) or keeping it (price off / no candle), `retoken --apply` clearing it, `gaps` rows; zero bars
+in the day checks, `load_minute` clean / not clean, `clean_bars` counts.
 `tests/test_equity_minute_memory.py`: worlds of 10 and 40 plain stocks over two years (`PlainKite`), the
 tracemalloc peak of a two-worker download plus check rebuild must not grow with the stocks (40 ≤ 10 x 1.15 +
 0.5 MB; the old code grew 2.97 -> 7.43 MB and fails it, the new one 2.76 -> 3.05 MB); the cache rows equal

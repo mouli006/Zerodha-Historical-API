@@ -1034,7 +1034,8 @@ def stored_minute_days(folder):
 def minute_gap_rows(folder, o, gap_rows, states, usable):
     """The phase 2 download's corrections: days of KITE_MISSING_SESSION / EOD_EMPTY_DAYS rows that do have stored
     1-minute candles leave the 1-minute part (BOTH -> EOD; a run where only some days have minutes is split), and
-    check/minute_empty_days.csv adds 1MIN / MINUTE_EMPTY_DAYS rows. Nothing stored yet -> the rows unchanged."""
+    check/minute_empty_days.csv adds 1MIN / MINUTE_EMPTY_DAYS rows, check/no_kite_data.csv (retoken) a BOTH /
+    NO_KITE_DATA row over need_from..need_to per stock. Nothing stored yet -> the rows unchanged."""
     have = stored_minute_days(folder)
     out = []
     for g in gap_rows:
@@ -1083,6 +1084,12 @@ def minute_gap_rows(folder, o, gap_rows, states, usable):
                 out.append({"data_missing": "1MIN", "security_id": "", "symbols": "", "isins": "", "company_name": "",
                             "need_from": iso(a), "need_to": iso(b), "trading_days": n, "reason": "MINUTE_EMPTY_DAYS",
                             "exit_note": "", "indices": "", "median_turnover": None, "priority": 1, "note": r.note})
+    path = os.path.join(out_dir(folder), "check", "no_kite_data.csv")     # retoken: stocks Kite no longer lists
+    if os.path.isfile(path):
+        for r in pd.read_csv(path, dtype=str, keep_default_na=False).itertuples():
+            u = o.inp.by_id.get(r.security_id)
+            if u:
+                out.append(o.row("BOTH", r.security_id, u["need_from"], u["need_to"], "NO_KITE_DATA", r.reason))
     return out
 
 

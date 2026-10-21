@@ -14,7 +14,9 @@ Output under <folder>/equity_1min/ (every file atomic):
     check/minute_check.csv / minute_empty_days.csv / scale_steps.csv / summary.json
     bhav_cache/<year>.parquet, cache_info.json   the bhavcopy rows of the plan's universe by security_id, read one
                                             stock at a time (derived from the store; rebuilt per changed year file)
-    update/kite_instruments_NSE_<date>.csv, update/tokens.csv, update/new_listings.csv   (update only)
+    update/kite_instruments_NSE_<date>.csv, update/tokens.csv, update/new_listings.csv   (update / retoken)
+    update/retoken_<date>.csv              the table of the last retoken --apply of that day
+    check/no_kite_data.csv                  stocks Kite no longer lists (NO_KITE_DATA): for the vendor list
     archive/<security_id>_<date>/           a stock's old files after its Kite token changed (never deleted)
 <folder>/equity_1min/.lock: the same lock as phase 1 (one tokens / probe / gaps / download / update at a time).
 Memory: the whole bhavcopy is never loaded (mp.Inputs(bhav=False); rows come per stock from bhav_cache), a build
@@ -93,6 +95,12 @@ CHECK_COLUMNS = ["security_id", "symbol", "priority", "date", "check", "kite_hig
 EMPTY_COLUMNS = ["security_id", "symbol", "from_date", "to_date", "days", "note"]
 STEP_COLUMNS = ["security_id", "symbol", "kind", "date", "from_value", "to_value", "near_action", "flagged"]
 NEW_LISTING_COLUMNS = ["security_id", "symbol", "instrument_token", "minute_first_day", "added"]
+NO_KITE = "NO_KITE_DATA"         # a plan stock Kite no longer lists: download skips it, update does not wait for it
+NO_KITE_COLUMNS = ["security_id", "symbol", "isin", "last_bhav_day", "reason"]
+RETOKEN_COLUMNS = ["security_id", "symbol", "old_token", "new_token", "kite_tradingsymbol", "result", "price_check",
+                   "note", "action"]
+PRICE_DAYS = 10                  # the price check: Kite's day candles over the 10 days to the last bhavcopy day
+FAILED_LINES = 30                # status lists at most 30 unresolved failures
 
 PART0_FINDINGS = """Part 0 findings (Kite, 2026-10-19; see docs/dev/equity_minute_download.md):
 - A minute request takes ~0.79 s, a day request ~0.12 s: one worker reaches ~1.3 req/s, two reach the 2.5 limit.
@@ -194,9 +202,12 @@ SQL = ["""CREATE TABLE IF NOT EXISTS chunks (security_id TEXT, token TEXT, chunk
           last_day TEXT, days INTEGER, minute_rows INTEGER, bytes INTEGER, built_at TEXT)""",
        """CREATE TABLE IF NOT EXISTS runs (run_id TEXT PRIMARY KEY, command TEXT, started TEXT, ended TEXT,
           requests INTEGER, n429 INTEGER, result TEXT, peak_mb REAL)"""]
+ERRORS_SQL = """CREATE TABLE IF NOT EXISTS errors (security_id TEXT, token TEXT, run_id TEXT, kind TEXT, chunk_from TEXT,
+          error TEXT, at TEXT, PRIMARY KEY (security_id, run_id, kind, chunk_from))"""
 CHUNK_FIELDS = ["security_id", "token", "chunk_from", "chunk_to", "rows", "status", "fetched_at", "run_id", "seconds",
                 "error"]
-STOCK_FIELDS = ["security_id", "token", "status", "first_day", "last_day", "days", "minute_rows", "bytes", "built_at"]
+STOCK_FIELDS = ["security_id", "token", "status", "first_day", "last_day", "days", "minute_rows", "bytes", "built_at",
+                "reason", "reason_at"]
 
 
 class Progress:
@@ -212,6 +223,12 @@ class Progress:
             self.db.execute(s)
         if write and "peak_mb" not in [r[1] for r in self.db.execute("PRAGMA table_info(runs)")]:
             self.db.execute("ALTER TABLE runs ADD COLUMN peak_mb REAL")     # files written before the memory fix
+        if write:                       # files written before the fixes: errors, and the NO_KITE_DATA reason
+            self.db.execute(ERRORS_SQL)
+            have = [r[1] for r in self.db.execute("PRAGMA table_info(stocks)")]
+            for c in ("reason", "reason_at"):
+                if c not in have:
+                    self.db.execute(f"ALTER TABLE stocks ADD COLUMN {c} TEXT")
         self.db.commit()
 
     def close(self):
@@ -253,6 +270,24 @@ class Progress:
         self.write(f"INSERT OR REPLACE INTO stocks ({','.join(STOCK_FIELDS)}) VALUES ({','.join('?' * len(STOCK_FIELDS))})",
                    [row.get(k) for k in STOCK_FIELDS])
 
+    def drop_stock(self, sid):
+        """Only the stocks row (a NO_KITE_DATA stock back in Kite's list); its chunks stay for the resume."""
+        self.write("DELETE FROM stocks WHERE security_id=?", (sid,))
+
+    def set_no_kite(self, sid, token, reason, day):
+        self.save_stock(security_id=sid, token=str(token), status=NO_KITE, reason=reason, reason_at=iso(day))
+
+    def save_error(self, sid, token, run_id, kind, error, chunk_from=""):
+        self.write("INSERT OR REPLACE INTO errors VALUES (?,?,?,?,?,?,?)",
+                   (sid, str(token), run_id, kind, chunk_from, error, stamp()))
+
+    def errors(self):
+        """Every errors row, oldest first ([] in a file written before the table existed)."""
+        with self.lock:
+            if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='errors'").fetchone():
+                return []
+        return self.rows("SELECT * FROM errors ORDER BY at")
+
     def reset_stock(self, sid):
         for table in ("chunks", "day_fetches", "stocks"):
             self.write(f"DELETE FROM {table} WHERE security_id=?", (sid,))
@@ -285,6 +320,17 @@ def read_progress(folder):
     db = Progress(folder, write=False)
     try:
         return db.chunks(), db.stocks(), db.runs()
+    finally:
+        db.close()
+
+
+def read_errors(folder):
+    """The errors rows, oldest first, without creating the file or the table (status)."""
+    if not os.path.isfile(os.path.join(out_dir(folder), "download_progress.sqlite")):
+        return []
+    db = Progress(folder, write=False)
+    try:
+        return db.errors()
     finally:
         db.close()
 
@@ -538,8 +584,11 @@ def chunk_done(have, chunk, token, folder, sid):
 
 
 def stock_state(item, stocks, chunks_by_sid, folder):
-    """DONE (built with this token), PARTLY (some chunks done), NOT_STARTED; and the chunks still to fetch."""
+    """DONE (built with this token), PARTLY (some chunks done), NOT_STARTED, NO_KITE_DATA (not in Kite's list: nothing
+    to fetch); and the chunks still to fetch."""
     st = stocks.get(item["security_id"])
+    if st and st["status"] == NO_KITE:
+        return NO_KITE, []
     if st and st["status"] == "DONE" and st["token"] == str(item["token"]):
         return "DONE", []
     have = chunks_by_sid.get(item["security_id"], {})
@@ -576,7 +625,7 @@ def estimate(items, folder, days, speed=SPEED, workers=WORKERS):
     groups = {}
     for i in items:
         state, todo = stock_state(i, stocks, by_sid, folder)
-        g = groups.setdefault(i["priority"], {"stocks": 0, "DONE": 0, "PARTLY": 0, "NOT_STARTED": 0,
+        g = groups.setdefault(i["priority"], {"stocks": 0, "DONE": 0, "PARTLY": 0, "NOT_STARTED": 0, NO_KITE: 0,
                                                "minute_requests": 0, "day_requests": 0, "bytes": 0.0})
         g["stocks"] += 1
         g[state] += 1
@@ -586,7 +635,7 @@ def estimate(items, folder, days, speed=SPEED, workers=WORKERS):
             n = bisect_right(days, i["last"]) - bisect_left(days, i["first"])
             g["bytes"] += n * len(todo) / max(len(i["chunks"]), 1) * per_day[i["priority"]]
     total = {k: sum(g[k] for g in groups.values()) for k in
-             ("stocks", "DONE", "PARTLY", "NOT_STARTED", "minute_requests", "day_requests", "bytes")}
+             ("stocks", "DONE", "PARTLY", "NOT_STARTED", NO_KITE, "minute_requests", "day_requests", "bytes")}
     secs = total["minute_requests"] * max(1 / speed, lat / workers) + \
         total["day_requests"] * max(1 / speed, DAY_SECONDS / workers)
     return {"groups": dict(sorted(groups.items())), "total": total, "hours": secs / 3600, "latency": lat,
@@ -596,8 +645,9 @@ def estimate(items, folder, days, speed=SPEED, workers=WORKERS):
 
 def estimate_text(e, free):
     t = e["total"]
+    nk = f", {t[NO_KITE]:,} no Kite data" if t.get(NO_KITE) else ""
     lines = [f"Stocks: {t['stocks']:,} ({t['DONE']:,} done, {t['PARTLY']:,} partly done, {t['NOT_STARTED']:,} not "
-             "started)"]
+             f"started{nk})"]
     for p, g in e["groups"].items():
         lines.append(f"  priority {p}: {g['stocks']:,} stocks, {g['DONE']:,} done, {g['PARTLY']:,} partly, "
                      f"{g['minute_requests']:,} minute + {g['day_requests']:,} day requests, "
@@ -703,8 +753,11 @@ def day_inputs(minutes, runs_of_day, day_frames):
 
 def minute_aggregates(minutes):
     """{date: minute aggregates} of minute rows (the stored columns plus run_id / fetched_at). Every date's rows must
-    be in the frame: a build calls it per staged chunk (chunks start at 00:00, so they never split a day)."""
+    be in the frame: a build calls it per staged chunk (chunks start at 00:00, so they never split a day). The bars go
+    through ms.clean_bars first (as load_minute's default): Kite's all-zero padding bars do not count, so a day of
+    only zero bars has no minutes (MINUTE_EMPTY). The stored files keep every bar."""
     rows = {}
+    minutes = ms.clean_bars(minutes)[0]
     if len(minutes):
         m = minutes.sort_values("ts", kind="stable")
         m = m.assign(_d=m["ts"].dt.date, _hm=m["ts"].dt.strftime("%H:%M"))
@@ -936,6 +989,7 @@ class Runner:
                     df = self.fetch_days(token, item["first"], item["last"])
                 except ChunkFailed as e:
                     self.log(f"  {item['symbol']}: day candles FAILED {e}")
+                    self.db.save_error(sid, token, self.run_id, "DAY_CANDLES", str(e))
                     self.add(failed_stocks=1, failed_chunks=1)
                     return "FAILED"
                 sm.write_parquet(df, os.path.join(stage, f"day_{self.run_id}.parquet"))
@@ -1047,6 +1101,7 @@ class Runner:
                 candles += self.fetch(token, s, e, "minute")
         except ChunkFailed as e:
             self.log(f"  {item['symbol']}: FAILED {e}")
+            self.db.save_error(sid, token, self.run_id, "UPDATE", str(e))
             self.add(failed_stocks=1, failed_chunks=1)
             return "FAILED"
         fetched = stamp()
@@ -1332,7 +1387,9 @@ def download(folder=None, kite=None, priority=None, symbols=None, limit=None, sp
         by_sid = {}
         for c in chunks:
             by_sid.setdefault(c["security_id"], {})[c["chunk_from"]] = c
-        todo = [i for i in items if stock_state(i, stocks, by_sid, folder)[0] != "DONE"]
+        state = {i["security_id"]: stock_state(i, stocks, by_sid, folder)[0] for i in items}
+        todo = [i for i in items if state[i["security_id"]] not in ("DONE", NO_KITE)]
+        skipped = [i["symbol"] for i in items if state[i["security_id"]] == NO_KITE]
         if limit:
             todo = todo[:limit]
             keep = {i["security_id"] for i in todo}
@@ -1342,6 +1399,9 @@ def download(folder=None, kite=None, priority=None, symbols=None, limit=None, sp
         est = estimate(shown, folder, inp.days, speed, workers)
         free = free_space(folder)
         text = estimate_text(est, free)
+        if skipped:
+            text += f"Skipped, Kite has no data ({NO_KITE}, see check/no_kite_data.csv): {len(skipped):,} " \
+                    f"({', '.join(skipped[:20])}{' ...' if len(skipped) > 20 else ''})\n"
         if dry_run:
             stale = plan_stale(folder)
             if stale:
@@ -1379,7 +1439,8 @@ def update(folder=None, kite=None, speed=SPEED, workers=WORKERS, now=None, log=p
                               "Run python equity_update.py first.")
         items = work_list(folder, inp)
         _, stocks, _ = read_progress(folder)
-        missing = [i for i in items if not i["new"] and (stocks.get(i["security_id"]) or {}).get("status") != "DONE"]
+        missing = [i for i in items if not i["new"]
+                   and (stocks.get(i["security_id"]) or {}).get("status") not in ("DONE", NO_KITE)]
         if missing:
             raise HistoryNotDone(f"{len(missing):,} stocks have no full history yet (e.g. {missing[0]['symbol']}). "
                                  "Run python equity_minute.py download first.")
@@ -1408,11 +1469,16 @@ def update(folder=None, kite=None, speed=SPEED, workers=WORKERS, now=None, log=p
         if fresh:
             listed = pd.concat([listed, pd.DataFrame(fresh, columns=NEW_LISTING_COLUMNS)], ignore_index=True)
             sm.write_csv(listed, new_path)
+        back = back_in_list(folder, inp, kite, toks, stocks, speed, log)
+        if back:
+            _, stocks, _ = read_progress(folder)
         items = work_list(folder, inp)
         last_before = min((sm.as_date(s["last_day"]) for s in stocks.values() if s["status"] == "DONE"), default=today)
         full, daily = [], []
         for i in items:
             st = stocks.get(i["security_id"])
+            if st and st["status"] == NO_KITE:
+                continue
             if st and st["status"] == "DONE" and st["token"] == str(i["token"]):
                 daily.append(i)
             else:
@@ -1450,8 +1516,207 @@ def update(folder=None, kite=None, speed=SPEED, workers=WORKERS, now=None, log=p
         lock.release()
 
 
+def price_check(kite, limiter, token, u, tol=mp.PRICE_TOL):
+    """(ok, text): Kite's day close for `token` on the stock's last bhavcopy day within tol (2%) of the bhavcopy close.
+    One day-candle request (PRICE_DAYS days). No candle that day, no bhavcopy close or a failed request is not ok."""
+    day, close = u["last_date"], u["last_close"]
+    if not close or pd.isna(close):
+        return False, f"no bhavcopy close on {day}"
+    candles = []
+    try:
+        for s, e in make_chunks(day - timedelta(days=PRICE_DAYS), day, "day"):
+            candles += fetch_chunk(kite, limiter, token, s, e, "day")
+    except AuthStop as e:
+        raise mp.SignInNeeded(f"Kite session expired or invalid ({e}). Sign in (python app.py) and run the same "
+                              "command again.")
+    except ChunkFailed as e:
+        return False, f"day candles failed: {e}"
+    df = mp.day_frame(candles)
+    hit = df[df["date"] == day]
+    if not len(hit):
+        return False, f"no Kite day candle on {day}"
+    k = float(hit["close"].iloc[0])
+    diff = abs(k - close) / close
+    ok = diff <= tol
+    return ok, f"{'OK' if ok else 'OFF'} {diff:.2%}: Kite {k:g} vs bhavcopy {close:g} on {day}"
+
+
+def write_no_kite(folder, inp):
+    """check/no_kite_data.csv from the NO_KITE_DATA rows of the progress db (for the vendor list and phase 1's
+    gaps)."""
+    _, stocks, _ = read_progress(folder)
+    rows = []
+    for sid, st in sorted(stocks.items()):
+        if st["status"] != NO_KITE:
+            continue
+        u = inp.by_id.get(sid, {})
+        rows.append({"security_id": sid, "symbol": u.get("symbol", ""), "isin": u.get("isin", ""),
+                     "last_bhav_day": iso(u.get("last_date")), "reason": st.get("reason") or ""})
+    os.makedirs(check_dir(folder), exist_ok=True)
+    path = os.path.join(check_dir(folder), "no_kite_data.csv")
+    sm.write_csv(pd.DataFrame(rows, columns=NO_KITE_COLUMNS), path)
+    return path
+
+
+def back_in_list(folder, inp, kite, toks, stocks, speed=SPEED, log=print):
+    """update: NO_KITE_DATA stocks matched again in today's token match get retoken's price check (one day-candle
+    request each). Passed: the state is cleared (a full download follows). Failed or no candle: they stay
+    NO_KITE_DATA and are logged as REVIEW. Returns the symbols that came back."""
+    nk = sorted(sid for sid, s in stocks.items() if s["status"] == NO_KITE and sid in inp.by_id)
+    matched = {t.security_id: t for t in toks.itertuples() if t.match_status in mp.MATCHED and t.instrument_token}
+    nk = [sid for sid in nk if sid in matched]
+    if not nk:
+        return []
+    limiter = SharedLimiter(speed)
+    back = []
+    db = Progress(folder)
+    try:
+        for sid in nk:
+            t, u = matched[sid], inp.by_id[sid]
+            ok, text = price_check(kite, limiter, int(t.instrument_token), u)
+            if ok:
+                db.drop_stock(sid)
+                back.append(u["symbol"])
+                log(f"Back in Kite's list: {u['symbol']} ({sid}) as {t.kite_tradingsymbol} ({t.instrument_token}), "
+                    f"price {text}: full download.")
+            else:
+                log(f"REVIEW {u['symbol']} ({sid}): back in Kite's list as {t.kite_tradingsymbol} "
+                    f"({t.instrument_token}), but {text}; stays {NO_KITE}.")
+    finally:
+        db.close()
+    if back:
+        write_no_kite(folder, inp)
+    return back
+
+
+def retoken(folder=None, kite=None, apply=False, speed=SPEED, now=None, log=print):
+    """Match every plan stock that is not DONE again in today's Kite instrument list (one request; phase 1's
+    match_tokens): SAME_TOKEN, NEW_TOKEN, SERIES_SWITCH (both need the 2% price check, one day-candle request each),
+    NO_KITE_DATA (not in the list) or REVIEW (several candidates, not ACTIVE, a failed price check; never guessed).
+    Dry run (default): the table only, nothing written. apply: takes equity_1min/.lock, saves the list, merges the
+    checked new tokens into update/tokens.csv (which download and update read), marks NO_KITE_DATA stocks (and clears
+    the state of those found again), writes check/no_kite_data.csv and update/retoken_<date>.csv."""
+    folder = folder or config.equity_data_dir()
+    mp.check_fno(config.load_env())
+    lock = RunLock(mp.lock_path(folder)).acquire("equity_minute.py retoken --apply") if apply else None
+    try:
+        inp = mp.Inputs(folder, bhav=False)
+        today = (now or now_ist()).date()
+        plan = read_plan(folder)
+        _, stocks, _ = read_progress(folder)
+        cands = [sid for sid in sorted(plan) if sid in inp.by_id
+                 and (stocks.get(sid) or {}).get("status") != "DONE"]
+        if not cands:
+            log("Every plan stock is DONE: nothing to retoken.")
+            return {"applied": apply, "rows": [], "counts": {}, "review": 0}
+        kite = kite or mp.kite_client()
+        try:
+            instruments = kite.instruments("NSE")
+        except kex.TokenException as e:
+            raise mp.SignInNeeded(f"Kite session expired or invalid ({type(e).__name__}). Sign in (python app.py) "
+                                  "and run the same command again.")
+        matched = {m["security_id"]: m for m in mp.match_tokens([inp.by_id[s] for s in cands], instruments)}
+        limiter = SharedLimiter(speed)
+        rows, new_tokens = [], {}
+        for sid in cands:
+            u, old = inp.by_id[sid], plan[sid]["token"]
+            was_nk = (stocks.get(sid) or {}).get("status") == NO_KITE
+            m = matched.get(sid)
+            row = {"security_id": sid, "symbol": u["symbol"], "old_token": str(old), "new_token": "",
+                   "kite_tradingsymbol": "", "result": "REVIEW", "price_check": "", "note": "", "action": "none"}
+            if m is None:
+                row["note"] = f"not ACTIVE ({u['status'] or 'no status'}): not matched"
+            elif m["match_status"] == "NO_TOKEN":
+                row.update(result=NO_KITE, note=m["note"],
+                           action="stays " + NO_KITE if was_nk else f"mark {NO_KITE}, skipped by download")
+            elif m["match_status"] == "REVIEW":
+                row["note"] = m["note"]
+            else:
+                tok = int(m["instrument_token"])
+                row.update(new_token=str(tok), kite_tradingsymbol=m["kite_tradingsymbol"])
+                kind = "NEW_TOKEN" if m["match_rule"] == "EXACT" else "SERIES_SWITCH"
+                if tok == old:
+                    row.update(result="SAME_TOKEN", note=m["match_rule"],
+                               action=f"clear {NO_KITE}; download fetches it" if was_nk else "download retries it")
+                else:
+                    ok, text = price_check(kite, limiter, tok, u)
+                    row.update(price_check=text, note=m["note"] if kind == "SERIES_SWITCH" else "")
+                    if ok:
+                        new_tokens[sid] = m
+                        row.update(result=kind, action="write update/tokens.csv; download fetches it" +
+                                   (f" (clear {NO_KITE})" if was_nk else ""))
+                    else:
+                        row["note"] = f"{kind} to {tok}: price check failed" + (f"; {row['note']}" if row["note"]
+                                                                                 else "")
+            rows.append(row)
+        table = pd.DataFrame(rows, columns=RETOKEN_COLUMNS)
+        counts = table["result"].value_counts().to_dict()
+        with pd.option_context("display.width", 250, "display.max_colwidth", 90, "display.max_rows", 500):
+            text = table.drop(columns="security_id").to_string(index=False)
+        log(f"Kite instrument list {today}: {len(instruments):,} rows; {len(cands):,} plan stock(s) not DONE "
+            f"({'apply' if apply else 'dry run, nothing written'}):")
+        log(text)
+        log("Results: " + ", ".join(f"{k} {v:,}" for k, v in sorted(counts.items())) +
+            f"; {limiter.requests:,} day-candle request(s)")
+        if apply:
+            out = update_dir(folder)
+            os.makedirs(out, exist_ok=True)
+            sm.write_csv(pd.DataFrame(instruments), os.path.join(out, f"kite_instruments_NSE_{today.isoformat()}.csv"))
+            tpath = os.path.join(out, "tokens.csv")
+            old_t = pd.read_csv(tpath, dtype=str, keep_default_na=False) if os.path.isfile(tpath) else \
+                pd.DataFrame(columns=mp.TOKEN_COLUMNS)
+            if new_tokens:
+                add = pd.DataFrame([{**m, "match_status": "MATCHED",
+                                     "note": (m["note"] + "; " if m["note"] else "") + f"retoken {today}: " +
+                                     table.loc[table["security_id"] == sid, "price_check"].iat[0]}
+                                    for sid, m in new_tokens.items()], columns=mp.TOKEN_COLUMNS)
+                merged = pd.concat([old_t[~old_t["security_id"].isin(new_tokens)], add], ignore_index=True)
+                sm.write_csv(merged.sort_values("security_id", kind="stable"), tpath)
+            db = Progress(folder)
+            try:
+                for r in rows:
+                    sid = r["security_id"]
+                    was_nk = (stocks.get(sid) or {}).get("status") == NO_KITE
+                    if r["result"] == NO_KITE and not was_nk:
+                        db.set_no_kite(sid, r["old_token"], f"not in Kite's NSE list of {today}", today)
+                    elif r["result"] in ("SAME_TOKEN", "NEW_TOKEN", "SERIES_SWITCH") and was_nk:
+                        db.drop_stock(sid)
+            finally:
+                db.close()
+            write_no_kite(folder, inp)
+            sm.write_csv(table, os.path.join(out, f"retoken_{today.isoformat()}.csv"))
+            log(f"Applied: {len(new_tokens):,} new token(s) in {tpath}; "
+                f"{counts.get(NO_KITE, 0):,} {NO_KITE} in check/no_kite_data.csv.")
+        return {"applied": apply, "rows": rows, "counts": counts, "review": counts.get("REVIEW", 0),
+                "report": text}
+    finally:
+        if lock:
+            lock.release()
+
+
+def failures(chunks, stocks, errors, names):
+    """Unresolved failures for status: FAILED chunks, and the newest error of a stock not built since (NO_KITE_DATA
+    stocks left out): [(symbol, security_id, kind, error, run_id)]."""
+    out = []
+    for c in chunks:
+        st = stocks.get(c["security_id"]) or {}
+        if c["status"] == "FAILED" and st.get("status") != NO_KITE:
+            out.append((names.get(c["security_id"], c["security_id"]), c["security_id"],
+                        f"MINUTE_CHUNK {c['chunk_from']}", c["error"] or "", c["run_id"]))
+    newest = {}
+    for e in errors:
+        newest[e["security_id"]] = e
+    for sid, e in sorted(newest.items()):
+        st = stocks.get(sid) or {}
+        if st.get("status") == NO_KITE or (st.get("status") == "DONE" and (st.get("built_at") or "") >= e["at"]):
+            continue
+        out.append((names.get(sid, sid), sid, e["kind"], e["error"] or "", e["run_id"]))
+    return sorted(out)
+
+
 def status(folder=None, speed=SPEED, workers=WORKERS, log=print):
-    """Offline: per priority DONE / partly / not started, chunks, FAILED chunks, rows, disk, ETA, 429s, last run."""
+    """Offline: per priority DONE / partly / not started, chunks, FAILED chunks, rows, disk, ETA, 429s, unresolved
+    failures with their error text, NO_KITE_DATA stocks, last run."""
     folder = folder or config.equity_data_dir()
     rows = read_plan(folder)
     try:
@@ -1479,6 +1744,22 @@ def status(folder=None, speed=SPEED, workers=WORKERS, log=print):
              f"Rows: {done_rows:,} in built stocks, {staged:,} staged",
              f"Disk used: {disk_used(folder) / 1e9:.2f} GB",
              f"429 answers: {n429:,} in {len(runs):,} run(s)"]
+    try:
+        names = dict(zip(*[mp.read_tokens(folder)[c] for c in ("security_id", "symbol")]))
+    except mp.NotBuilt:
+        names = {}
+    fails = failures(chunks, stocks, read_errors(folder), names)
+    if fails:
+        lines.append(f"Failed (not built yet, run download again or retoken): {len(fails):,}")
+        for sym, sid, kind, err, run in fails[:FAILED_LINES]:
+            err = err if len(err) <= 150 else err[:147] + "..."
+            lines.append(f"  {sym} ({sid}) {kind}: {err} [run {run}]")
+        if len(fails) > FAILED_LINES:
+            lines.append(f"  ... {len(fails) - FAILED_LINES:,} more")
+    nk = sorted((names.get(sid, sid), s.get("reason_at") or "") for sid, s in stocks.items() if s["status"] == NO_KITE)
+    if nk:
+        lines.append(f"No Kite data ({NO_KITE}): {len(nk):,} stocks ({', '.join(n for n, _ in nk)}), since "
+                     f"{min(d for _, d in nk) or '?'}; check/no_kite_data.csv")
     aborted = [r for r in runs if r["result"] == "ABORTED"]
     if aborted:
         lines.append(f"ABORTED runs (process killed, e.g. low memory): {len(aborted):,} "
@@ -1495,7 +1776,8 @@ def status(folder=None, speed=SPEED, workers=WORKERS, log=print):
     text = "\n".join(lines) + "\n"
     log(text, end="")
     return {"estimate": est, "failed_chunks": failed, "rows": done_rows, "staged_rows": staged, "n429": n429,
-            "runs": runs, "aborted": len(aborted), "report": text}
+            "runs": runs, "aborted": len(aborted), "failures": fails, "no_kite_data": [n for n, _ in nk],
+            "report": text}
 
 
 def same_column(a, b):

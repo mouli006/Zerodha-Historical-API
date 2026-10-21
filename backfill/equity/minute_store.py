@@ -9,7 +9,9 @@ load_minute() rebuilds raw prices from the stored conversion of each day (docs/d
     p' = Kite minute x minute_scale (Kite's minute and day histories are not always on the same scale)
     MULTIPLICATIVE: raw = p' x ratio;  ADDITIVE: raw = kite_multiplier x (p' + kite_difference)
     volume: raw = Kite minute volume x minute_volume_scale x vol_ratio
-and "ours" divides raw prices by today's cumulative factor of the day (adjustments.factor_on), volume times it."""
+and "ours" divides raw prices by today's cumulative factor of the day (adjustments.factor_on), volume times it.
+With clean=True (default) the stored bars are cleaned first (clean_bars): Kite pads some sessions with all-zero bars,
+and a few bars have a negative volume or a high / low that does not contain the open / close."""
 import os
 import re
 from datetime import date
@@ -114,10 +116,32 @@ def resolve(key, folder, on_date=None):
     raise NoMinuteData(f"{key} was used by {', '.join(ids)}; pass the security_id or a start date.")
 
 
-def load_minute(security_id_or_symbol, start=None, end=None, prices="raw", folder=None):
+def clean_bars(df):
+    """(cleaned copy, counts) of minute bars: bars with any of open / high / low / close <= 0 dropped (Kite's all-zero
+    padding bars), a negative volume set to 0, and high / low widened to contain open and close. counts: bars (in),
+    dropped_nonpositive, volume_set_zero, highlow_widened."""
+    o, h, l, c = (df[x].to_numpy(float) for x in ("open", "high", "low", "close"))
+    keep = (o > 0) & (h > 0) & (l > 0) & (c > 0)
+    out = df[keep].copy()
+    v = out["volume"].to_numpy()
+    neg = v < 0
+    if neg.any():
+        out["volume"] = np.where(neg, 0, v).astype(out["volume"].dtype)
+    o, h, l, c = (out[x].to_numpy(float) for x in ("open", "high", "low", "close"))
+    hi, lo = np.maximum.reduce([h, o, c]), np.minimum.reduce([l, o, c])
+    widened = (hi != h) | (lo != l)
+    if widened.any():
+        out["high"], out["low"] = hi, lo
+    return out, {"bars": len(df), "dropped_nonpositive": int((~keep).sum()), "volume_set_zero": int(neg.sum()),
+                 "highlow_widened": int(widened.sum())}
+
+
+def load_minute(security_id_or_symbol, start=None, end=None, prices="raw", folder=None, clean=True):
     """1-minute candles of one company from start to end (dates, inclusive): prices "kite" (as stored), "raw" (each
     day converted with its own stored conversion) or "ours" (raw, then adjusted with our factors, for indicators).
-    Columns ts, open, high, low, close, volume, security_id, symbol (the symbol of that day)."""
+    Columns ts, open, high, low, close, volume, security_id, symbol (the symbol of that day). clean=True (default):
+    the stored bars go through clean_bars first and attrs["clean"] holds its counts; clean=False: the stored bars
+    exactly."""
     if prices not in PRICES:
         raise ValueError(f"prices must be one of {', '.join(PRICES)}")
     folder = folder or config.equity_data_dir()
@@ -146,6 +170,9 @@ def load_minute(security_id_or_symbol, start=None, end=None, prices="raw", folde
         m = m[m["date"] >= a]
     if b:
         m = m[m["date"] <= b]
+    counts = None
+    if clean:
+        m, counts = clean_bars(m)
     cols = ["date", "symbol", "kind", "ratio", "kite_multiplier", "kite_difference", "vol_ratio", "minute_scale",
             "minute_volume_scale"]
     m = m.merge(days[cols], on="date", how="inner").sort_values("ts", kind="stable").reset_index(drop=True)
@@ -162,6 +189,8 @@ def load_minute(security_id_or_symbol, start=None, end=None, prices="raw", folde
         out["volume"] = out["volume"] * f
     out["security_id"] = sid
     out["symbol"] = m["symbol"].to_numpy()
+    if clean:
+        out.attrs["clean"] = counts
     return out
 
 
