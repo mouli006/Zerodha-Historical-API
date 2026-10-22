@@ -659,6 +659,7 @@ open / close (`df.attrs["clean"]` counts the fixes); `clean=False` returns the b
   `download` again. Stocks Kite no longer lists become `NO_KITE_DATA`: they are skipped, listed in
   `check/no_kite_data.csv` and in `kite_gaps.csv` (after `gaps`), and `update` no longer waits for them. `status`
   shows each failure with Kite's error text.
+- `retoken` also probes again the stocks phase 1's probe found no day candles for: `PROBE_RECOVERED` (Kite has them now, price checked) is added to `plan.csv` by `--apply` (backup in `equity_1min/archive/`), so `download` fetches it.
 - Problem days are in `equity_1min/check/` (`minute_check.csv`, `minute_empty_days.csv`, `scale_steps.csv`, `summary.json`). Run `python equity_minute.py gaps` afterwards to add the days Kite has no minutes for to `kite_gaps.csv`.
 - Memory stays under about 1.5 GB with two workers (the bhavcopy is read one stock at a time); the progress lines and `status` show the memory used. A run whose process was killed (for example by Windows for low memory) shows in `status` as `ABORTED` after the next `download` or `update` starts; nothing is lost, the same command resumes it.
 - During the history weeks, `download` rebuilds `plan.csv` itself (offline) after an `equity_update.py`. It refuses while a Kite F&O download runs. If the Kite session expires it stops: sign in (`python app.py`) and run the same command again. Exit codes: 0 done or stopped by you, 1 some chunks failed (run it again) or not ready, 2 bad arguments, busy, Kite sign-in needed or not enough disk.

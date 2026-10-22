@@ -29,6 +29,7 @@ import secrets
 import shutil
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 from bisect import bisect_left, bisect_right
@@ -99,6 +100,8 @@ NO_KITE = "NO_KITE_DATA"         # a plan stock Kite no longer lists: download s
 NO_KITE_COLUMNS = ["security_id", "symbol", "isin", "last_bhav_day", "reason"]
 RETOKEN_COLUMNS = ["security_id", "symbol", "old_token", "new_token", "kite_tradingsymbol", "result", "price_check",
                    "note", "action"]
+PROBE_RECOVERED = "PROBE_RECOVERED"   # retoken: the probe found no day candles, a new probe does (price checked)
+PLAN_TARGETS = ["plan.csv", "kite_vs_bhav.parquet", "kite_adjustment.csv", "eod_mismatch.csv", "probe_progress.sqlite"]
 PRICE_DAYS = 10                  # the price check: Kite's day candles over the 10 days to the last bhavcopy day
 FAILED_LINES = 30                # status lists at most 30 unresolved failures
 
@@ -125,6 +128,10 @@ class NoBhavToday(mp.MinutePlanError):
 
 
 class CacheStale(mp.MinutePlanError):
+    pass
+
+
+class ApplyFailed(mp.MinutePlanError):
     pass
 
 
@@ -1589,16 +1596,173 @@ def back_in_list(folder, inp, kite, toks, stocks, speed=SPEED, log=print):
     return back
 
 
+def probe_empty(folder, inp):
+    """{security_id: token} of the ACTIVE plan stocks the probe found no day candles for (phase 1's BOTH /
+    NO_KITE_DATA gap row "the token returned no day candles"): matched to a token, probed DONE with that token, a blank
+    eod_first_day, download_minute = N. A NO_TOKEN listing has no token and a not probed / FAILED probe no DONE row:
+    neither is here."""
+    plan = pd.read_csv(plan_path(folder), dtype=str, keep_default_na=False)
+    probes = mp.read_probes(folder)
+    out = {}
+    for r in plan.itertuples():
+        p = probes.get(r.security_id)
+        if (r.status == "ACTIVE" and r.match_status in mp.MATCHED and r.instrument_token and r.download_minute == "N"
+                and not r.eod_first_day and r.security_id in inp.by_id and p and p["status"] == "DONE"
+                and p["instrument_token"] == r.instrument_token and not p["eod_first_day"]):
+            out[r.security_id] = int(r.instrument_token)
+    return out
+
+
+def reprobe(kite, limiter, token, u, bhav, today, out):
+    """Probe a probe-empty stock again the way phase 1 did (mp.Prober: day candles in chunks, the 2% price check, the
+    first minute day), the price check on the latest finished bhavcopy day before today. Writes only
+    <out>/kite_day/<security_id>.parquet. Returns (result, price_check, note, probe row or None)."""
+    days = bhav[bhav["date"] < today] if bhav is not None else None
+    if days is None or not len(days):
+        return "REVIEW", "", f"no bhavcopy day before {today}", None
+    day, close = days["date"].iloc[-1], float(days["close"].iloc[-1])
+    try:
+        row = mp.Prober(kite, limiter).probe(token, {**u, "last_close": close}, list(days["date"]), out, mp.PRICE_TOL)
+    except AuthStop as e:
+        raise mp.SignInNeeded(f"Kite session expired or invalid ({e}). Sign in (python app.py) and run the same "
+                              "command again.")
+    except ChunkFailed as e:
+        return "REVIEW", "", f"probe found no day candles; the new probe failed: {e}", None
+    if not row["eod_first_day"]:
+        return NO_KITE, "", "the token still returns no day candles", row
+    note = (f"probe found no day candles; now day candles from {row['eod_first_day']}, minutes from "
+            f"{row['minute_first_day'] or 'none'}")
+    if row["price_kite_close"] is None:
+        return "REVIEW", f"no Kite day candle on {day}", note, row
+    k = row["price_kite_close"]
+    diff = abs(k - close) / close
+    text = f"{'OK' if row['price_status'] == 'MATCHED' else 'OFF'} {diff:.2%}: Kite {k:g} vs bhavcopy {close:g} on {day}"
+    return (PROBE_RECOVERED if row["price_status"] == "MATCHED" else "REVIEW"), text, note, row
+
+
+def _replace(tmp, path):
+    os.replace(tmp, path)
+
+
+def build_recovered(folder, recovered, work, now=None):
+    """Phase 1's build (mp.build_outputs) in <work>/build, never in the data folder: a copy of the plan folder's tokens,
+    probe db (plus the new probe rows) and kite_day files (plus the re-probed ones); the inputs are read from the real
+    folder. Its gap rows lack the download's corrections (no data/ or check/ there) and are not used. Returns the
+    temp plan folder."""
+    tmp = os.path.join(work, "build")
+    tplan, pdir = mp.plan_dir(tmp), mp.plan_dir(folder)
+    os.makedirs(os.path.join(tplan, "kite_day"))
+    for name in ("kite_tokens.csv", "tokens_info.json", "probe_progress.sqlite"):
+        if os.path.isfile(os.path.join(pdir, name)):
+            shutil.copy2(os.path.join(pdir, name), os.path.join(tplan, name))
+    kd = os.path.join(pdir, "kite_day")
+    for name in (os.listdir(kd) if os.path.isdir(kd) else []):
+        if name.endswith(".parquet"):
+            shutil.copy2(os.path.join(kd, name), os.path.join(tplan, "kite_day", name))
+    for sid, (row, path) in recovered.items():
+        shutil.copy2(path, os.path.join(tplan, "kite_day", f"{sid}.parquet"))
+    db = sqlite3.connect(os.path.join(tplan, "probe_progress.sqlite"))
+    try:
+        db.execute(mp.PROBE_SQL)
+        for row, _ in recovered.values():
+            mp.save_probe(db, row)
+    finally:
+        db.close()
+    mp.build_outputs(tmp, mp.Inputs(folder), now=now, log=quiet)
+    return tplan
+
+
+def spliced(old, new, ids):
+    """old's rows of every other stock unchanged plus new's rows of `ids`, in security_id order when old was."""
+    out = pd.concat([old[~old["security_id"].isin(ids)], new.loc[new["security_id"].isin(ids), list(old.columns)]],
+                    ignore_index=True)
+    if old["security_id"].is_monotonic_increasing:
+        out = out.sort_values("security_id", kind="stable")
+    return out
+
+
+def apply_recovered(folder, recovered, work, now=None):
+    """retoken --apply for the PROBE_RECOVERED stocks ({security_id: (probe row, re-probed kite_day file)}): what the
+    probe would have written. Backs up the targets (plan.csv, kite_vs_bhav.parquet, kite_adjustment.csv,
+    eod_mismatch.csv, probe_progress.sqlite, kite_day/<sid>.parquet) to archive/plan_retoken_<time>/, builds in a temp
+    folder, writes every target to <target>.tmp, then replaces them all. kite_gaps.csv and the other phase 1 outputs
+    are not written (the next gaps run). All or nothing: any error restores every target from the backup
+    (ApplyFailed). Returns the backup folder."""
+    pdir = mp.plan_dir(folder)
+    ids = set(recovered)
+    targets = [os.path.join(pdir, n) for n in PLAN_TARGETS] + \
+        [os.path.join(pdir, "kite_day", f"{sid}.parquet") for sid in sorted(ids)]
+    backup = os.path.join(out_dir(folder), "archive", f"plan_retoken_{now_ist():%Y-%m-%d_%H%M%S}")
+    existed = {}
+    for p in targets:
+        existed[p] = os.path.isfile(p)
+        if existed[p]:
+            dst = os.path.join(backup, os.path.relpath(p, pdir))
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(p, dst)
+    tmps = []
+    try:
+        tplan = build_recovered(folder, recovered, work, now)
+        for name in ("plan.csv", "kite_adjustment.csv", "eod_mismatch.csv"):
+            p = os.path.join(pdir, name)
+            new = pd.read_csv(os.path.join(tplan, name), dtype=str, keep_default_na=False)
+            old = pd.read_csv(p, dtype=str, keep_default_na=False) if existed[p] else new.iloc[:0]
+            tmps.append((p + ".tmp", p))
+            spliced(old, new, ids).to_csv(p + ".tmp", index=False, lineterminator="\n", encoding="utf-8")
+        p = os.path.join(pdir, "kite_vs_bhav.parquet")
+        new = pq.read_table(os.path.join(tplan, "kite_vs_bhav.parquet")).to_pandas()
+        old = pq.read_table(p).to_pandas() if existed[p] else new.iloc[:0]
+        kvb = spliced(old, new, ids)
+        if old["security_id"].is_monotonic_increasing:
+            kvb = kvb.sort_values(["security_id", "date"], kind="stable")
+        tmps.append((p + ".tmp", p))
+        pq.write_table(pa.Table.from_pandas(kvb, preserve_index=False), p + ".tmp")
+        p = os.path.join(pdir, "probe_progress.sqlite")
+        tmps.append((p + ".tmp", p))
+        if existed[p]:
+            shutil.copy2(p, p + ".tmp")
+        db = sqlite3.connect(p + ".tmp")
+        try:
+            db.execute(mp.PROBE_SQL)
+            for row, _ in recovered.values():
+                mp.save_probe(db, row)
+        finally:
+            db.close()
+        os.makedirs(os.path.join(pdir, "kite_day"), exist_ok=True)
+        for sid in sorted(ids):
+            p = os.path.join(pdir, "kite_day", f"{sid}.parquet")
+            tmps.append((p + ".tmp", p))
+            shutil.copy2(os.path.join(tplan, "kite_day", f"{sid}.parquet"), p + ".tmp")
+        for tmp, p in tmps:
+            _replace(tmp, p)
+    except Exception as e:
+        for tmp, _ in tmps:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        for p in targets:
+            if existed[p]:
+                shutil.copy2(os.path.join(backup, os.path.relpath(p, pdir)), p)
+            elif os.path.exists(p):
+                os.remove(p)
+        raise ApplyFailed(f"retoken --apply failed ({type(e).__name__}: {e}); plan files restored from {backup}") \
+            from e
+    return backup
+
+
 def retoken(folder=None, kite=None, apply=False, speed=SPEED, now=None, log=print):
     """Match every plan stock that is not DONE again in today's Kite instrument list (one request; phase 1's
     match_tokens): SAME_TOKEN, NEW_TOKEN, SERIES_SWITCH (both need the 2% price check, one day-candle request each),
     NO_KITE_DATA (not in the list) or REVIEW (several candidates, not ACTIVE, a failed price check; never guessed).
     Dry run (default): the table only, nothing written. apply: takes equity_1min/.lock, saves the list, merges the
     checked new tokens into update/tokens.csv (which download and update read), marks NO_KITE_DATA stocks (and clears
-    the state of those found again), writes check/no_kite_data.csv and update/retoken_<date>.csv."""
+    the state of those found again), writes check/no_kite_data.csv and update/retoken_<date>.csv.
+    Also the ACTIVE stocks the probe found no day candles for (probe_empty): probed again (reprobe) -> PROBE_RECOVERED
+    (price check on the latest finished day OK; apply updates their plan rows as the probe would have,
+    apply_recovered), NO_KITE_DATA (still empty; nothing written) or REVIEW (never applied)."""
     folder = folder or config.equity_data_dir()
     mp.check_fno(config.load_env())
     lock = RunLock(mp.lock_path(folder)).acquire("equity_minute.py retoken --apply") if apply else None
+    work = None
     try:
         inp = mp.Inputs(folder, bhav=False)
         today = (now or now_ist()).date()
@@ -1606,7 +1770,8 @@ def retoken(folder=None, kite=None, apply=False, speed=SPEED, now=None, log=prin
         _, stocks, _ = read_progress(folder)
         cands = [sid for sid in sorted(plan) if sid in inp.by_id
                  and (stocks.get(sid) or {}).get("status") != "DONE"]
-        if not cands:
+        empty = {sid: tok for sid, tok in probe_empty(folder, inp).items() if sid not in plan}
+        if not cands and not empty:
             log("Every plan stock is DONE: nothing to retoken.")
             return {"applied": apply, "rows": [], "counts": {}, "review": 0}
         kite = kite or mp.kite_client()
@@ -1615,9 +1780,10 @@ def retoken(folder=None, kite=None, apply=False, speed=SPEED, now=None, log=prin
         except kex.TokenException as e:
             raise mp.SignInNeeded(f"Kite session expired or invalid ({type(e).__name__}). Sign in (python app.py) "
                                   "and run the same command again.")
-        matched = {m["security_id"]: m for m in mp.match_tokens([inp.by_id[s] for s in cands], instruments)}
+        matched = {m["security_id"]: m for m in mp.match_tokens([inp.by_id[s] for s in cands + sorted(empty)],
+                                                                instruments)}
         limiter = SharedLimiter(speed)
-        rows, new_tokens = [], {}
+        rows, new_tokens, recovered = [], {}, {}
         for sid in cands:
             u, old = inp.by_id[sid], plan[sid]["token"]
             was_nk = (stocks.get(sid) or {}).get("status") == NO_KITE
@@ -1649,16 +1815,43 @@ def retoken(folder=None, kite=None, apply=False, speed=SPEED, now=None, log=prin
                         row["note"] = f"{kind} to {tok}: price check failed" + (f"; {row['note']}" if row["note"]
                                                                                  else "")
             rows.append(row)
+        # the stocks the probe found no day candles for (download_minute = N, not in read_plan): probed again
+        work = tempfile.mkdtemp(prefix="retoken_")
+        bhav = {}
+        if empty:
+            b = mp.read_bhav(folder, sm.load_master(folder), set(empty))
+            bhav = {sid: g.reset_index(drop=True) for sid, g in b.groupby("security_id")}
+            del b
+        for sid in sorted(empty):
+            u, tok, m = inp.by_id[sid], empty[sid], matched.get(sid)
+            row = {"security_id": sid, "symbol": u["symbol"], "old_token": str(tok), "new_token": "",
+                   "kite_tradingsymbol": "", "result": "REVIEW", "price_check": "", "note": "", "action": "none"}
+            if m is None or m["match_status"] not in mp.MATCHED or int(m["instrument_token"] or 0) != tok:
+                listed = f"gives token {m['instrument_token']}" if m and m["instrument_token"] else "has no single match"
+                row["note"] = f"probe found no day candles; today's Kite list {listed}: run tokens, then probe"
+            else:
+                row.update(new_token=str(tok), kite_tradingsymbol=m["kite_tradingsymbol"])
+                out = os.path.join(work, "probe", sid)
+                result, text, note, prow = reprobe(kite, limiter, tok, u, bhav.get(sid), today, out)
+                row.update(result=result, price_check=text, note=note)
+                if result == PROBE_RECOVERED:
+                    recovered[sid] = (prow, os.path.join(out, "kite_day", f"{sid}.parquet"))
+                    row["action"] = "plan.csv download_minute = Y (as the probe); download fetches it"
+                elif result == NO_KITE:
+                    row["action"] = "stays N in plan.csv (phase 1 gap row)"
+            rows.append(row)
         table = pd.DataFrame(rows, columns=RETOKEN_COLUMNS)
         counts = table["result"].value_counts().to_dict()
         with pd.option_context("display.width", 250, "display.max_colwidth", 90, "display.max_rows", 500):
             text = table.drop(columns="security_id").to_string(index=False)
-        log(f"Kite instrument list {today}: {len(instruments):,} rows; {len(cands):,} plan stock(s) not DONE "
-            f"({'apply' if apply else 'dry run, nothing written'}):")
+        log(f"Kite instrument list {today}: {len(instruments):,} rows; {len(cands):,} plan stock(s) not DONE" +
+            (f", {len(empty):,} the probe found no day candles for" if empty else "") +
+            f" ({'apply' if apply else 'dry run, nothing written'}):")
         log(text)
         log("Results: " + ", ".join(f"{k} {v:,}" for k, v in sorted(counts.items())) +
-            f"; {limiter.requests:,} day-candle request(s)")
+            f"; {limiter.requests:,} " + ("Kite history request(s)" if empty else "day-candle request(s)"))
         if apply:
+            backup = apply_recovered(folder, recovered, work, now) if recovered else None
             out = update_dir(folder)
             os.makedirs(out, exist_ok=True)
             sm.write_csv(pd.DataFrame(instruments), os.path.join(out, f"kite_instruments_NSE_{today.isoformat()}.csv"))
@@ -1676,6 +1869,8 @@ def retoken(folder=None, kite=None, apply=False, speed=SPEED, now=None, log=prin
             try:
                 for r in rows:
                     sid = r["security_id"]
+                    if sid in empty:
+                        continue
                     was_nk = (stocks.get(sid) or {}).get("status") == NO_KITE
                     if r["result"] == NO_KITE and not was_nk:
                         db.set_no_kite(sid, r["old_token"], f"not in Kite's NSE list of {today}", today)
@@ -1685,11 +1880,16 @@ def retoken(folder=None, kite=None, apply=False, speed=SPEED, now=None, log=prin
                 db.close()
             write_no_kite(folder, inp)
             sm.write_csv(table, os.path.join(out, f"retoken_{today.isoformat()}.csv"))
-            log(f"Applied: {len(new_tokens):,} new token(s) in {tpath}; "
-                f"{counts.get(NO_KITE, 0):,} {NO_KITE} in check/no_kite_data.csv.")
+            nk = sum(1 for r in rows if r["result"] == NO_KITE and r["security_id"] not in empty)
+            log(f"Applied: {len(new_tokens):,} new token(s) in {tpath}; {nk:,} {NO_KITE} in check/no_kite_data.csv.")
+            if recovered:
+                log(f"Applied: {len(recovered):,} probe-recovered stock(s): plan.csv download_minute = Y; backup in "
+                    f"{backup}")
         return {"applied": apply, "rows": rows, "counts": counts, "review": counts.get("REVIEW", 0),
                 "report": text}
     finally:
+        if work:
+            shutil.rmtree(work, ignore_errors=True)
         if lock:
             lock.release()
 

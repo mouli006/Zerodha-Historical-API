@@ -103,7 +103,8 @@ invalid token`).
   `--apply` would do) and writes nothing. `--apply` (takes `.lock`) makes the same requests, then saves
   `update/kite_instruments_NSE_<date>.csv`, merges the checked tokens into `update/tokens.csv` (`MATCHED`, other rows
   kept; `read_plan` and `update` use them), marks NO_KITE_DATA stocks, clears the state of NO_KITE_DATA stocks found
-  again, and writes `check/no_kite_data.csv` and `update/retoken_<date>.csv`. Phase 1's plan folder is not touched.
+  again, and writes `check/no_kite_data.csv` and `update/retoken_<date>.csv`. Phase 1's plan folder is not touched,
+  except for PROBE_RECOVERED stocks (below).
   DONE stocks are never candidates; a DONE stock whose token changes still goes to `archive/` (download / update).
 - **NO_KITE_DATA** (`stocks.status`, `reason` "not in Kite's NSE list of <date>", `reason_at`): `download` skips it
   (also with `--symbols`; the work list says so), `estimate` counts it apart, `status` shows it on its own line, and
@@ -115,6 +116,27 @@ invalid token`).
   reason. `retoken --apply` also clears a stock found again (SAME_TOKEN / NEW_TOKEN / SERIES_SWITCH).
 - **status** lists unresolved failures with their error text (a FAILED chunk, or a stock's newest `errors` row newer
   than its `built_at`; NO_KITE_DATA stocks left out), at most 30 lines.
+
+### `retoken`: stocks the probe found empty, PROBE_RECOVERED (2026-10-22)
+S001680 (INFIBEAM -> CCAVENUE) got 0 day candles in the probe (plan.csv `download_minute = N`, blank
+`eod_first_day`, gap row `BOTH / NO_KITE_DATA` "the token returned no day candles"); days later Kite returned day and
+minute candles for the same token (after a 1:10 consolidation). `read_plan` keeps only `download_minute = Y`, so
+neither `retoken` nor `update` looked at it again.
+- **Candidates** (`probe_empty`): ACTIVE plan rows with a token, `match_status` MATCHED / MATCHED_UNCHECKED,
+  `download_minute = N`, blank `eod_first_day`, and a DONE probe row with that token and no day candles. NO_TOKEN
+  listings (no token) and not probed / FAILED probes are not candidates.
+- Matched in the same instrument list; today's token must be the plan's (else REVIEW: run `tokens`, then `probe`).
+  Then probed again with phase 1's `Prober` (same day-candle chunks, first minute day) and its 2% price check on the
+  latest **finished** bhavcopy day before today (today's Kite day candle is not final). Results: `PROBE_RECOVERED`,
+  `NO_KITE_DATA` (still empty; nothing written, not marked in the progress db) or `REVIEW` (price off / no candle that
+  day / the request failed; never applied). The dry run writes the new probe only to a temp folder.
+- **`--apply`** (`apply_recovered`, PROBE_RECOVERED only): backs up plan.csv, kite_vs_bhav.parquet,
+  kite_adjustment.csv, eod_mismatch.csv, probe_progress.sqlite and kite_day/<sid>.parquet to
+  `archive/plan_retoken_<time>/`; runs phase 1's `build_outputs` in a temp folder (copies of the tokens, probe db plus
+  the new probe row, kite_day files; inputs read from the real folder); splices only the recovered stocks' rows into
+  those files (every other row unchanged); writes each to `<file>.tmp`, then replaces them all. Any error: every file
+  is restored from the backup and `ApplyFailed` is raised (exit 1). kite_gaps.csv / build_info.json are not written:
+  the next `gaps` drops the NO_KITE_DATA gap row. `download` then picks the stock up.
 
 ## Memory
 The first real `--priority 1` run (2026-10-19) was killed by Windows for low memory (5.9 GB machine) after 63
@@ -249,6 +271,11 @@ written, CLI exit codes), `--apply` then `download` with the new tokens (stored 
 db, `no_kite_data.csv`, `status`, skipped by `download`, `update` refusing only for other stocks, running with it,
 bringing it back (price ok) or keeping it (price off / no candle), `retoken --apply` clearing it, `gaps` rows; zero bars
 in the day checks, `load_minute` clean / not clean, `clean_bars` counts.
+`tests/test_equity_minute_probe_empty.py` (phase 1 with GEN1's token answering no day candles, GEN3 NO_TOKEN):
+PROBE_RECOVERED (price check on the day before the last bhavcopy day; dry run writes nothing; apply: only GEN1's
+plan rows change, kite_gaps.csv etc. untouched, backup, then `download` and `gaps`), still empty -> NO_KITE_DATA,
+price off -> REVIEW (not applied), GEN3 not a candidate, the build never writes the plan folder before the replace,
+an error on the third replace restores every file.
 `tests/test_equity_minute_memory.py`: worlds of 10 and 40 plain stocks over two years (`PlainKite`), the
 tracemalloc peak of a two-worker download plus check rebuild must not grow with the stocks (40 ≤ 10 x 1.15 +
 0.5 MB; the old code grew 2.97 -> 7.43 MB and fails it, the new one 2.76 -> 3.05 MB); the cache rows equal
