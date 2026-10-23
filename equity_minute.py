@@ -12,13 +12,16 @@ Downloads no candles to keep.
 Phase 2 (backfill/equity/minute_download.py), each with --folder:
     python equity_minute.py download [--dry-run] [--priority 1|2|3] [--symbols A,B] [--limit N] [--speed 2.5]
                                      [--workers 2]    the 1-minute history of every plan stock (resumable)
-    python equity_minute.py update [--speed 2.5] [--workers 2]   the evening update, after equity_update.py
+    python equity_minute.py update [--speed 2.5] [--workers 2]   the daily update, after equity_update.py: stores
+                                                  up to the target day (finished from 01:00 IST the next day)
     python equity_minute.py status                progress, offline
     python equity_minute.py checks [--apply]      the check labels of the built stocks with the current rules,
                                                   offline (dry run unless --apply)
     python equity_minute.py retoken [--apply]     match the stocks not DONE again in Kite's list (one request, a
                                                   price check per new token): dry run unless --apply, which writes
                                                   update/tokens.csv and marks NO_KITE_DATA stocks
+    python equity_minute.py repair [--apply] [--limit N] [--speed 2.5]   day candles stored before they were final,
+                                                  fetched again (Kite requests even in the dry run; --apply writes)
 --workers is 1 to 4 (default 2); all workers share one --speed limit.
 
 Every command takes --folder (absolute; default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data) and --include-etf.
@@ -38,6 +41,7 @@ from backfill.equity import exits as ex
 from backfill.equity import index_membership as im
 from backfill.equity import minute_download as md
 from backfill.equity import minute_plan as mp
+from backfill.equity import minute_repair as mr
 from backfill.equity import security_master as sm
 from config import equity_data_dir
 
@@ -67,7 +71,8 @@ def run_result(stats, cmd):
     """Exit code of a download / update run: 0 done or stopped by the user, 1 some chunks failed."""
     print(f"{cmd}: {stats['stocks']:,} stocks, {stats['built']:,} built, {stats['chunks']:,} chunks, "
           f"{stats['rows']:,} rows, {stats['requests']:,} requests, {stats['n429']:,} x 429, "
-          f"{stats['failed_chunks']:,} failed, peak memory {stats.get('peak_mb', 0) / 1e3:.2f} GB")
+          f"{stats['failed_chunks']:,} failed, {stats.get('deferred_days', 0):,} deferred days, "
+          f"peak memory {stats.get('peak_mb', 0) / 1e3:.2f} GB")
     if stats["stopped"]:
         print("Stopped, resume with the same command.", file=sys.stderr)
         return 0
@@ -148,6 +153,11 @@ def main(argv=None):
     rt.add_argument("--apply", action="store_true", help="write the checked tokens and NO_KITE_DATA states")
     rt.add_argument("--speed", type=speed, default=md.SPEED, help="requests per second (default 2.5, at most 3)")
     rt.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
+    rp = sub.add_parser("repair", help="phase 2: fetch again the day candles stored before they were final (dry run)")
+    rp.add_argument("--apply", action="store_true", help="write the repaired days.parquet files (backup first)")
+    rp.add_argument("--limit", type=positive, help="at most this many stocks (a small trial)")
+    rp.add_argument("--speed", type=speed, default=md.SPEED, help="requests per second (default 2.5, at most 3)")
+    rp.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
     for sp in (dl, up, st):
         sp.add_argument("--speed", type=speed, default=md.SPEED, help="requests per second (default 2.5, at most 3)")
         sp.add_argument("--workers", type=int, choices=range(1, md.MAX_WORKERS + 1), default=md.WORKERS,
@@ -190,6 +200,8 @@ def main(argv=None):
             return 0
         if args.cmd == "checks":
             return 1 if md.checks(folder, apply=args.apply)["refused"] else 0
+        if args.cmd == "repair":
+            return 1 if mr.repair(folder, apply=args.apply, limit=args.limit, speed=args.speed)["refused"] else 0
         if args.cmd == "retoken":
             return 1 if md.retoken(folder, apply=args.apply, speed=args.speed)["review"] else 0
         return show(args.key, folder)

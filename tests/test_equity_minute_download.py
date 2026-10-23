@@ -54,6 +54,7 @@ SESSION = 70                 # Kite has no day candle for any stock; minutes for
 EXTRA = date(2015, 2, 28)    # a Saturday session Kite has and the bhavcopy store lacks
 NOW = datetime(2015, 4, 25, 10, 0, tzinfo=mp.IST)
 FAST = 1e6
+MORNING_AFTER = datetime.combine(DAYS[N] + timedelta(days=1), dtime(2), tzinfo=mp.IST)   # day N is finished
 FIRST_CHUNK = (date(2015, 2, 2), date(2015, 4, 2))
 
 
@@ -748,7 +749,7 @@ def test_update_refuses_before_history_and_bhavcopy(world, done_copy):
         md.update(world, kite=FakeKite(), speed=FAST, now=datetime.combine(DAYS[N - 1], dtime(20)), log=q)
     kite = FakeKite()
     with pytest.raises(md.NoBhavToday, match="equity_update.py"):
-        md.update(done_copy, kite=kite, speed=FAST, now=datetime.combine(DAYS[N], dtime(20)), log=q)
+        md.update(done_copy, kite=kite, speed=FAST, now=MORNING_AFTER, log=q)
     assert kite.calls == []
     assert cli.main(["update", "--folder", world]) == 1
 
@@ -759,7 +760,7 @@ def test_update_appends_new_day_new_listing_and_tokens(done_copy):
     big_before = days_of(f, "BIG")
     kite = FakeKite(last_day=N, new_tokens={"GEN1": 211})
     logs = []
-    res = md.update(f, kite=kite, speed=FAST, workers=2, now=datetime.combine(DAYS[N], dtime(20), tzinfo=mp.IST),
+    res = md.update(f, kite=kite, speed=FAST, workers=2, now=MORNING_AFTER,
                     log=lambda *a, **k: logs.append(" ".join(map(str, a))))
     st = res["stats"]
     assert kite.calls[0] == ("instruments", "NSE")
@@ -773,14 +774,14 @@ def test_update_appends_new_day_new_listing_and_tokens(done_copy):
     ipo = days_of(f, "NEWIPO")
     assert list(ipo.index) == [DAYS[N]]
     up = os.path.join(mp.out_dir(f), "update")
-    assert os.path.isfile(os.path.join(up, f"kite_instruments_NSE_{DAYS[N]}.csv"))
+    assert os.path.isfile(os.path.join(up, f"kite_instruments_NSE_{MORNING_AFTER.date()}.csv"))
     toks = pd.read_csv(os.path.join(up, "tokens.csv"), dtype=str, keep_default_na=False).set_index("symbol")
     assert toks.loc["GEN1", "instrument_token"] == "211"
     assert os.listdir(os.path.join(mp.out_dir(f), "archive"))[0].startswith(sid(f, "GEN1"))
     _, stocks, _ = md.read_progress(f)
     assert stocks[sid(f, "GEN1")]["token"] == "211" and stocks[sid(f, "NEWIPO")]["status"] == "DONE"
     kite2 = FakeKite(last_day=N, new_tokens={"GEN1": 211})
-    again = md.update(f, kite=kite2, speed=FAST, now=datetime.combine(DAYS[N], dtime(21), tzinfo=mp.IST), log=q)
+    again = md.update(f, kite=kite2, speed=FAST, now=MORNING_AFTER + timedelta(hours=1), log=q)
     assert again["stats"]["up_to_date"] == 14 and again["stats"]["updated"] == 0
     assert [c for c in kite2.calls if c[0] != "instruments"] == []
 

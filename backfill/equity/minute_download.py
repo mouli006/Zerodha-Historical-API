@@ -33,7 +33,7 @@ import tempfile
 import threading
 import time
 from bisect import bisect_left, bisect_right
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -79,7 +79,11 @@ PROGRESS_EVERY = 10
 AUCTION_FROM, AUCTION_TO = "15:00", "15:29"   # CLOSING_AUCTION: the last minute bar in [15:00, 15:29) (F&O stocks end
 #                                               at 15:14 from 2026-08-03; the 2021-02-24 outage ended 11:43)
 CHECKS = ["EXTRA_SESSION", "DAY_EMPTY", "MINUTE_EMPTY", "HIGHLOW_DIFF", "CLOSE_DIFF", "CLOSING_AUCTION", "VOLUME_DIFF",
-          "SCALE_STEP"]
+          "SCALE_STEP", "CANDLE_UNCONFIRMED"]
+FINISHED_AT = dtime(1, 0)        # a day's Kite day candle is final from 01:00 IST the next day (22-23 Oct 2026: fetched
+#                                  on its own day it is provisional, around midnight Kite returned none)
+DEFER_DAYS = 3                   # an unfinished day up to 3 trading days before the target is deferred, older: stored
+LIST_LINES = 20                  # the run summary lists at most 20 deferred / unconfirmed days
 FIELDS = mp.FIELDS
 
 INPUT_COLUMNS = ["date"] + [f"kite_{f}" for f in FIELDS] + \
@@ -137,6 +141,70 @@ class ApplyFailed(mp.MinutePlanError):
 
 def now_ist():
     return datetime.now(mp.IST)
+
+
+def as_ist(now=None):
+    """now (default: the clock) in IST; a naive datetime is taken as IST."""
+    now = now or now_ist()
+    return now.replace(tzinfo=mp.IST) if now.tzinfo is None else now.astimezone(mp.IST)
+
+
+def finished_at(d):
+    """When the day d counts as finished: (d + 1) 01:00 IST."""
+    return datetime.combine(d + timedelta(days=1), FINISHED_AT, tzinfo=mp.IST)
+
+
+def bhav_holidays(folder):
+    """The weekdays cm_bhav.py found to be NSE holidays (a real 404; NSE_CM_bhav/days.csv), or an empty set."""
+    path = os.path.join(mp.store_dir(folder), "days.csv")
+    try:
+        df = pd.read_csv(path, dtype=str, keep_default_na=False)
+    except (OSError, ValueError):
+        return set()
+    if "date" not in df or "status" not in df:
+        return set()
+    return {sm.as_date(d) for d, s in zip(df["date"], df["status"]) if s == "holiday"}
+
+
+def target_day(days, now=None, holidays=()):
+    """(T, why, in_store): the latest trading day T with now >= (T + 1) 01:00 IST. Trading days are the bhavcopy
+    dates (days); after the newest of them a weekday counts too unless cm_bhav found it a holiday (its bhavcopy is not
+    in the store yet: in_store False). A weekend session counts only once its bhavcopy is in the store."""
+    if not days:
+        raise mp.NotBuilt("No bhavcopy days: run python equity_update.py first.")
+    now = as_ist(now)
+    limit = (now - timedelta(hours=1)).date() - timedelta(days=1)
+    newest = days[-1]
+    when = f"now {now:%Y-%m-%d %H:%M} IST; a day is finished from 01:00 IST the next day"
+    d = limit
+    while d > newest:
+        if d.weekday() < 5 and d not in holidays:
+            return d, (f"latest trading day finished, {when}; no bhavcopy for it yet (newest {newest}): update would "
+                       "refuse, run python equity_update.py first"), False
+        d -= timedelta(days=1)
+    i = bisect_right(days, d)
+    if not i:
+        raise mp.NotBuilt(f"No bhavcopy day on or before {d}.")
+    return days[i - 1], f"latest trading day finished, {when}; bhavcopy in the store", True
+
+
+def unfinished(inputs, bhav):
+    """{date: reason} of the days (INPUT_COLUMNS rows) whose Kite day candle does not look final: minutes and a
+    bhavcopy row but no day candle, or a candle volume equal to the summed minute volume while not equal to the
+    bhavcopy volume (Kite's provisional candle of the same day). Days without a bhavcopy row are never unfinished."""
+    bv = {} if bhav is None else dict(zip(bhav["date"], bhav["volume"]))
+    out = {}
+    for d, rows, kc, kv, mv in zip(inputs["date"], inputs["minute_rows"], inputs["kite_close"], inputs["kite_volume"],
+                                   inputs["minute_volume"]):
+        b = bv.get(d)
+        if b is None or pd.isna(b):
+            continue
+        if pd.isna(kc):
+            if rows > 0:
+                out[d] = "no day candle"
+        elif rows > 0 and kv == mv and kv != b:
+            out[d] = f"candle volume {kv:,.0f} = summed minute volume, bhavcopy {b:,.0f}"
+    return out
 
 
 def stamp():
@@ -506,12 +574,12 @@ def file_key(path):
     return [st.st_size, st.st_mtime_ns]
 
 
-def bhav_cache(folder, inp, log=quiet, write=True):
+def bhav_cache(folder, inp, log=quiet, write=True, out=None):
     """bhav_cache/<year>.parquet: the bhavcopy rows of the universe by security_id (bhav_year), rebuilt for the year
     files that changed since (size, mtime), all of them when the master or the universe changed. The caller holds
     equity_1min/.lock. Returns the cache's year file paths. write=False (a dry run): writes nothing and raises
-    CacheStale when a year would be rebuilt."""
-    out = cache_dir(folder)
+    CacheStale when a year would be rebuilt. out: another cache folder (repair's dry run: a temporary one)."""
+    out = out or cache_dir(folder)
     if write:
         os.makedirs(out, exist_ok=True)
     info_path = os.path.join(out, "cache_info.json")
@@ -554,12 +622,14 @@ def read_cached_bhav(paths, sid):
     return pd.concat(frames, ignore_index=True).drop(columns="security_id")
 
 
-def work_list(folder, inp, priority=None, symbols=None):
-    """Every stock to download, in order: priority 1, 2, 3, then median turnover (largest first)."""
+def work_list(folder, inp, priority=None, symbols=None, target=None):
+    """Every stock to download, in order: priority 1, 2, 3, then median turnover (largest first). Each range ends at
+    the latest bhavcopy day, or at the target day (target_day) when that is earlier: an unfinished day is never
+    fetched."""
     rows = read_plan(folder)
     prio = priorities(inp.membership)
     turnover = turnover_medians(folder, inp)
-    last = inp.days[-1]
+    last = min(inp.days[-1], target) if target else inp.days[-1]
     want = None
     if symbols:
         want = set()
@@ -803,10 +873,10 @@ class Calc:
     """What every stock's days need: the bhavcopy rows (read per stock from bhav_cache), factors and corporate
     actions (from minute_plan.Inputs). Building it refreshes the cache: the caller holds equity_1min/.lock."""
 
-    def __init__(self, folder, inp, log=quiet, write=True):
+    def __init__(self, folder, inp, log=quiet, write=True, cache_out=None):
         self.inp = inp
         self.days = inp.days
-        self.cache = bhav_cache(folder, inp, log, write)
+        self.cache = bhav_cache(folder, inp, log, write, cache_out)
         self.actions = corporate_actions(folder, inp)
 
     def bhav_of(self, sid):
@@ -822,10 +892,15 @@ class Calc:
         near = [a for a in acts if lo <= a <= hi]
         return iso(near[0]) if near else ""
 
-    def derive(self, sid, inputs):
-        """The days.parquet frame of one stock from its INPUT_COLUMNS frame (every date of the stock)."""
+    def age(self, d, end):
+        """Trading days from d to end (end itself 0)."""
+        return bisect_right(self.days, end) - bisect_right(self.days, d)
+
+    def derive(self, sid, inputs, bhav=False):
+        """The days.parquet frame of one stock from its INPUT_COLUMNS frame (every date of the stock). bhav: the
+        stock's bhav_of rows when the caller has read them already."""
         d = inputs.sort_values("date", kind="stable").reset_index(drop=True)
-        b = self.bhav_of(sid)
+        b = self.bhav_of(sid) if bhav is False else bhav
         b = (b[["date", "symbol", "series"] + FIELDS].rename(columns={f: f"bhav_{f}" for f in FIELDS})
              if b is not None else pd.DataFrame(columns=["date", "symbol", "series"] + [f"bhav_{f}" for f in FIELDS]))
         d = d.merge(b, on="date", how="left")
@@ -906,9 +981,12 @@ class Calc:
             vol = both & ((vs > kv * VOLUME_HIGH + 1) | (vs < kv * VOLUME_LOW))
         last_bar = d["last_bar"].fillna("").astype(str).to_numpy(object)
         auction = cl & (last_bar >= AUCTION_FROM) & (last_bar < AUCTION_TO)    # the close came from the auction
+        bv = d["bhav_volume"].to_numpy(float)
+        unconfirmed = has_min & has_day & has_bhav & (kv == mv) & (kv != bv)   # unfinished(): stored after the cap
         flags = {"EXTRA_SESSION": ~has_bhav, "DAY_EMPTY": has_min & has_bhav & ~has_day,
                  "MINUTE_EMPTY": has_day & has_bhav & ~has_min, "HIGHLOW_DIFF": hl, "CLOSE_DIFF": cl & ~auction,
-                 "CLOSING_AUCTION": auction, "VOLUME_DIFF": vol, "SCALE_STEP": np.zeros(n, bool)}
+                 "CLOSING_AUCTION": auction, "VOLUME_DIFF": vol, "SCALE_STEP": np.zeros(n, bool),
+                 "CANDLE_UNCONFIRMED": unconfirmed}
         notes = [[] for _ in range(n)]
         vscale = d["minute_volume_scale"].to_numpy(float)
         for i in range(1, n):
@@ -959,7 +1037,9 @@ class Runner:
         self.lock = threading.Lock()
         self.stats = {"stocks": 0, "built": 0, "updated": 0, "up_to_date": 0, "failed_stocks": 0, "chunks": 0,
                       "failed_chunks": 0, "rows": 0, "new_days": 0, "problem_days": 0, "stopped": False,
-                      "auth": None, "started": time.monotonic(), "done": 0}
+                      "auth": None, "started": time.monotonic(), "done": 0, "deferred_days": 0, "deferred_stocks": 0,
+                      "unconfirmed_days": 0}
+        self.deferred, self.unconfirmed = [], []     # (symbol, date, reason[, days held back])
         self.priority = None
 
     def add(self, **kw):
@@ -976,6 +1056,29 @@ class Runner:
             candles += self.fetch(token, s, e, "day")
         return mp.day_frame(candles)
 
+    def hold_back(self, item, inputs, bhav, end, window=False):
+        """The first deferred date of a stock's new days (INPUT_COLUMNS rows), or None. An unfinished day (unfinished())
+        at most DEFER_DAYS trading days before end is deferred with every day after it: nothing of them is stored and
+        the next update fetches them again. An older one is stored anyway (CANDLE_UNCONFIRMED, or DAY_EMPTY without a
+        candle) and counted as unconfirmed, so no stock is deferred forever. window: only the days at most
+        DEFER_DAYS before end are looked at (a full history: the older days are finished)."""
+        if window:
+            inputs = inputs[[self.calc.age(d, end) <= DEFER_DAYS for d in inputs["date"]]]
+        bad = unfinished(inputs, bhav)
+        cut = next((d for d in sorted(bad) if self.calc.age(d, end) <= DEFER_DAYS), None)
+        with self.lock:
+            for d in sorted(bad):
+                if cut is not None and d >= cut:
+                    break
+                self.unconfirmed.append((item["symbol"], d, bad[d]))
+                self.stats["unconfirmed_days"] += 1
+            if cut is not None:
+                held = int((inputs["date"] >= cut).sum())
+                self.stats["deferred_days"] += held
+                self.stats["deferred_stocks"] += 1
+                self.deferred.append((item["symbol"], cut, bad[cut], held))
+        return cut
+
     # history of one stock
     def history(self, item):
         sid, token = item["security_id"], item["token"]
@@ -984,6 +1087,8 @@ class Runner:
             archive(self.folder, sid, f"token {st['token']} -> {token}")
             self.db.reset_stock(sid)
             shutil.rmtree(staging_dir(self.folder, sid), ignore_errors=True)
+        if not item["chunks"]:                      # listed after the target day: the next run fetches it
+            return "NOT_YET"
         stage = staging_dir(self.folder, sid)
         os.makedirs(stage, exist_ok=True)
         have = self.db.chunks(sid)
@@ -1023,13 +1128,16 @@ class Runner:
         if failed:
             self.add(failed_stocks=1)
             return "FAILED"
-        self.build(item)
+        if not self.build(item):
+            return "DEFERRED"
         self.add(built=1)
         return "BUILT"
 
     def build(self, item):
         """All chunks done: write data/<sid>/ (into a temporary folder, then renamed) and mark the stock DONE. The
-        staged chunks are read one at a time; at most one year of the stock is held, for its year file."""
+        staged chunks are read one at a time; at most one year of the stock is held, for its year file. Deferred days
+        at the end (hold_back) are left out of both files; when nothing is left, nothing is built (False) and the
+        staging stays."""
         sid = item["security_id"]
         stage = staging_dir(self.folder, sid)
         have = self.db.chunks(sid)
@@ -1073,7 +1181,16 @@ class Runner:
                     return run, fetched
             return spans[-1][2], spans[-1][3]
 
-        days = self.calc.derive(sid, inputs_from(aggs, runs_of_day, frames))
+        inputs = inputs_from(aggs, runs_of_day, frames)
+        bhav = self.calc.bhav_of(sid)
+        cut = self.hold_back(item, inputs, bhav, item["last"], window=True)
+        if cut is not None:
+            inputs = inputs[inputs["date"] < cut].reset_index(drop=True)
+            if inputs.empty:
+                shutil.rmtree(tmp, ignore_errors=True)
+                return False
+            n -= cut_minutes(tmp, cut)
+        days = self.calc.derive(sid, inputs, bhav=bhav)
         ms.write_days(days, os.path.join(tmp, ms.DAYS_FILE))
         if os.path.isdir(final):
             archive(self.folder, sid, "rebuilt")
@@ -1082,6 +1199,7 @@ class Runner:
         shutil.rmtree(stage, ignore_errors=True)
         del days, frames, aggs
         gc.collect()
+        return True
 
     def save_stock(self, item, days, rows):
         path = ms.stock_dir(self.folder, item["security_id"])
@@ -1092,17 +1210,19 @@ class Runner:
                            days=len(days), minute_rows=int(rows), bytes=size, built_at=stamp())
 
     # daily update of one DONE stock
-    def append(self, item, st, today):
+    def append(self, item, st, target):
+        """The days after the stock's last stored day up to the target day (target_day, fixed for the run); deferred
+        days (hold_back) are not stored, so last_day stays before them."""
         sid, token = item["security_id"], item["token"]
         last = sm.as_date(st["last_day"])
         a = last + timedelta(days=1)
-        if a > today:
+        if a > target:
             self.add(up_to_date=1)
             return "UP_TO_DATE"
         try:
-            dayf = self.fetch_days(token, a, today)
+            dayf = self.fetch_days(token, a, target)
             candles = []
-            for s, e in make_chunks(a, today, "minute"):
+            for s, e in make_chunks(a, target, "minute"):
                 if STOP.is_set():
                     raise StopJob()
                 candles += self.fetch(token, s, e, "minute")
@@ -1120,7 +1240,15 @@ class Runner:
         if inputs_new.empty:
             self.add(up_to_date=1)
             return "NO_NEW_DAYS"
-        derived = self.calc.derive(sid, pd.concat([stored[INPUT_COLUMNS], inputs_new], ignore_index=True))
+        bhav = self.calc.bhav_of(sid)
+        cut = self.hold_back(item, inputs_new, bhav, target)
+        if cut is not None:
+            inputs_new = inputs_new[inputs_new["date"] < cut]
+            if len(new):
+                new = new[new["ts"].dt.date < cut].reset_index(drop=True)
+            if inputs_new.empty:
+                return "DEFERRED"
+        derived = self.calc.derive(sid, pd.concat([stored[INPUT_COLUMNS], inputs_new], ignore_index=True), bhav=bhav)
         added = derived[derived["date"] > last]
         days = pd.concat([stored, added], ignore_index=True)[DAY_COLUMNS]
         if len(new):
@@ -1216,7 +1344,44 @@ class Runner:
         self.db.end_run(self.run_id, self.limiter.requests, self.limiter.n429, result, s["peak_mb"])
         self.db.close()
         s["requests"], s["n429"] = self.limiter.requests, self.limiter.n429
+        s["deferred"], s["unconfirmed"] = sorted(self.deferred), sorted(self.unconfirmed)
         return s
+
+
+def cut_minutes(path, cut):
+    """Drop the bars from the date cut on from a stock folder's year files (a build's temporary folder); returns how
+    many were dropped."""
+    dropped = 0
+    for y, p in sorted(ms.year_paths(path).items()):
+        if y < cut.year:
+            continue
+        df = pq.read_table(p).to_pandas()
+        keep = (pd.to_datetime(df["ts"]).dt.tz_convert(ms.TZ).dt.date < cut).to_numpy()
+        dropped += int((~keep).sum())
+        if keep.all():
+            continue
+        if keep.any():
+            ms.write_minutes(df[keep], p)
+        else:
+            os.remove(p)
+    return dropped
+
+
+def held_text(stats):
+    """The summary lines of the deferred and the stored-unconfirmed days (at most LIST_LINES each)."""
+    lines = []
+    for key, what in (("deferred", "Deferred (not stored, the next update tries again)"),
+                      ("unconfirmed", f"Stored unconfirmed (more than {DEFER_DAYS} trading days old)")):
+        rows = stats.get(key) or []
+        if not rows:
+            continue
+        lines.append(f"{what}: {len(rows):,}")
+        for r in rows[:LIST_LINES]:
+            more = f", {r[3]} day(s) held back" if len(r) > 3 else ""
+            lines.append(f"  {r[0]} {iso(r[1])}: {r[2]}{more}")
+        if len(rows) > LIST_LINES:
+            lines.append(f"  ... {len(rows) - LIST_LINES:,} more")
+    return lines
 
 
 def archive(folder, sid, why):
@@ -1383,13 +1548,15 @@ def mark_aborted(folder, log=print):
 
 
 def download(folder=None, kite=None, priority=None, symbols=None, limit=None, speed=SPEED, workers=WORKERS,
-             dry_run=False, log=print):
-    """The history download of the work list (Parts 1-3). dry_run: figures only, nothing written or fetched."""
+             dry_run=False, now=None, log=print):
+    """The history download of the work list (Parts 1-3). dry_run: figures only, nothing written or fetched. Ranges
+    end at the target day at the latest (target_day): an unfinished day is never stored."""
     folder = folder or config.equity_data_dir()
     check_workers(workers)
     inp, lock = _prepare(folder, "download", log, dry_run)
     try:
-        items = work_list(folder, inp, priority, symbols)
+        target = target_day(inp.days, now, bhav_holidays(folder))[0]
+        items = work_list(folder, inp, priority, symbols, target)
         chunks, stocks, _ = read_progress(folder)
         by_sid = {}
         for c in chunks:
@@ -1435,16 +1602,20 @@ def download(folder=None, kite=None, priority=None, symbols=None, limit=None, sp
 
 
 def update(folder=None, kite=None, speed=SPEED, workers=WORKERS, now=None, log=print):
-    """The evening update (Part 5): new tokens / listings, then each DONE stock from its next day to today."""
+    """The daily update (Part 5): new tokens / listings, then each DONE stock from its next day to the target day T
+    (target_day: the latest trading day finished by 01:00 IST the next day), fixed once at the start; unfinished days
+    are deferred (Runner.hold_back). docs/dev/equity_minute_finished_days.md."""
     folder = folder or config.equity_data_dir()
     check_workers(workers)
     inp, lock = _prepare(folder, "update", log)
     try:
-        today = (now or now_ist()).date()
-        if inp.days[-1] < today:
-            raise NoBhavToday(f"Today's bhavcopy ({today}) is not in the store yet (newest {inp.days[-1]}). "
-                              "Run python equity_update.py first.")
-        items = work_list(folder, inp)
+        now = as_ist(now)
+        today = now.date()
+        target, why, in_store = target_day(inp.days, now, bhav_holidays(folder))
+        if not in_store:
+            raise NoBhavToday(f"No bhavcopy for the target day {target} {target:%a} in the store yet (newest "
+                              f"{inp.days[-1]}). Run python equity_update.py first.")
+        items = work_list(folder, inp, target=target)
         _, stocks, _ = read_progress(folder)
         missing = [i for i in items if not i["new"]
                    and (stocks.get(i["security_id"]) or {}).get("status") not in ("DONE", NO_KITE)]
@@ -1479,8 +1650,9 @@ def update(folder=None, kite=None, speed=SPEED, workers=WORKERS, now=None, log=p
         back = back_in_list(folder, inp, kite, toks, stocks, speed, log)
         if back:
             _, stocks, _ = read_progress(folder)
-        items = work_list(folder, inp)
-        last_before = min((sm.as_date(s["last_day"]) for s in stocks.values() if s["status"] == "DONE"), default=today)
+        items = work_list(folder, inp, target=target)
+        last_before = min((sm.as_date(s["last_day"]) for s in stocks.values() if s["status"] == "DONE"),
+                          default=target)
         full, daily = [], []
         for i in items:
             st = stocks.get(i["security_id"])
@@ -1491,13 +1663,14 @@ def update(folder=None, kite=None, speed=SPEED, workers=WORKERS, now=None, log=p
             else:
                 full.append(i)
         r = Runner(folder, inp, kite, speed, workers, "update", log)
-        log(f"Update to {today}: {len(daily):,} stocks, {len(full):,} full downloads "
+        log(f"Update to {target} {target:%a} (target day: {why})")
+        log(f"Update to {target}: {len(daily):,} stocks, {len(full):,} full downloads "
             f"({len(fresh):,} new listings, {sum(1 for i in full if not i['new']):,} token changes)")
 
         def task(item):
             st = stocks.get(item["security_id"])
             if st and st["status"] == "DONE" and st["token"] == str(item["token"]):
-                return r.append(item, st, today)
+                return r.append(item, st, target)
             return r.history(item)
 
         try:
@@ -1507,13 +1680,18 @@ def update(folder=None, kite=None, speed=SPEED, workers=WORKERS, now=None, log=p
             rebuild_checks(folder, {i["security_id"]: i["priority"] for i in items})
         if stats["auth"]:
             raise mp.SignInNeeded("sign in (python app.py) and run the same command again; finished days are kept.")
-        gone = ex.exits_between(last_before, today, folder=folder)
+        gone = ex.exits_between(last_before, target, folder=folder)
         exits = [f"{x.last_symbol} ({x.security_id}, last day {x.last_date})" for x in gone.itertuples()
                  if x.security_id in known]
-        stats.update(new_listings=[f["symbol"] for f in fresh], exits=exits, today=iso(today))
-        log(f"Updated {stats['updated']:,} stocks ({stats['new_days']:,} new days, {stats['problem_days']:,} with a "
-            f"problem check), {stats['up_to_date']:,} already up to date, {stats['built']:,} full histories built, "
+        stats.update(new_listings=[f["symbol"] for f in fresh], exits=exits, today=iso(today), target=iso(target),
+                     target_why=why)
+        log(f"Target day {target}: updated {stats['updated']:,} stocks ({stats['new_days']:,} new days, "
+            f"{stats['problem_days']:,} with a problem check), {stats['deferred_days']:,} deferred days "
+            f"({stats['deferred_stocks']:,} stocks), {stats['unconfirmed_days']:,} stored unconfirmed, "
+            f"{stats['up_to_date']:,} already up to date, {stats['built']:,} full histories built, "
             f"{stats['failed_stocks']:,} failed.")
+        for line in held_text(stats):
+            log(line)
         if fresh:
             log("New listings: " + ", ".join(stats["new_listings"]))
         if exits:
@@ -1914,9 +2092,9 @@ def failures(chunks, stocks, errors, names):
     return sorted(out)
 
 
-def status(folder=None, speed=SPEED, workers=WORKERS, log=print):
+def status(folder=None, speed=SPEED, workers=WORKERS, now=None, log=print):
     """Offline: per priority DONE / partly / not started, chunks, FAILED chunks, rows, disk, ETA, 429s, unresolved
-    failures with their error text, NO_KITE_DATA stocks, last run."""
+    failures with their error text, NO_KITE_DATA stocks, last run, and the target day update would use now."""
     folder = folder or config.equity_data_dir()
     rows = read_plan(folder)
     try:
@@ -1944,6 +2122,10 @@ def status(folder=None, speed=SPEED, workers=WORKERS, log=print):
              f"Rows: {done_rows:,} in built stocks, {staged:,} staged",
              f"Disk used: {disk_used(folder) / 1e9:.2f} GB",
              f"429 answers: {n429:,} in {len(runs):,} run(s)"]
+    target = None
+    if days:
+        target, why, _ = target_day(days, now, bhav_holidays(folder))
+        lines.append(f"Target day for update now: {target} {target:%a} ({why})")
     try:
         names = dict(zip(*[mp.read_tokens(folder)[c] for c in ("security_id", "symbol")]))
     except mp.NotBuilt:
@@ -1977,7 +2159,7 @@ def status(folder=None, speed=SPEED, workers=WORKERS, log=print):
     log(text, end="")
     return {"estimate": est, "failed_chunks": failed, "rows": done_rows, "staged_rows": staged, "n429": n429,
             "runs": runs, "aborted": len(aborted), "failures": fails, "no_kite_data": [n for n, _ in nk],
-            "report": text}
+            "target": target, "report": text}
 
 
 def same_column(a, b):

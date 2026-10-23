@@ -40,6 +40,7 @@ A local Flask app ("Kite Backfill", one machine) that:
 - `index_membership.py`: fetch (network) / build / members / show / check NIFTY index membership and AMFI categories, point in time. See docs/dev/index_membership.md.
 - `equity_minute.py`: Kite 1-minute / EOD plan: tokens / probe (Kite network) / gaps / show -> the vendor gap list. See docs/dev/equity_minute_plan.md.
 - `equity_minute.py download / update / status / checks`: phase 2, the Kite 1-minute history (2 workers, resumable) and evening update; `load_minute` loader. See docs/dev/equity_minute_download.md.
+- `equity_minute.py update` stores only finished days (target day T = finished by 01:00 IST next day; unfinished days deferred, capped); `repair [--apply]` re-fetches day candles stored before that. See docs/dev/equity_minute_finished_days.md.
 - `equity_minute.py retoken [--apply]`: re-match failed stocks (price-checked tokens, NO_KITE_DATA), re-probe probe-empty stocks (PROBE_RECOVERED); `load_minute(clean=True)` drops zero bars. See docs/dev/equity_minute_download.md.
 - Never run a CLI against real Kite or Dhan unless the user asks.
 
@@ -106,3 +107,4 @@ Web
 | index membership and AMFI categories (sources, notice parsing, walk, checks, loaders, limits) | docs/dev/index_membership.md |
 | Kite 1-minute / EOD plan (Part 0 findings, tokens, probe, adjustment periods, gap list) | docs/dev/equity_minute_plan.md |
 | Kite 1-minute download (Part 0 findings, scales, checks, workers, update, loader) | docs/dev/equity_minute_download.md |
+| 1-minute finished days (target day, safety net, deferral cap, `repair`) | docs/dev/equity_minute_finished_days.md |

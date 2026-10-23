@@ -21,8 +21,8 @@ from backfill import fetch
 from backfill.equity import minute_download as md
 from backfill.equity import minute_plan as mp
 from backfill.equity import minute_store as ms
-from test_equity_minute_download import (DAYS, FAST, N, STOCKS, FakeKite, FastStop, build_inputs, dl,  # noqa: F401
-                                         no_network, planned, q, sid, world)
+from test_equity_minute_download import (DAYS, FAST, MORNING_AFTER, N, STOCKS, FakeKite, FastStop,  # noqa: F401
+                                         build_inputs, dl, no_network, planned, q, sid, world)
 
 PAD, ZERO = 33, 34           # BIG: two all-zero bars added on PAD; only all-zero bars on ZERO
 OLD = {"GEN1": 110, "GEN2": 111, "GEN3": 112, "GEN4": 113, "NEWNM": 109}
@@ -292,7 +292,7 @@ def test_update_runs_with_a_no_kite_data_stock(nkcopy):
     build_inputs(f, N)
     kite = FixKite(last_day=N, **AFTER)
     logs = []
-    res = md.update(f, kite=kite, speed=FAST, now=datetime.combine(DAYS[N], dtime(20), tzinfo=mp.IST),
+    res = md.update(f, kite=kite, speed=FAST, now=MORNING_AFTER,
                     log=logger(logs))
     assert res["stats"]["updated"] == 12 and res["stats"]["failed_stocks"] == 0
     assert 112 not in {c[0] for c in kite.calls}
@@ -305,7 +305,7 @@ def test_update_brings_back_a_stock_listed_again(nkcopy):
     build_inputs(f, N)
     kite = FixKite(last_day=N, new_tokens={"GEN1": 210, "GEN2": 211}, be={"GEN2"})       # GEN3 listed again
     logs = []
-    res = md.update(f, kite=kite, speed=FAST, now=datetime.combine(DAYS[N], dtime(20), tzinfo=mp.IST),
+    res = md.update(f, kite=kite, speed=FAST, now=MORNING_AFTER,
                     log=logger(logs))
     assert any(x.startswith("Back in Kite's list: GEN3") and "price OK" in x for x in logs)
     g = stocks_of(f)[sid(f, "GEN3")]
@@ -323,7 +323,7 @@ def test_update_keeps_a_returning_stock_when_the_price_check_fails(nkcopy, extra
     build_inputs(f, N)
     kite = FixKite(last_day=N, new_tokens={"GEN1": 210, "GEN2": 211, "GEN3": 312}, be={"GEN2"}, **extra)
     logs = []
-    res = md.update(f, kite=kite, speed=FAST, now=datetime.combine(DAYS[N], dtime(20), tzinfo=mp.IST),
+    res = md.update(f, kite=kite, speed=FAST, now=MORNING_AFTER,
                     log=logger(logs))
     review = [x for x in logs if x.startswith("REVIEW GEN3")]
     assert len(review) == 1 and why in review[0] and "stays NO_KITE_DATA" in review[0]

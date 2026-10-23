@@ -642,12 +642,20 @@ python equity_minute.py checks                      # the check labels again wit
 python equity_minute.py retoken                     # stocks not done: match again in Kite's list (dry run; --apply)
 ```
 
-Every evening, once the history is complete:
+Every evening (or the next morning), once the history is complete:
 
 ```
 python equity_update.py                             # first: today's bhavcopy and the equity builds
-python equity_minute.py update                      # then: today's minutes for every stock, new listings, new tokens
+python equity_minute.py update                      # then: minutes up to the previous trading day, new listings, new tokens
 ```
+
+- **`update` stores data up to the previous trading day only.** Kite's day candle is final only from 01:00 IST the
+  next day (fetched the same evening it is provisional), so an evening run on Thursday stores up to Wednesday and
+  Thursday comes with the next run; a run after 01:00 on Friday morning stores Thursday. `status` shows the day
+  `update` would store up to now. A day whose candle still does not look final is deferred (listed in the summary)
+  and tried again by the next `update`; after 3 trading days it is stored anyway, labelled `CANDLE_UNCONFIRMED`.
+- Rows stored before this rule: `python equity_minute.py repair` (a dry run that fetches the day candles again and
+  shows what would change, about 25 minutes), then `--apply` (backup in `equity_1min/archive/repair_<time>/`).
 
 - Kite's prices are adjusted by Kite's own rules, so the files keep Kite's candles unchanged plus, per day, the conversion back to the bhavcopy's raw prices. Read them in Python with `from backfill.equity.minute_store import load_minute`: `load_minute("RELIANCE", "2024-01-01", "2024-01-31", prices="raw")`. `prices="ours"` gives our split / bonus adjusted prices (for indicators), `prices="kite"` Kite's own. By default
 (`clean=True`) Kite's all-zero padding bars are left out, a negative volume reads as 0 and high / low always contain

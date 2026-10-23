@@ -154,8 +154,9 @@ reading the 12 year files), `Calc` grouped it again, and a build held all of a s
   float64) and renamed at the end; only per-date counts, steps and MINUTE_EMPTY dates are kept, and the
   `minute_empty_days` runs re-read only the `date` column of the stocks that have any.
 - A stale `plan.csv` still needs the whole bhavcopy (phase 1's gaps step): `ensure_plan` loads a full `Inputs` for
-  it only, frees it, and logs memory before / peak / after (measured: 0.41 GB after freeing, so it stays in
-  process).
+  it only, frees it, and logs memory before / peak / after. Measured on the real data: the rebuild inside `update`
+  after `equity_update.py` has changed the master peaks at **~2.4-2.6 GB of process memory**, and 0.41 GB is held after
+  freeing, so it stays in process (the 1.5 GB of the README is the download / update itself).
 - `memory()`: the working set via `GetProcessMemoryInfo` (ctypes, no psutil), `ru_maxrss` elsewhere. `runs.peak_mb`
   and the CLI's last line give each run's peak.
 
@@ -172,7 +173,8 @@ reading the 12 year files), `Calc` grouped it again, and a build held all of a s
 `OK`, `CLOSE_DIFF` (the day close outside the scaled minute low..high), `CLOSING_AUCTION` (the same, on a day whose
 last minute bar is in 15:00..15:28), `HIGHLOW_DIFF` (the scaled minute high above
 the day high, or the low below the day low; a wider day range is normal), `VOLUME_DIFF` (scaled minute volume >
-day x 1.01 + 1 or < day x 0.5), `MINUTE_EMPTY` (a day candle and a bhavcopy row, no minutes), `DAY_EMPTY` (minutes
+day x 1.01 + 1 or < day x 0.5), `CANDLE_UNCONFIRMED` (Kite's day volume = the summed minute volume, not the bhavcopy's:
+docs/dev/equity_minute_finished_days.md), `MINUTE_EMPTY` (a day candle and a bhavcopy row, no minutes), `DAY_EMPTY` (minutes
 and a bhavcopy row, no day candle), `EXTRA_SESSION` (no bhavcopy row), `SCALE_STEP`. A day can carry several,
 `|`-joined. Files in `check/` are rebuilt from every `days.parquet` at the end of a run:
 - `minute_check.csv`: the problem days;
@@ -208,18 +210,22 @@ prints each stock's first CLOSING_AUCTION date.
   are on the vendor list.
 With no phase 2 files, the output is byte for byte phase 1's.
 
-## Update (`update`, every evening after `python equity_update.py`)
-- Refuses: a plan stock not DONE and not NO_KITE_DATA (`HistoryNotDone`, exit 1); the newest bhavcopy day before today IST (`NoBhavToday`,
-  exit 1); the same locks and F&O check as download.
+## Update (`update`, daily after `python equity_update.py`)
+Stores only finished days, up to the target day T (the latest trading day finished by 01:00 IST the next day), with a
+safety net that defers unfinished days: docs/dev/equity_minute_finished_days.md (also `repair` for the rows stored
+before that rule).
+- Refuses: a plan stock not DONE and not NO_KITE_DATA (`HistoryNotDone`, exit 1); no bhavcopy for T in the store
+  (`NoBhavToday`, exit 1); the same locks and F&O check as download.
 - One `kite.instruments("NSE")` request, matched with `mp.match_tokens`. It writes
   `update/kite_instruments_NSE_<date>.csv` and `update/tokens.csv`. A matched security absent from phase 1's
   `kite_tokens.csv` is a new listing (`update/new_listings.csv`, first minute day = its first bhavcopy day). New
   listings and changed tokens get a full history. NO_KITE_DATA stocks matched again get the price check first (see
   above); the others are skipped.
-- Every other DONE stock: day and minute candles from the day after its last stored day to today. The new days are
+- Every other DONE stock: day and minute candles from the day after its last stored day to T. The new days are
   derived with the stored days as neighbours, and the stored rows are kept as they are. The year file and
   `days.parquet` are rewritten atomically (days last).
-- Report: stocks updated, new days, problem checks, new listings, exits since the last stored day
+- Report: the target day and why, stocks updated, new days, deferred days, problem checks, new listings, exits since
+  the last stored day
   (`ex.exits_between`; exited stocks simply get no more days).
 
 ## Status (`status`, offline)
@@ -248,7 +254,8 @@ clean=True)`:
 
 ## CLI and exit codes
 `download [--dry-run] [--priority N] [--symbols A,B] [--limit N] [--speed 2.5] [--workers 1-4]`, `update`, `status`,
-`checks [--apply]`, `retoken [--apply] [--speed 2.5]`, each with `--folder`. Exit codes: 0 done / stopped by the user /
+`checks [--apply]`, `retoken [--apply] [--speed 2.5]`, `repair [--apply] [--limit N] [--speed 2.5]`
+(docs/dev/equity_minute_finished_days.md), each with `--folder`. Exit codes: 0 done / stopped by the user /
 dry run; 1 FAILED chunks, not built, stale input, history not done, no bhavcopy for today, retoken left a stock to
 REVIEW; 2 arguments, a lock busy, a Kite F&O run, Kite sign-in needed, not enough
 disk.
