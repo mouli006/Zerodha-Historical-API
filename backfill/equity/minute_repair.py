@@ -6,7 +6,8 @@ volume), and around midnight Kite returned none (DAY_EMPTY rows). find_affected(
 days.parquet files and the progress db only; repair() fetches each stock's day candles over its affected dates once,
 replaces only the day inputs (kite_*, fetched_at, run_id) of those dates and derives each repaired row as update stores
 a new day (repaired_rows); only those rows are spliced into the stored file (splice). A stock where the repair would
-change any other row (two fresh derives, without and with the new candles) is listed, never written.
+change a row after a repaired date, or where any row borrows a repaired date's conversion, is listed, never
+written; a difference only on earlier rows (hindsight drift of a whole-history derive) is listed and not written.
 Dry run (default) writes nothing; --apply backs up every changed days.parquet to
 equity_1min/archive/repair_<time>/<security_id>/ and replaces them all at the end (any error restores them). Both
 take equity_1min/.lock and refuse while a Kite F&O run or an input build runs (they make Kite requests)."""
@@ -177,7 +178,8 @@ def repair(folder=None, kite=None, apply=False, limit=None, speed=md.SPEED, now=
         if limit:
             sids = sids[:limit]
         result = {"applied": apply, "counts": counts, "stocks": len(sids), "repaired": [], "skipped": [],
-                  "skipped_dates": [], "refused": [], "preexisting": [], "before": {}, "after": {}, "ratio": {},
+                  "skipped_dates": [], "refused": [], "borrowing": [], "preexisting": [], "drift": [],
+                  "before": {}, "after": {}, "ratio": {}, "drift_before": {}, "drift_after": {}, "drift_ratio": {},
                   "backup": None, "requests": 0}
         if not sids:
             log("Nothing to repair.")
@@ -205,6 +207,7 @@ def repair(folder=None, kite=None, apply=False, limit=None, speed=md.SPEED, now=
                                   "and run the same command again.")
         matched = {m["security_id"]: m for m in mp.match_tokens([inp.by_id[s] for s in sids if s in inp.by_id],
                                                                 instruments)}
+        by_token = {int(i["instrument_token"]): i for i in instruments if i.get("instrument_token")}
         limiter = md.SharedLimiter(speed)
         run_id = f"{now:%Y%m%d-%H%M%S}-{secrets.token_hex(2)}"
         if apply:
@@ -226,6 +229,9 @@ def repair(folder=None, kite=None, apply=False, limit=None, speed=md.SPEED, now=
             elif m is None or m["match_status"] not in mp.MATCHED or not m["instrument_token"]:
                 why = ("not ACTIVE: not matched" if m is None else
                        f"{m['match_status']} in Kite's list ({m['note']}): left to update / retoken")
+                i = by_token.get(int(st["token"])) if st.get("token") else None
+                why += (f"; stored token {st['token']} is now listed as {i['tradingsymbol']} ({i.get('name') or ''}, "
+                        f"{i.get('segment') or ''})" if i else f"; stored token {st.get('token')} not in today's list")
             elif int(m["instrument_token"]) != int(st["token"]):
                 why = f"token {st['token']} -> {m['instrument_token']}: left to update / retoken"
             if why:
@@ -276,19 +282,39 @@ def repair(folder=None, kite=None, apply=False, limit=None, speed=md.SPEED, now=
             if pre:                                            # stored rows a fresh derive no longer gives: kept
                 result["preexisting"].append((symbol, sid, pre))
             cols, when = different(base, after, keep)
-            if cols:
-                result["refused"].append((symbol, sid, f"rows not repaired would change ({', '.join(cols)}) on "
-                                                       f"{', '.join(md.iso(d) for d in when[:5])}"
-                                                       f"{' ...' if len(when) > 5 else ''}"))
+            first, names = min(good), {md.iso(d) for d in good}
+            borrow = [d for d, k, a, b in zip(stored["date"], keep, stored["conversion_from"], after["conversion_from"])
+                      if k and (a in names or b in names)]     # its stored values came from a provisional candle
+            later = [d for d in when if d > first]
+            if borrow or later:
+                shown = when or borrow
+                changed = (f"rows not repaired would change ({', '.join(cols)}) on " if cols else
+                           "rows not repaired borrow from it on ")
+                changed += f"{', '.join(md.iso(d) for d in shown[:5])}{' ...' if len(shown) > 5 else ''}"
+                if borrow:
+                    who = "earlier row" if all(d < first for d in borrow) else "a row"
+                    result["borrowing"].append(sid)
+                    why = f"{who} borrows a repaired date's conversion: {changed}"
+                else:
+                    why = f"a later row would change: {changed}"
+                result["refused"].append((symbol, sid, why))
                 continue
+            drift = bool(when)                                 # earlier rows only: hindsight of a whole-history derive
+            if drift:
+                result["drift"].append((symbol, sid, cols))
             new = splice(stored, repaired_rows(calc, sid, new_in, good, bhav))
             sel = ~keep
             old_r, new_r = stored.loc[sel], new.loc[sel]
             count_labels(result["before"], old_r["check"])
             count_labels(result["after"], new_r["check"])
+            if drift:
+                count_labels(result["drift_before"], old_r["check"])
+                count_labels(result["drift_after"], new_r["check"])
             for (_, a), (_, b) in zip(old_r.iterrows(), new_r.iterrows()):
                 name = bucket(a["ratio"], b["ratio"])
                 result["ratio"][name] = result["ratio"].get(name, 0) + 1
+                if drift:
+                    result["drift_ratio"][name] = result["drift_ratio"].get(name, 0) + 1
                 rows.append({"security_id": sid, "symbol": symbol, "date": md.iso(a["date"]),
                              "kind": affected[sid][a["date"]], "result": "REPAIRED", "note": "",
                              "old_check": a["check"], "new_check": b["check"], "old_ratio": a["ratio"],
@@ -369,8 +395,23 @@ def report(r, apply):
         if len(r["skipped_dates"]) > LIST_LINES:
             lines.append(f"  ... {len(r['skipped_dates']) - LIST_LINES:,} more")
     if r["refused"]:
-        lines.append(f"Not written, the repair would change rows not repaired: {len(r['refused']):,}")
+        k = len(r["borrowing"])
+        lines.append(f"Not written, the repair would change rows not repaired: {len(r['refused']):,} ({k:,} with a row "
+                     f"borrowing a repaired date's conversion, {len(r['refused']) - k:,} with a later row changed)")
         lines += [f"  {s} ({sid}): {why}" for s, sid, why in r["refused"]]
+    if r["drift"]:
+        cols = {}
+        for _, _, cs in r["drift"]:
+            for c in cs:
+                cols[c] = cols.get(c, 0) + 1
+        rows = sum(n for _, sid, n in r["repaired"] if sid in {x[1] for x in r["drift"]})
+        lines.append(f"Fresh-derive drift on earlier rows (not written): {len(r['drift']):,} stocks; columns: " +
+                     ", ".join(f"{c} ({n:,})" for c, n in sorted(cols.items(), key=lambda x: -x[1])))
+        lines.append(f"  their repaired rows: {rows:,}; checks before -> after:")
+        for k in ["OK"] + md.CHECKS:
+            if r["drift_before"].get(k) or r["drift_after"].get(k):
+                lines.append(f"    {k:<18} {r['drift_before'].get(k, 0):>7,} -> {r['drift_after'].get(k, 0):,}")
+        lines.append("  their ratio change: " + ", ".join(f"{n} {r['drift_ratio'].get(n, 0):,}" for n in names))
     if r["preexisting"]:
         cols = {}
         for _, _, cs in r["preexisting"]:

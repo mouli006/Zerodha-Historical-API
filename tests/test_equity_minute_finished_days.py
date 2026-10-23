@@ -372,10 +372,13 @@ def test_repair_dry_run_writes_nothing(broken):
     assert {s for s, _, _ in res["repaired"]} == {"BIG", "MID", "GEN1"} and res["requests"] == 1 + 4
     assert [s for s, _, _ in res["refused"]] == ["PTWO"]
     assert "rows not repaired would change (" in res["refused"][0][2] and str(DAYS[N - 2]) in res["refused"][0][2]
+    assert res["refused"][0][2].startswith("earlier row borrows a repaired date's conversion")      # PTWO's N-2
+    assert res["borrowing"] == [sid(f, "PTWO")] and res["drift"] == []
     assert res["before"]["DAY_EMPTY"] == 1 and res["after"].get("DAY_EMPTY", 0) == 0 and res["after"]["OK"] == 3
     assert res["ratio"]["0.1-0.5%"] == 2 and sum(res["ratio"].values()) == 3
     text = res["report"]
     assert "Repaired (dry run: would repair): 3 rows in 3 stocks" in text and "PTWO" in text
+    assert "(1 with a row borrowing a repaired date's conversion, 0 with a later row changed)" in text
     assert [c for c in kite.calls if c[0] == "instruments"] == [("instruments", "NSE")]
     assert sorted(c[1] for c in kite.calls if c[0] != "instruments") == [DAYS[N - 1]] * 4
 
@@ -523,7 +526,8 @@ def test_repair_refuses_when_a_later_row_depends_on_the_repaired_day(done_copy):
     res = rp(f, FakeKite(), apply=True)
     assert [s for s, _, _ in res["refused"]] == ["MID"]
     why = res["refused"][0][2]
-    assert why.startswith("rows not repaired would change (") and why.endswith(f") on {DAYS[N - 1]}")   # only the later row
+    assert "rows not repaired would change (" in why and why.endswith(f") on {DAYS[N - 1]}")   # only the later row
+    assert why.startswith("a row borrows a repaired date's conversion") and res["borrowing"] == [sid(f, "MID")]
     assert tree(f)[mid] == before[mid] and not os.path.isdir(os.path.join(res["backup"], sid(f, "MID")))
     assert [s for s, _, _ in res["repaired"]] == ["BIG"]
 
@@ -577,3 +581,68 @@ def test_repaired_rows_match_what_update_stores(done_copy):
     got = days_of(f, "BIG")
     cols = [c for c in ref.columns if c not in ("fetched_at", "run_id")]
     pd.testing.assert_frame_equal(got[cols], ref[cols], check_exact=True)
+
+
+def shifting_derive(monkeypatch, f, sym, repaired, rows):
+    """Wrap Calc.derive: when the inputs carry Kite's final candle on DAYS[repaired] for sym, minute_volume_scale and
+    note change on rows (a mask function of the dates): the hindsight drift of levels() on a whole-history derive."""
+    orig = md.Calc.derive
+    target, final = sid(f, sym), kite_day(sym, repaired)["close"]
+
+    def derive(self, s, inputs, bhav=False):
+        out = orig(self, s, inputs, bhav)
+        k = inputs.loc[inputs["date"] == DAYS[repaired], "kite_close"]
+        if s == target and len(k) and k.iloc[0] == final:
+            mask = rows(out["date"])
+            out.loc[mask, "minute_volume_scale"] = 1.5
+            out.loc[mask, "note"] = "shifted by hindsight"
+        return out
+
+    monkeypatch.setattr(md.Calc, "derive", derive)
+
+
+def test_repair_writes_a_stock_with_drift_on_earlier_rows_only(clean, monkeypatch):
+    f = clean                                          # BIG: earlier rows shift, no row borrows N-1
+    shifting_derive(monkeypatch, f, "BIG", N - 1, lambda d: (d >= DAYS[N - 12]) & (d < DAYS[N - 1]))
+    path = ms.stock_dir(f, sid(f, "BIG"))
+    before = ms.read_days(path)
+    res = rp(f, FakeKite(), apply=True)
+    assert "BIG" in [x for x, _, _ in res["repaired"]] and not res["refused"] and res["borrowing"] == []
+    assert [(x, cols) for x, _, cols in res["drift"]] == [("BIG", ["minute_volume_scale", "note"])]
+    text = res["report"]
+    assert "Fresh-derive drift on earlier rows (not written): 1 stocks; columns: minute_volume_scale (1), note (1)" \
+        in text and "  their repaired rows: 1; checks before -> after:" in text and "  their ratio change: " in text
+    after = ms.read_days(path)
+    keep = after["date"] != DAYS[N - 1]
+    pd.testing.assert_frame_equal(after[keep].reset_index(drop=True), before[keep].reset_index(drop=True),
+                                  check_exact=True)                      # earlier rows exactly as stored
+    assert not after["note"].str.contains("hindsight").any()
+    assert after.loc[~keep, "kite_close"].iloc[0] == kite_day("BIG", N - 1)["close"]
+
+
+def test_repair_refuses_a_later_row_change_without_borrowing(done_copy, monkeypatch):
+    f = done_copy                                      # MID repaired on N-2; its N-1 row would change
+    update_run(f)
+    make_rows(f, [("MID", N - 2, "prov", f"{DAYS[N - 2]} 20:00:00")])
+    shifting_derive(monkeypatch, f, "MID", N - 2, lambda d: d == DAYS[N - 1])
+    mid = os.path.join("equity_1min", "data", sid(f, "MID"), ms.DAYS_FILE)
+    before = tree(f)
+    res = rp(f, FakeKite(), apply=True)
+    assert [x for x, _, _ in res["refused"]] == ["MID"] and res["borrowing"] == [] and res["drift"] == []
+    why = res["refused"][0][2]
+    assert why == f"a later row would change: rows not repaired would change (minute_volume_scale, note) on {DAYS[N - 1]}"
+    assert "(0 with a row borrowing a repaired date's conversion, 1 with a later row changed)" in res["report"]
+    assert tree(f)[mid] == before[mid]
+
+
+def test_repair_reports_the_stored_token_of_a_stock_not_matched(clean):
+    f = clean
+
+    class Renamed(FakeKite):
+        def instruments(self, exchange):
+            out = super().instruments(exchange)
+            return [{**i, "tradingsymbol": "BIGNEW"} if i["tradingsymbol"] == "BIG" else i for i in out]
+
+    res = rp(f, Renamed())
+    why = {x: w for x, _, w in res["skipped"]}["BIG"]
+    assert why.startswith("NO_TOKEN in Kite's list") and "stored token 101 is now listed as BIGNEW (BIG LIMITED, NSE)" in why

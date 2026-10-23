@@ -75,7 +75,9 @@ fetches again the day candles stored before this rule (the 1-minute bars are nev
    - DAY_EMPTY: a `DAY_EMPTY` row of an `update` run fetched before (date + 1) 01:00 IST (the midnight window).
      Historical DAY_EMPTY days (fetched years later by `download`) and normal rows are never selected.
 2. **Tokens:** one `kite.instruments("NSE")`, matched with `mp.match_tokens`. A stock whose token changed or that is
-   not matched is skipped and listed (left to `update` / `retoken`); a stock not DONE too.
+   not matched is skipped and listed (left to `update` / `retoken`); a stock not DONE too. For a stock not matched by
+   symbol the reason also says where its stored token is in that list ("now listed as <tradingsymbol> (<name>,
+   <segment>)" or "not in today's list"; no extra request).
 3. **Per stock:** one day request over its affected dates. A date whose new candle is still unfinished (same check as
    the safety net) is skipped and listed; a failed request (COMFINTE) skips the stock with Kite's error text; a sign-in
    error stops (exit 2).
@@ -86,10 +88,19 @@ fetches again the day candles stored before this rule (the 1-minute bars are nev
    (all columns but `fetched_at` / `run_id`).
 5. **Only the repaired rows are written** (`splice`): the stored file with those rows replaced; every other row stays
    exactly as stored. Minute files are never written.
-6. **Guard:** two fresh derives of the whole stock, without (`base`) and with the new candles, are compared on every
-   row not being repaired, later rows as well as older ones (a row stored after the repaired day may have been
-   derived with the provisional day as a neighbour: a borrowed conversion, a scale level). If any would change, the
-   repair itself changes it: the stock is listed with the columns and dates and not written (exit 1).
+6. **Guard:** two fresh derives of the whole stock, without (`base`) and with (`trial`) the new candles, are compared
+   on every row not being repaired, split at the first repaired date:
+   - a row that **borrows a repaired date's conversion** (`conversion_from`, stored or in `trial`), earlier or later:
+     its stored values came from the provisional candle. Refused: "earlier row borrows a repaired date's conversion:
+     ..." (or "a row borrows ..."), counted apart (`borrowing`);
+   - a **later row** (after a repaired date) that would change, e.g. a 23 Oct row stored before the repair and derived
+     with the provisional 22 Oct as a neighbour. Refused: "a later row would change: ...".
+   Refused stocks are listed with the columns and dates and not written (exit 1).
+   - **Drift:** only rows before the first repaired date differ, none borrows. That is hindsight of a whole-history
+     derive (`levels()` re-measured with later days; real data 23 Oct: mostly `minute_volume_scale` / `note`), the
+     same effect as the pre-existing differences. The stock is repaired (only the repaired rows are written, the
+     earlier rows stay as stored) and listed: `Fresh-derive drift on earlier rows (not written): N stocks; columns:
+     ...`, with its own checks before -> after and ratio buckets for comparison with the rest.
    **Pre-existing differences** (`base` != the stored file: an older rule, a newer bhavcopy, ...) never block a stock
    and are not fixed; the report gives one line: `Pre-existing re-derive differences (not fixed; those rows stay as
    stored): N stocks; columns: <column> (<stocks>), ...`.
@@ -120,7 +131,9 @@ holidays both ways, a weekend session, no bhavcopy for T, `days.csv`, status, an
 midnight); the safety net (no candle and provisional deferred then stored, illiquid stored, the build cut, the cap at
 ages 0-3 / 4 with `CANDLE_UNCONFIRMED` kept by `checks` and `checks --apply`, `derive` never adding it,
 `add_check`); repair (selection incl. the 00:00:00 row and both counts, dry run writes nothing, new token / still
-provisional skipped, a borrowed conversion refused for an older and for a later row (nothing written for it), apply
+provisional skipped, a borrowed conversion refused for an older and for a later row (nothing written for it), a
+later row changing without borrowing refused, drift on earlier rows only repaired with those rows exactly as stored
+(a wrapped `derive`), the refusal counts, the stored token of a stock not matched, apply
 writes only the repaired rows (the others exactly as stored) and backs up, a pre-existing difference repaired with
 its rows kept and reported, the repaired rows equal a day-by-day update's, an error on the third replace restores every file, a second run finds nothing,
 `--limit`, refusals by lock / F&O / input build for the dry run and apply, CLI exit codes).
