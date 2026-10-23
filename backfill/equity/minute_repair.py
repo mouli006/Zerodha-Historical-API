@@ -4,8 +4,9 @@ touched). docs/dev/equity_minute_finished_days.md has the rules and the evidence
 A day candle fetched before (date + 1) 01:00 IST is provisional (close = last minute close, volume = summed minute
 volume), and around midnight Kite returned none (DAY_EMPTY rows). find_affected() finds those rows from the stored
 days.parquet files and the progress db only; repair() fetches each stock's day candles over its affected dates once,
-replaces only the day inputs (kite_*, fetched_at, run_id) of those dates and re-derives the stock with the download's
-Calc.derive. Only the repaired dates may change: a stock where any other row would differ is listed, never written.
+replaces only the day inputs (kite_*, fetched_at, run_id) of those dates and derives each repaired row as update stores
+a new day (repaired_rows); only those rows are spliced into the stored file (splice). A stock where the repair would
+change any other row (two fresh derives, without and with the new candles) is listed, never written.
 Dry run (default) writes nothing; --apply backs up every changed days.parquet to
 equity_1min/archive/repair_<time>/<security_id>/ and replaces them all at the end (any error restores them). Both
 take equity_1min/.lock and refuse while a Kite F&O run or an input build runs (they make Kite requests)."""
@@ -100,10 +101,47 @@ def bucket(old, new):
     return next(name for top, name in RATIO_BUCKETS if x <= top)
 
 
-def different(stored, new, keep):
-    """The DAY_COLUMNS (other than date) where the rows `keep` of stored and new differ ([] = the same)."""
-    a, b = stored[keep].reset_index(drop=True), new[keep].reset_index(drop=True)
-    return [c for c in md.DAY_COLUMNS if c != "date" and not md.same_column(a[c], b[c])]
+def different(a, b, keep):
+    """(columns, dates): the DAY_COLUMNS (other than date) where the rows `keep` of a and b differ, and the dates of
+    those rows (NaN equal to NaN, as md.same_column). ([], []) = the same."""
+    a, b = a[keep].reset_index(drop=True), b[keep].reset_index(drop=True)
+    cols, bad = [], np.zeros(len(a), bool)
+    for c in md.DAY_COLUMNS:
+        if c == "date":
+            continue
+        try:
+            x, y = a[c].to_numpy(float), b[c].to_numpy(float)
+            eq = (x == y) | (np.isnan(x) & np.isnan(y))
+        except (TypeError, ValueError):
+            eq = a[c].astype(str).to_numpy() == b[c].astype(str).to_numpy()
+        if not eq.all():
+            cols.append(c)
+            bad |= ~eq
+    return cols, list(a.loc[bad, "date"])
+
+
+def repaired_rows(calc, sid, inputs, dates, bhav):
+    """The new days.parquet rows of the repaired dates, each derived as update stores a new day: from the inputs up
+    to that date only (the stored days as neighbours, nothing later yet), with the new candles in."""
+    rows = []
+    for d in sorted(dates):
+        der = calc.derive(sid, inputs[inputs["date"] <= d], bhav=bhav)
+        rows.append(der[der["date"] == d])
+    return pd.concat(rows, ignore_index=True)
+
+
+def splice(stored, rows):
+    """stored with only the rows of rows' dates replaced (every other row as stored), in the stored dtypes where
+    the values fit."""
+    out = pd.concat([stored[~stored["date"].isin(set(rows["date"]))], rows[stored.columns]], ignore_index=True)
+    out = out.sort_values("date", kind="stable").reset_index(drop=True)
+    for c in out.columns:
+        if out[c].dtype != stored[c].dtype and not out[c].isna().any():
+            try:
+                out[c] = out[c].astype(stored[c].dtype)
+            except (TypeError, ValueError):
+                pass
+    return out
 
 
 def count_labels(counts, labels):
@@ -139,8 +177,8 @@ def repair(folder=None, kite=None, apply=False, limit=None, speed=md.SPEED, now=
         if limit:
             sids = sids[:limit]
         result = {"applied": apply, "counts": counts, "stocks": len(sids), "repaired": [], "skipped": [],
-                  "skipped_dates": [], "refused": [], "before": {}, "after": {}, "ratio": {}, "backup": None,
-                  "requests": 0}
+                  "skipped_dates": [], "refused": [], "preexisting": [], "before": {}, "after": {}, "ratio": {},
+                  "backup": None, "requests": 0}
         if not sids:
             log("Nothing to repair.")
             result["report"] = "Nothing to repair."
@@ -230,21 +268,20 @@ def repair(folder=None, kite=None, apply=False, limit=None, speed=md.SPEED, now=
                     new_in.at[i, f"kite_{f}"] = trial.at[i, f"kite_{f}"]
                 new_in.at[i, "fetched_at"] = fetched
                 new_in.at[i, "run_id"] = run_id
-            new = calc.derive(sid, new_in, bhav=bhav)
-            for c in new.columns:                                  # the stored file's dtypes where the values fit
-                if new[c].dtype != stored[c].dtype and not new[c].isna().any():
-                    try:
-                        new[c] = new[c].astype(stored[c].dtype)
-                    except (TypeError, ValueError):
-                        pass
             keep = ~stored["date"].isin(good).to_numpy()
-            if len(new) != len(stored) or list(new["date"]) != list(stored["date"]):
-                result["refused"].append((symbol, sid, "the dates would differ"))
-                continue
-            cols = different(stored, new, keep)
+            # the guard: the repair may change no other row (older or later), compared on two fresh derives
+            base = calc.derive(sid, inputs, bhav=bhav)
+            after = calc.derive(sid, new_in, bhav=bhav)
+            pre = different(stored, base, keep)[0]
+            if pre:                                            # stored rows a fresh derive no longer gives: kept
+                result["preexisting"].append((symbol, sid, pre))
+            cols, when = different(base, after, keep)
             if cols:
-                result["refused"].append((symbol, sid, "older rows would change: " + ", ".join(cols)))
+                result["refused"].append((symbol, sid, f"rows not repaired would change ({', '.join(cols)}) on "
+                                                       f"{', '.join(md.iso(d) for d in when[:5])}"
+                                                       f"{' ...' if len(when) > 5 else ''}"))
                 continue
+            new = splice(stored, repaired_rows(calc, sid, new_in, good, bhav))
             sel = ~keep
             old_r, new_r = stored.loc[sel], new.loc[sel]
             count_labels(result["before"], old_r["check"])
@@ -264,7 +301,7 @@ def repair(folder=None, kite=None, apply=False, limit=None, speed=md.SPEED, now=
                 tmp = os.path.join(path, ms.DAYS_FILE + ".tmp")
                 ms.write_days(new, tmp)
                 tmps.append((tmp, os.path.join(path, ms.DAYS_FILE)))
-            del stored, inputs, trial, new_in, new
+            del stored, inputs, trial, new_in, new, base, after
         result["requests"] = limiter.requests + 1
         if apply:
             for tmp, p in tmps:
@@ -332,8 +369,16 @@ def report(r, apply):
         if len(r["skipped_dates"]) > LIST_LINES:
             lines.append(f"  ... {len(r['skipped_dates']) - LIST_LINES:,} more")
     if r["refused"]:
-        lines.append(f"Not written, older rows would change: {len(r['refused']):,}")
+        lines.append(f"Not written, the repair would change rows not repaired: {len(r['refused']):,}")
         lines += [f"  {s} ({sid}): {why}" for s, sid, why in r["refused"]]
+    if r["preexisting"]:
+        cols = {}
+        for _, _, cs in r["preexisting"]:
+            for c in cs:
+                cols[c] = cols.get(c, 0) + 1
+        lines.append(f"Pre-existing re-derive differences (not fixed; those rows stay as stored): "
+                     f"{len(r['preexisting']):,} stocks; columns: " +
+                     ", ".join(f"{c} ({n:,})" for c, n in sorted(cols.items(), key=lambda x: -x[1])))
     if apply and r["backup"]:
         lines.append(f"Backup of every changed days.parquet and repair.csv: {r['backup']}")
     return "\n".join(lines) + "\n"

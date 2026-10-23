@@ -173,8 +173,8 @@ reading the 12 year files), `Calc` grouped it again, and a build held all of a s
 `OK`, `CLOSE_DIFF` (the day close outside the scaled minute low..high), `CLOSING_AUCTION` (the same, on a day whose
 last minute bar is in 15:00..15:28), `HIGHLOW_DIFF` (the scaled minute high above
 the day high, or the low below the day low; a wider day range is normal), `VOLUME_DIFF` (scaled minute volume >
-day x 1.01 + 1 or < day x 0.5), `CANDLE_UNCONFIRMED` (Kite's day volume = the summed minute volume, not the bhavcopy's:
-docs/dev/equity_minute_finished_days.md), `MINUTE_EMPTY` (a day candle and a bhavcopy row, no minutes), `DAY_EMPTY` (minutes
+day x 1.01 + 1 or < day x 0.5), `CANDLE_UNCONFIRMED` (set by `update` only, on a day stored after the deferral cap whose Kite day volume is still the
+summed minute volume; never derived, `checks` keeps it: docs/dev/equity_minute_finished_days.md), `MINUTE_EMPTY` (a day candle and a bhavcopy row, no minutes), `DAY_EMPTY` (minutes
 and a bhavcopy row, no day candle), `EXTRA_SESSION` (no bhavcopy row), `SCALE_STEP`. A day can carry several,
 `|`-joined. Files in `check/` are rebuilt from every `days.parquet` at the end of a run:
 - `minute_check.csv`: the problem days;

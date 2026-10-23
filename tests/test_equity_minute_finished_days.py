@@ -246,6 +246,26 @@ def test_deferral_cap_stores_an_old_unfinished_day_labelled(done_copy):
     big_id = sid(f, "BIG")
     assert chk["after"].get("CANDLE_UNCONFIRMED") == 1
     assert big_id not in {x[0] for x in chk["changed"]} and not [x for x in chk["refused"] if big_id in x]
+    md.checks(f, apply=True, log=q)                    # (b) checks --apply keeps the stored label
+    assert "CANDLE_UNCONFIRMED" in days_of(f, "BIG").loc[DAYS[bad], "check"]
+    assert md.rebuild_checks(f, {})["checks"]["CANDLE_UNCONFIRMED"] == 1
+
+
+def test_derive_never_adds_candle_unconfirmed(done_copy):
+    f = done_copy                                      # (a) volume = minute sum != bhavcopy on every day
+    s = sid(f, "BIG")
+    x = ms.read_days(ms.stock_dir(f, s))[md.INPUT_COLUMNS].copy()
+    x["kite_volume"] = x["minute_volume"].astype("float64")
+    calc = md.Calc(f, mp.Inputs(f, bhav=False))
+    out = calc.derive(s, x)
+    assert len(md.unfinished(x, calc.bhav_of(s))) > 50
+    assert not out["check"].str.contains("CANDLE_UNCONFIRMED").any()
+
+
+def test_add_check():
+    assert md.add_check("OK", "CANDLE_UNCONFIRMED") == "CANDLE_UNCONFIRMED"
+    assert md.add_check("SCALE_STEP|VOLUME_DIFF", "CANDLE_UNCONFIRMED") == "VOLUME_DIFF|SCALE_STEP|CANDLE_UNCONFIRMED"
+    assert md.add_check("CANDLE_UNCONFIRMED", "CANDLE_UNCONFIRMED") == "CANDLE_UNCONFIRMED"
 
 
 def test_build_defers_an_unfinished_last_day(world):
@@ -263,39 +283,54 @@ def test_build_defers_an_unfinished_last_day(world):
 UPDATE_RUN = "20150423-000500-abcd"
 
 
-def fabricate(f, ptwo=True):
-    """Rows as the old update stored them: BIG and PTWO provisional (fetched the same evening), MID fetched at
-    00:00:00 the next day (ARIHANTSUP: only the 01:00 rule finds it), GEN1 a DAY_EMPTY of an update run at 00:05.
-    PTWO: its DAYS[N-2] and DAYS[N-3] have no candle (old, fetched by the download) and borrow DAYS[N-1]'s
-    conversion: repairing DAYS[N-1] would change them."""
-    inp = mp.Inputs(f, bhav=False)
-    calc = md.Calc(f, inp)
+def make_rows(f, specs):
+    """Store rows as the old update did: specs = [(symbol, day index, kind, fetched_at)], kind "prov" (Kite's
+    provisional candle: close = last minute close, volume = summed minutes; fetched_at and the update run), "empty"
+    (no candle; fetched_at and the update run) or "old_empty" (no candle, still the download's run and time). Each
+    stock is re-derived whole (a consistent stored file)."""
+    calc = md.Calc(f, mp.Inputs(f, bhav=False))
+    by = {}
+    for sym, i, kind, fetched in specs:
+        by.setdefault(sym, []).append((DAYS[i], kind, fetched))
+    for sym, rows in by.items():
+        s, path = sid(f, sym), ms.stock_dir(f, sid(f, sym))
+        x = ms.read_days(path)[md.INPUT_COLUMNS].copy()
+        for c in md.FIELDS:
+            x[f"kite_{c}"] = x[f"kite_{c}"].astype("float64")
+        for d, kind, fetched in rows:
+            i = int(np.flatnonzero(x["date"] == d)[0])
+            if kind == "prov":
+                x.at[i, "kite_close"] = x.at[i, "minute_close"]
+                x.at[i, "kite_volume"] = x.at[i, "minute_volume"]
+            else:
+                for c in md.FIELDS:
+                    x.at[i, f"kite_{c}"] = np.nan
+            if kind != "old_empty":
+                x.at[i, "fetched_at"] = fetched
+                x.at[i, "run_id"] = UPDATE_RUN
+        ms.write_days(calc.derive(s, x), os.path.join(path, ms.DAYS_FILE))
+
+
+def update_run(f):
     db = md.Progress(f)
     db.start_run(UPDATE_RUN, "update")
     db.end_run(UPDATE_RUN, 0, 0, "done")
     db.close()
+
+
+def fabricate(f, ptwo=True):
+    """BIG and PTWO provisional on DAYS[N-1] (fetched the same evening), MID fetched at 00:00:00 the next day
+    (ARIHANTSUP: only the 01:00 rule finds it), GEN1 a DAY_EMPTY of an update run at 00:05. PTWO: its DAYS[N-2] and
+    DAYS[N-3] have no candle (old, fetched by the download) and DAYS[N-2] borrows DAYS[N-1]'s conversion: repairing
+    DAYS[N-1] would change it."""
+    update_run(f)
     d, nxt = DAYS[N - 1], DAYS[N - 1] + timedelta(days=1)
-    rows = [("BIG", f"{d} 20:05:00", "prov"), ("MID", f"{nxt} 00:00:00", "prov"), ("GEN1", f"{nxt} 00:05:00", "empty")]
-    for sym, fetched, kind in rows + ([("PTWO", f"{d} 20:06:00", "prov")] if ptwo else []):
-        s, path = sid(f, sym), ms.stock_dir(f, sid(f, sym))
-        stored = ms.read_days(path)
-        x = stored[md.INPUT_COLUMNS].copy()
-        for c in md.FIELDS:
-            x[f"kite_{c}"] = x[f"kite_{c}"].astype("float64")
-        i = int(np.flatnonzero(x["date"] == d)[0])
-        if kind == "empty":
-            for c in md.FIELDS:
-                x.at[i, f"kite_{c}"] = np.nan
-        else:
-            x.at[i, "kite_close"] = x.at[i, "minute_close"]
-            x.at[i, "kite_volume"] = x.at[i, "minute_volume"]
-        x.at[i, "fetched_at"] = fetched
-        x.at[i, "run_id"] = UPDATE_RUN
-        if sym == "PTWO":
-            for j in (i - 1, i - 2):
-                for c in md.FIELDS:
-                    x.at[j, f"kite_{c}"] = np.nan
-        ms.write_days(calc.derive(s, x), os.path.join(path, ms.DAYS_FILE))
+    specs = [("BIG", N - 1, "prov", f"{d} 20:05:00"), ("MID", N - 1, "prov", f"{nxt} 00:00:00"),
+             ("GEN1", N - 1, "empty", f"{nxt} 00:05:00")]
+    if ptwo:
+        specs += [("PTWO", N - 1, "prov", f"{d} 20:06:00"), ("PTWO", N - 2, "old_empty", ""),
+                  ("PTWO", N - 3, "old_empty", "")]
+    make_rows(f, specs)
 
 
 @pytest.fixture
@@ -335,7 +370,8 @@ def test_repair_dry_run_writes_nothing(broken):
     res = rp(f, kite)
     assert tree(f) == before
     assert {s for s, _, _ in res["repaired"]} == {"BIG", "MID", "GEN1"} and res["requests"] == 1 + 4
-    assert [(s, why.split(":")[0]) for s, _, why in res["refused"]] == [("PTWO", "older rows would change")]
+    assert [s for s, _, _ in res["refused"]] == ["PTWO"]
+    assert "rows not repaired would change (" in res["refused"][0][2] and str(DAYS[N - 2]) in res["refused"][0][2]
     assert res["before"]["DAY_EMPTY"] == 1 and res["after"].get("DAY_EMPTY", 0) == 0 and res["after"]["OK"] == 3
     assert res["ratio"]["0.1-0.5%"] == 2 and sum(res["ratio"].values()) == 3
     text = res["report"]
@@ -367,7 +403,7 @@ def test_repair_apply_changes_only_the_repaired_dates(broken):
     changed = {k for k in after if after[k] != files.get(k)}
     for sym in ("BIG", "MID", "GEN1"):
         new, old = days_of(f, sym), before[sym]
-        pd.testing.assert_frame_equal(new.drop(index=d), old.drop(index=d))
+        pd.testing.assert_frame_equal(new.drop(index=d), old.drop(index=d), check_exact=True)   # (c)
         assert new.loc[d, "check"] == "OK" and new.loc[d, "kite_close"] == kite_day(sym, N - 1)["close"]
         assert new.loc[d, "run_id"] != UPDATE_RUN
         assert os.path.join("equity_1min", "data", sid(f, sym), ms.DAYS_FILE) in changed
@@ -474,3 +510,70 @@ def test_repair_cli_exit_codes(clean, monkeypatch, capsys):
     assert cli.main(["repair", "--folder", f]) == 1
     monkeypatch.setattr(mp, "kite_client", lambda: (_ for _ in ()).throw(mp.SignInNeeded("no token")))
     assert cli.main(["repair", "--folder", f]) == 2
+
+
+def test_repair_refuses_when_a_later_row_depends_on_the_repaired_day(done_copy):
+    f = done_copy                                      # (e) MID's DAYS[N-1] borrows DAYS[N-2]'s conversion
+    update_run(f)
+    make_rows(f, [("MID", N - 2, "prov", f"{DAYS[N - 2]} 20:00:00"), ("MID", N - 1, "old_empty", ""),
+                  ("BIG", N - 1, "prov", f"{DAYS[N - 1]} 20:00:00")])
+    assert days_of(f, "MID").loc[DAYS[N - 1], "conversion_from"] == str(DAYS[N - 2])
+    mid = os.path.join("equity_1min", "data", sid(f, "MID"), ms.DAYS_FILE)
+    before = tree(f)
+    res = rp(f, FakeKite(), apply=True)
+    assert [s for s, _, _ in res["refused"]] == ["MID"]
+    why = res["refused"][0][2]
+    assert why.startswith("rows not repaired would change (") and why.endswith(f") on {DAYS[N - 1]}")   # only the later row
+    assert tree(f)[mid] == before[mid] and not os.path.isdir(os.path.join(res["backup"], sid(f, "MID")))
+    assert [s for s, _, _ in res["repaired"]] == ["BIG"]
+
+
+def test_repair_keeps_preexisting_differences(clean):
+    f = clean                                          # (d) BIG's stored rows differ from a fresh derive
+    path = ms.stock_dir(f, sid(f, "BIG"))
+    stored = ms.read_days(path)
+    stored.loc[10, "note"] = "written by an older rule"
+    stored.loc[11, "vol_ratio"] = 1.2345
+    ms.write_days(stored, os.path.join(path, ms.DAYS_FILE))
+    before = ms.read_days(path)
+    res = rp(f, FakeKite(), apply=True)
+    assert "BIG" in [x for x, _, _ in res["repaired"]] and not res["refused"]
+    assert [(x, cols) for x, _, cols in res["preexisting"]] == [("BIG", ["vol_ratio", "note"])]
+    assert ("Pre-existing re-derive differences (not fixed; those rows stay as stored): 1 stocks; columns: "
+            "vol_ratio (1), note (1)") in res["report"]
+    after = ms.read_days(path)
+    keep = after["date"] != DAYS[N - 1]
+    pd.testing.assert_frame_equal(after[keep].reset_index(drop=True), before[keep].reset_index(drop=True),
+                                  check_exact=True)
+    assert after.loc[10, "note"] == "written by an older rule" and after.loc[11, "vol_ratio"] == 1.2345
+
+
+def test_repaired_rows_match_what_update_stores(done_copy):
+    """(1) BIG updated day by day with final candles (T = N-1, then N) is the reference; the same world with those
+    two rows stored provisional, repaired, gives the same rows (but fetched_at / run_id)."""
+    f = done_copy
+    extend(f)
+    rollback(f, "BIG", N - 2)
+    md.update(f, kite=FakeKite(last_day=N), speed=FAST, now=morning_after(N - 1), log=q)
+    md.update(f, kite=FakeKite(last_day=N), speed=FAST, now=MORNING_AFTER, log=q)
+    ref = days_of(f, "BIG")
+    assert list(ref.index[-2:]) == [DAYS[N - 1], DAYS[N]]
+    s, path = sid(f, "BIG"), ms.stock_dir(f, sid(f, "BIG"))
+    calc = md.Calc(f, mp.Inputs(f, bhav=False))
+    stored = ms.read_days(path)
+    x = stored[md.INPUT_COLUMNS].copy()
+    for c in md.FIELDS:
+        x[f"kite_{c}"] = x[f"kite_{c}"].astype("float64")
+    for d in (DAYS[N - 1], DAYS[N]):                   # as the old update stored them: provisional, that evening
+        i = int(np.flatnonzero(x["date"] == d)[0])
+        x.at[i, "kite_close"] = x.at[i, "minute_close"]
+        x.at[i, "kite_volume"] = x.at[i, "minute_volume"]
+        x.at[i, "fetched_at"] = f"{d} 20:00:00"
+    ms.write_days(mr.splice(stored, mr.repaired_rows(calc, s, x, [DAYS[N - 1], DAYS[N]], calc.bhav_of(s))),
+                  os.path.join(path, ms.DAYS_FILE))
+    assert days_of(f, "BIG").loc[DAYS[N], "kite_close"] != ref.loc[DAYS[N], "kite_close"]
+    res = rp(f, FakeKite(last_day=N), apply=True)
+    assert [x for x, _, _ in res["repaired"]] == ["BIG"] and not res["refused"]
+    got = days_of(f, "BIG")
+    cols = [c for c in ref.columns if c not in ("fetched_at", "run_id")]
+    pd.testing.assert_frame_equal(got[cols], ref[cols], check_exact=True)

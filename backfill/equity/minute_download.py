@@ -188,6 +188,16 @@ def target_day(days, now=None, holidays=()):
     return days[i - 1], f"latest trading day finished, {when}; bhavcopy in the store", True
 
 
+def add_check(check, name):
+    """A check label with `name` added, in CHECKS order ("OK" alone becomes `name`)."""
+    have = set(check.split("|")) - {"OK", ""}
+    return "|".join(c for c in CHECKS if c in have | {name})
+
+
+UNCONFIRMED = "CANDLE_UNCONFIRMED"
+NO_CANDLE = "no day candle"
+
+
 def unfinished(inputs, bhav):
     """{date: reason} of the days (INPUT_COLUMNS rows) whose Kite day candle does not look final: minutes and a
     bhavcopy row but no day candle, or a candle volume equal to the summed minute volume while not equal to the
@@ -201,7 +211,7 @@ def unfinished(inputs, bhav):
             continue
         if pd.isna(kc):
             if rows > 0:
-                out[d] = "no day candle"
+                out[d] = NO_CANDLE
         elif rows > 0 and kv == mv and kv != b:
             out[d] = f"candle volume {kv:,.0f} = summed minute volume, bhavcopy {b:,.0f}"
     return out
@@ -981,12 +991,12 @@ class Calc:
             vol = both & ((vs > kv * VOLUME_HIGH + 1) | (vs < kv * VOLUME_LOW))
         last_bar = d["last_bar"].fillna("").astype(str).to_numpy(object)
         auction = cl & (last_bar >= AUCTION_FROM) & (last_bar < AUCTION_TO)    # the close came from the auction
-        bv = d["bhav_volume"].to_numpy(float)
-        unconfirmed = has_min & has_day & has_bhav & (kv == mv) & (kv != bv)   # unfinished(): stored after the cap
+        # CANDLE_UNCONFIRMED is never derived (2015-2018 final candles often equal the minute sum too): update sets
+        # it on the days it stores after the deferral cap (add_check), checks keeps it
         flags = {"EXTRA_SESSION": ~has_bhav, "DAY_EMPTY": has_min & has_bhav & ~has_day,
                  "MINUTE_EMPTY": has_day & has_bhav & ~has_min, "HIGHLOW_DIFF": hl, "CLOSE_DIFF": cl & ~auction,
                  "CLOSING_AUCTION": auction, "VOLUME_DIFF": vol, "SCALE_STEP": np.zeros(n, bool),
-                 "CANDLE_UNCONFIRMED": unconfirmed}
+                 "CANDLE_UNCONFIRMED": np.zeros(n, bool)}
         notes = [[] for _ in range(n)]
         vscale = d["minute_volume_scale"].to_numpy(float)
         for i in range(1, n):
@@ -1061,11 +1071,13 @@ class Runner:
         at most DEFER_DAYS trading days before end is deferred with every day after it: nothing of them is stored and
         the next update fetches them again. An older one is stored anyway (CANDLE_UNCONFIRMED, or DAY_EMPTY without a
         candle) and counted as unconfirmed, so no stock is deferred forever. window: only the days at most
-        DEFER_DAYS before end are looked at (a full history: the older days are finished)."""
+        DEFER_DAYS before end are looked at (a full history: the older days are finished). Returns (cut, the dates
+        stored anyway whose candle volume is the minute sum: they get CANDLE_UNCONFIRMED)."""
         if window:
             inputs = inputs[[self.calc.age(d, end) <= DEFER_DAYS for d in inputs["date"]]]
         bad = unfinished(inputs, bhav)
         cut = next((d for d in sorted(bad) if self.calc.age(d, end) <= DEFER_DAYS), None)
+        label = {d for d, why in bad.items() if why != NO_CANDLE and (cut is None or d < cut)}
         with self.lock:
             for d in sorted(bad):
                 if cut is not None and d >= cut:
@@ -1077,7 +1089,7 @@ class Runner:
                 self.stats["deferred_days"] += held
                 self.stats["deferred_stocks"] += 1
                 self.deferred.append((item["symbol"], cut, bad[cut], held))
-        return cut
+        return cut, label
 
     # history of one stock
     def history(self, item):
@@ -1183,7 +1195,7 @@ class Runner:
 
         inputs = inputs_from(aggs, runs_of_day, frames)
         bhav = self.calc.bhav_of(sid)
-        cut = self.hold_back(item, inputs, bhav, item["last"], window=True)
+        cut, _ = self.hold_back(item, inputs, bhav, item["last"], window=True)      # never older than the cap
         if cut is not None:
             inputs = inputs[inputs["date"] < cut].reset_index(drop=True)
             if inputs.empty:
@@ -1241,7 +1253,7 @@ class Runner:
             self.add(up_to_date=1)
             return "NO_NEW_DAYS"
         bhav = self.calc.bhav_of(sid)
-        cut = self.hold_back(item, inputs_new, bhav, target)
+        cut, label = self.hold_back(item, inputs_new, bhav, target)
         if cut is not None:
             inputs_new = inputs_new[inputs_new["date"] < cut]
             if len(new):
@@ -1249,7 +1261,10 @@ class Runner:
             if inputs_new.empty:
                 return "DEFERRED"
         derived = self.calc.derive(sid, pd.concat([stored[INPUT_COLUMNS], inputs_new], ignore_index=True), bhav=bhav)
-        added = derived[derived["date"] > last]
+        added = derived[derived["date"] > last].copy()
+        if label:
+            added["check"] = [add_check(c, UNCONFIRMED) if d in label else c
+                              for d, c in zip(added["date"], added["check"])]
         days = pd.concat([stored, added], ignore_index=True)[DAY_COLUMNS]
         if len(new):
             for year, g in new.groupby(new["ts"].dt.year):
@@ -2188,6 +2203,8 @@ def checks(folder=None, apply=False, log=print):
             path = ms.stock_dir(folder, sid)
             stored = ms.read_days(path)
             new = calc.derive(sid, stored[INPUT_COLUMNS])
+            new["check"] = [add_check(c, UNCONFIRMED) if UNCONFIRMED in old else c     # set by update, never derived
+                            for c, old in zip(new["check"], stored["check"])]
             for counts, labels in ((before, stored["check"]), (after, new["check"])):
                 for chk in labels:
                     for x in chk.split("|"):

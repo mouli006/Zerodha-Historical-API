@@ -51,17 +51,19 @@ fetches again the day candles stored before this rule (the 1-minute bars are nev
   neither it nor any later day is stored (no `days.parquet` row, no minute bars), `last_day` stays, and the next
   `update` fetches it again. Deferred days are counted (`deferred_days` / `deferred_stocks`), never as failed.
 - **Cap:** an unfinished day older than 3 trading days is stored anyway, so no stock is deferred forever. The volume
-  case gets the check **`CANDLE_UNCONFIRMED`** (computed by `Calc.derive` from the stored inputs, so `checks` and
-  `repair` keep it); without a candle it is `DAY_EMPTY` as before. Counted as `unconfirmed_days`.
+  case gets the check **`CANDLE_UNCONFIRMED`**, set by `update` on the row it stores (`add_check`, in `CHECKS` order);
+  without a candle it is `DAY_EMPTY` as before. Counted as `unconfirmed_days`.
+- **The label is sticky, never derived.** `Calc.derive` does not compute it, and `checks` keeps it where it is stored.
+  A read-only scan of the real store (23 Oct) found 49,567 days with candle volume = summed minute volume != bhavcopy:
+  9,072 / 14,595 / 11,152 / 9,659 in 2015-2018 (Kite's final old candles, the bhavcopy on another volume scale,
+  median difference 300%), 988 in 2019-2025, and 4,101 in 2026 (4,089 of them the provisional rows). Derived, the label
+  would have relabelled ~45,000 final old days; the rule is only good for days just fetched.
 - In `update` every new day is checked; in a full-history build only the days with age <= 3 at its end (older days
   are finished: the Muhurat and ENERGYDEV 2018 DAY_EMPTY days stay). A build cuts deferred days from its temporary
   year file and `days.parquet` before the rename; when nothing is left it builds nothing (staging kept).
 - Run summary: `Update to T <weekday> (target day: why)`, then `Target day T: updated N stocks (X new days, P with a
   problem check), D deferred days (S stocks), U stored unconfirmed, ...` and the lists (at most 20 lines each). The CLI's
   last line shows the deferred days.
-- `CANDLE_UNCONFIRMED` also labels older stored rows where Kite's stored candle has the summed minute volume and the
-  bhavcopy differs: the provisional rows before this fix (repair replaces them) and possibly a few old days. `checks`
-  (dry run) counts them.
 
 ## `repair [--apply] [--limit N] [--speed 2.5]`
 1. **Selection** (`find_affected`, stored data only: every `days.parquet`, the progress db's `runs` and
@@ -78,26 +80,34 @@ fetches again the day candles stored before this rule (the 1-minute bars are nev
    the safety net) is skipped and listed; a failed request (COMFINTE) skips the stock with Kite's error text; a sign-in
    error stops (exit 2).
 4. Only the day inputs of the repaired dates change (`kite_*`, `fetched_at` = the repair's fetch time, `run_id` = the
-   repair run); the stock is re-derived with `Calc.derive` from its stored `INPUT_COLUMNS`. Minute files are never
-   written.
-5. **Only the repaired dates may change:** every other row must equal its stored row in every column
-   (`md.same_column`). Otherwise (a volume scale level, a borrowed conversion) the stock is listed with the columns
-   and not written (exit 1), as `checks --apply` does.
-6. **Dry run** (default) writes nothing but makes the Kite requests (the counts after need the new candles). It prints
+   repair run). **Each repaired row is derived as `update` stores a new day** (`repaired_rows`): for each repaired
+   date d in order, `Calc.derive` on the inputs up to d only (the stored days as neighbours, nothing later yet), with
+   the new candles in; row d is taken. A test checks the rows equal those of a day-by-day update with final candles
+   (all columns but `fetched_at` / `run_id`).
+5. **Only the repaired rows are written** (`splice`): the stored file with those rows replaced; every other row stays
+   exactly as stored. Minute files are never written.
+6. **Guard:** two fresh derives of the whole stock, without (`base`) and with the new candles, are compared on every
+   row not being repaired, later rows as well as older ones (a row stored after the repaired day may have been
+   derived with the provisional day as a neighbour: a borrowed conversion, a scale level). If any would change, the
+   repair itself changes it: the stock is listed with the columns and dates and not written (exit 1).
+   **Pre-existing differences** (`base` != the stored file: an older rule, a newer bhavcopy, ...) never block a stock
+   and are not fixed; the report gives one line: `Pre-existing re-derive differences (not fixed; those rows stay as
+   stored): N stocks; columns: <column> (<stocks>), ...`.
+7. **Dry run** (default) writes nothing but makes the Kite requests (the counts after need the new candles). It prints
    the rows found (provisional with both rule counts / DAY_EMPTY), stocks, requests and minutes needed, the checks of
    the repaired rows before -> after, the ratio changes (new / old - 1: <=0.1%, 0.1-0.5%, 0.5-2%, >2%), and every
    skipped stock, skipped date and refused stock with its reason. A bhavcopy cache older than the store is built in a
    temporary folder (removed after). `--limit N`: the first N stocks (by security_id), for a trial.
-7. **Refusals (dry run and `--apply`, exit 2):** `.lock` held (both take it for the whole run, so no `update` /
+8. **Refusals (dry run and `--apply`, exit 2):** `.lock` held (both take it for the whole run, so no `update` /
    `download` shares Kite's limit), a Kite F&O run (`check_fno`), a bhavcopy download or input build (`StoreBusy`).
-8. **`--apply`:** marks runs left `running` ABORTED, records a `repair` run; per stock copies `days.parquet` to
+9. **`--apply`:** marks runs left `running` ABORTED, records a `repair` run; per stock copies `days.parquet` to
    `equity_1min/archive/repair_<YYYY-MM-DD_HHMMSS>/<security_id>/days.parquet` and writes the new one as
    `days.parquet.tmp`; at the end replaces them all. Any error removes the `.tmp` files, restores every repaired file
    from the backup and raises `ApplyFailed` (exit 1; the run is `failed`). Then `repair.csv` (every row: REPAIRED /
    SKIPPED / REFUSED, old / new check and ratio, old `fetched_at`) goes into the backup folder and `check/` is rebuilt.
-9. **Re-runnable:** repaired rows have a `fetched_at` after their date and a run that is not `update`, so a second
+10. **Re-runnable:** repaired rows have a `fetched_at` after their date and a run that is not `update`, so a second
    run finds only what it skipped or refused. A killed run leaves at most `.tmp` files (overwritten next time).
-10. Exit codes: 0 done / dry run (skips listed), 1 a stock refused or `ApplyFailed`, 2 a lock, a Kite F&O run, an input
+11. Exit codes: 0 done / dry run (skips listed), 1 a stock refused or `ApplyFailed`, 2 a lock, a Kite F&O run, an input
     build, or Kite sign-in needed.
 
 **Estimate (23 Oct):** 1 + 2,592 = 2,593 requests, 0.4 s each at 2.5 req/s (~17 min), plus ~0.25 s per stock to
@@ -108,7 +118,9 @@ read, derive and compare: about 25 minutes per run (the dry run and `--apply` ea
 missing candles and minute volumes equal to the day's): the target day (22:00 on D, 00:30 / 01:00 on D+1, Monday,
 holidays both ways, a weekend session, no bhavcopy for T, `days.csv`, status, an evening update, a run crossing
 midnight); the safety net (no candle and provisional deferred then stored, illiquid stored, the build cut, the cap at
-ages 0-3 / 4 with `CANDLE_UNCONFIRMED` kept by `checks`); repair (selection incl. the 00:00:00 row and both counts,
-dry run writes nothing, new token / still provisional skipped, a borrowed conversion refused, apply changes only the
-repaired dates and backs up, an error on the third replace restores every file, a second run finds nothing,
+ages 0-3 / 4 with `CANDLE_UNCONFIRMED` kept by `checks` and `checks --apply`, `derive` never adding it,
+`add_check`); repair (selection incl. the 00:00:00 row and both counts, dry run writes nothing, new token / still
+provisional skipped, a borrowed conversion refused for an older and for a later row (nothing written for it), apply
+writes only the repaired rows (the others exactly as stored) and backs up, a pre-existing difference repaired with
+its rows kept and reported, the repaired rows equal a day-by-day update's, an error on the third replace restores every file, a second run finds nothing,
 `--limit`, refusals by lock / F&O / input build for the dry run and apply, CLI exit codes).
