@@ -277,6 +277,11 @@ def test_daily_cap_stops_cleanly_and_resume_continues(world, downloaded):
     assert db.calls_on(NOW.date()) == 6
     db.close()
     first = fake.historical_calls()
+    db = idl.Progress(world, write=False)
+    assert set(db.stocks()) == {sid(world, "DEADA")}                   # only the stock the run touched has a row
+    db.close()
+    text = idl.status(world, max_calls=6, now=NOW, log=q)["text"]
+    assert "0 done, 1 partly, 1 not started" in text                    # priority 1: DEADA started, LIVE1 not yet
     res2 = dl(world, fake, max_calls=6)
     assert res2["stats"]["cap"] and res2["stats"]["calls"] == 0        # the cap counts across runs
     later = FakeBreeze()

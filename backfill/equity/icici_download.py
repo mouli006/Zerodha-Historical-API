@@ -674,7 +674,8 @@ class Runner:
         chunks = [c for c in self.db.chunks(sid) if c["status"] in ("DONE", "EMPTY")]
         unbuilt = [c for c in chunks if not c["built"]]
         if not unbuilt and not files:
-            self.finish_stock(item, days)
+            if state.get("code"):                      # a stock this or an earlier run touched (else: no row)
+                self.finish_stock(item, days)
             return
         path = st.stock_dir(self.folder, sid)
         os.makedirs(path, exist_ok=True)
@@ -1054,7 +1055,8 @@ def status(folder=None, max_calls=ip.MAX_CALLS, now=None, log=print):
         state = {"DONE": 0, "PARTIAL": 0, "REVIEW": 0, "NOT_STARTED": 0}
         stored = empty = before = 0
         for r in fetch_.itertuples():
-            s = stocks.get(r.security_id, {}).get("status") or "NOT_STARTED"
+            row = stocks.get(r.security_id, {})
+            s = (row.get("status") if row.get("code") else "") or "NOT_STARTED"     # no code: never fetched
             state[s] = state.get(s, 0) + 1
             d = stored_days(folder, r.security_id)
             done_days = 0
