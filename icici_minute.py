@@ -57,6 +57,9 @@ def download_result(res):
           f"{s.get('days_stored', 0):,} days with minutes, {s['empty_days']:,} ICICI_EMPTY, "
           f"{s['before_start_days']:,} ICICI_BEFORE_START, {s['failed_chunks']:,} failed, {len(s['review'])} REVIEW, "
           f"peak memory {s['peak_mb'] / 1e3:.2f} GB")
+    if s.get("failed"):
+        print(f"Not run: {s['failed']}", file=sys.stderr)
+        return 1
     if s["rate_stop"]:
         print(f"Stopped: {s['rate_stop']}", file=sys.stderr)
         return 1
@@ -80,6 +83,7 @@ def show(key, folder, n):
     plan, _ = ip.read_plan(folder)
     db = idl.Progress(folder, write=False)
     stocks = db.stocks()
+    starts = db.start_checks()
     db.close()
     found = 0
     cols = ["date", "symbol", "check", "minute_rows", "bars_outside", "first_bar", "last_bar", "icici_close",
@@ -96,6 +100,9 @@ def show(key, folder, n):
             s = stocks.get(sid)
             if s:
                 print("Progress:", ", ".join(f"{k}={v}" for k, v in s.items() if k != "security_id" and v))
+            c = starts.get(sid)
+            if c:
+                print("Start check:", ", ".join(f"{k}={v}" for k, v in c.items() if k != "security_id" and v))
             d = idl.stored_days(folder, sid)
             if d is not None:
                 counts = {}

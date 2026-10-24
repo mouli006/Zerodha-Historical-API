@@ -78,7 +78,12 @@ SQL = ["""CREATE TABLE IF NOT EXISTS calls (n INTEGER PRIMARY KEY AUTOINCREMENT,
        """CREATE TABLE IF NOT EXISTS runs (run_id TEXT PRIMARY KEY, command TEXT, started TEXT, ended TEXT,
           calls INTEGER, result TEXT, peak_mb REAL)""",
        """CREATE TABLE IF NOT EXISTS errors (security_id TEXT, run_id TEXT, kind TEXT, chunk_from TEXT, error TEXT,
-          at TEXT)"""]
+          at TEXT)""",
+       """CREATE TABLE IF NOT EXISTS start_checks (security_id TEXT PRIMARY KEY, first_before TEXT, first_after TEXT,
+          samples TEXT, result TEXT, rounds INTEGER, checked_at TEXT, run_id TEXT)"""]
+START_FIELDS = ["security_id", "first_before", "first_after", "samples", "result", "rounds", "checked_at", "run_id"]
+START_SAMPLES = 3                # the start check: 3 single sample days in the largest unprobed gaps before the start
+START_ROUNDS = 5                 # at most 5 rounds (each moves the start earlier)
 CHUNK_FIELDS = ["security_id", "interval", "chunk_from", "chunk_to", "code", "bars", "day_bars", "status", "built",
                 "fetched_at", "run_id", "seconds", "error"]
 STOCK_FIELDS = ["security_id", "code", "match_kind", "status", "first_minute_day", "price_check", "reason", "days",
@@ -177,6 +182,13 @@ class Progress:
     def save_stock(self, sid, **kw):
         row = {**{f: None for f in STOCK_FIELDS}, **self.stock(sid), "security_id": sid, **kw}
         self.save("stocks", STOCK_FIELDS, row)
+
+    def start_check(self, sid):
+        r = self.rows("SELECT * FROM start_checks WHERE security_id = ?", (sid,))
+        return r[0] if r else {}
+
+    def start_checks(self):
+        return {r["security_id"]: r for r in self.rows("SELECT * FROM start_checks")}
 
     def mark_aborted(self):
         n = self.rows("SELECT COUNT(*) AS n FROM runs WHERE result = 'running'")[0]["n"]
@@ -311,8 +323,11 @@ def derive(rows, day_candles, bhav, factors, sid, near_action=lambda d: "", code
              "SHORT_DAY": short, "HIGHLOW_DIFF": hl, "CLOSE_DIFF": cl & ~auction, "CLOSING_AUCTION": auction,
              "VOLUME_DIFF": vol, "SCALE_STEP": np.zeros(n, bool)}
     notes = [[] for _ in range(n)]
+    start_note = d["start_note"].fillna("").astype(str).to_numpy() if "start_note" in d else [""] * n
     for i in np.flatnonzero(before):
         notes[i].append("inferred by the first-minute-day search (not fetched)")
+        if start_note[i]:
+            notes[i].append(start_note[i])
     steps = [(dc_dates[j], kind, arr[j - 1], arr[j]) for kind, arr in (("icici_scale", dc_scale),
                                                                        ("icici_volume_scale", dc_vscale))
              for j in range(1, len(dc_dates)) if arr[j] != arr[j - 1]]
@@ -335,6 +350,45 @@ def derive(rows, day_candles, bhav, factors, sid, near_action=lambda d: "", code
     d["check"] = ["|".join(c for c in CHECKS if flags[c][i]) or "OK" for i in range(n)]
     d["note"] = ["; ".join(x) for x in notes]
     return d[DAY_COLUMNS]
+
+
+def sample_days(days, have, end, n=START_SAMPLES):
+    """Positions of the start check's sample days among days[:end]: n times the middle of the largest run of days not
+    fetched yet (have) between two boundaries (-1, end and every fetched day; ties: the earlier run), each pick
+    becoming a boundary."""
+    bounds = sorted({-1, end} | {i for i in range(end) if days[i] in have})
+    picks = []
+    for _ in range(n):
+        best = None
+        for a, b in zip(bounds, bounds[1:]):
+            if b - a - 1 > 0 and (best is None or b - a - 1 > best[0]):
+                best = (b - a - 1, a, b)
+        if best is None:
+            break
+        m = (best[1] + best[2]) // 2
+        picks.append(m)
+        bounds = sorted(set(bounds) | {m})
+    return picks
+
+
+def check_pending(first, days, done):
+    """Whether a stock needs the start check: a stored search result after its first needed day (or NONE), and no
+    recorded check."""
+    if done or not first or not days:
+        return False
+    return first == NONE or sm.as_date(first) > days[0]
+
+
+def start_note(check):
+    """The note of the ICICI_BEFORE_START rows: the samples of the check's last round (all without minutes)."""
+    if not check:
+        return ""
+    samples = json.loads(check["samples"] or "[]")
+    last = [s["date"] for s in samples if s["round"] == check["rounds"] and not s["bars"]]
+    when = (check["checked_at"] or "")[:10]
+    if not last:
+        return f"start check {when}: no unprobed day to sample"
+    return f"start check {when}: samples {', '.join(last)} without minutes"
 
 
 def scale_ok(icici, bhav, scales, tol=PRICE_TOL):
@@ -370,7 +424,8 @@ class Runner:
         self.calls = 0
         self.rate_hits = 0
         self.stats = {"stocks": 0, "built": 0, "chunks": 0, "rows": 0, "calls": 0, "failed_chunks": 0,
-                      "review": [], "cap": False, "stopped": False, "auth": "", "rate_stop": "", "empty_days": 0,
+                      "review": [], "cap": False, "stopped": False, "auth": "", "rate_stop": "", "failed": "",
+                      "empty_days": 0,
                       "before_start_days": 0, "deferred_days": 0, "peak_mb": 0}
         self.cache = None
         self.actions = None
@@ -551,6 +606,57 @@ class Runner:
                 lo = mid
         return days[hi]
 
+    def start_check(self, item, days, have, first):
+        """The start check of a search result (a day after the first needed day, or NONE): sample days in the
+        largest unprobed gaps before it (NONE: over the whole range); a sample with minutes means searching again up
+        to it, and a new round on the new start. Recorded in start_checks (never repeated). Returns the (new) first
+        minute day, or None when a call failed (nothing recorded; the next run checks again, reusing the samples)."""
+        sid = item["security_id"]
+        original, rounds, samples, note = first, 0, [], ""
+        while True:
+            end = len(days) if first == NONE else bisect_left(days, sm.as_date(first))
+            if end == 0:
+                break
+            rounds += 1
+            hits = []
+            for i in sample_days(days, have, end):
+                got = self.has_minutes(item, days[i], have)
+                if got is None:
+                    return None
+                samples.append({"date": iso(days[i]), "bars": int(have[days[i]][0]), "round": rounds})
+                if got:
+                    hits.append(i)
+            if not hits:
+                break
+            found = self.first_minute_day(item, days[:min(hits) + 1], have)
+            if found is None:
+                return None
+            first = iso(found)
+            self.db.save_stock(sid, first_minute_day=first)
+            if rounds >= START_ROUNDS:
+                note = "round limit"
+                break
+        result = "KEPT" if first == original else "MOVED"
+        self.db.save("start_checks", START_FIELDS, {
+            "security_id": sid, "first_before": original, "first_after": first, "samples": json.dumps(samples),
+            "result": result + (f" ({note})" if note else ""), "rounds": rounds, "checked_at": stamp(self.clock()),
+            "run_id": self.run_id})
+        self.log(f"Start check {item['symbol']}: {original} -> {first} ({result}); samples " +
+                 ", ".join(f"{s['date']} {s['bars']} bars" for s in samples))
+        return first
+
+    def precheck(self, item, days):
+        """The start check of a stock searched by an earlier run (before any minute call of this run), then a
+        build so the samples are stored."""
+        sid = item["security_id"]
+        first = self.db.stock(sid).get("first_minute_day") or ""
+        if not check_pending(first, days, self.db.start_check(sid)):
+            return
+        try:
+            self.start_check(item, days, self.covered(sid, "minute"), first)
+        finally:
+            self.build(item, days)
+
     def price_check(self, item, first):
         """SYMBOL_ONLY: ICICI's day candle (else the minute aggregates) of the first day with minutes vs the
         bhavcopy, at one of the allowed scales. Returns (passed, text)."""
@@ -622,8 +728,13 @@ class Runner:
                 if found is not None:
                     first = found if found == NONE else iso(found)
                     self.db.save_stock(sid, first_minute_day=first)
+            checked = True
+            if check_pending(first, days, self.db.start_check(sid)):
+                new = self.start_check(item, days, have, first)
+                checked = new is not None
+                first = new or first
             symbol_only = item["match_kind"] == "SYMBOL_ONLY"
-            if first == NONE and symbol_only:
+            if first == NONE and symbol_only and checked:
                 self.db.save_stock(sid, status="DONE", reason="no ICICI minutes on any needed day; nothing stored "
                                                               "(SYMBOL_ONLY, not price checked)")
                 return
@@ -741,9 +852,11 @@ class Runner:
             rows[d] = {"fetched": True, "before_start": False, "fetched_at": c["fetched_at"] if c else "",
                        "run_id": c["run_id"] if c else ""}
         if first:
+            note = start_note(self.db.start_check(sid))
             for d in days:
                 if d not in have and (start is None or d < start):
-                    rows[d] = {"fetched": False, "before_start": True, "fetched_at": "", "run_id": ""}
+                    rows[d] = {"fetched": False, "before_start": True, "fetched_at": "", "run_id": "",
+                               "start_note": note}
         for d in agg:
             rows.setdefault(d, {"fetched": True, "before_start": False, "fetched_at": "", "run_id": ""})
         if not rows:
@@ -779,10 +892,12 @@ def resolved_days(folder, sid):
     return set() if d is None else set(d["date"])
 
 
-def work_items(folder, plan, days, inp, priority=None, symbols=None, limit=None, stocks=None, now=None):
-    """(items, days by stock, deferred) in plan order: fetchable stocks not DONE / REVIEW, each with its finished
-    needed days (a day is fetched only from (day + 1) 01:00 IST)."""
+def work_items(folder, plan, days, inp, priority=None, symbols=None, limit=None, stocks=None, now=None, checks=None):
+    """(items, days by stock, deferred) in plan order: fetchable stocks not DONE / REVIEW (a DONE stock whose start
+    check is pending counts too), each with its finished needed days (a day is fetched only from (day + 1) 01:00
+    IST)."""
     stocks = stocks or {}
+    checks = checks or {}
     want = None
     if symbols:
         want = set()
@@ -809,6 +924,10 @@ def work_items(folder, plan, days, inp, priority=None, symbols=None, limit=None,
         fin = [d for d in ds if now >= md.finished_at(d)]
         deferred += len(ds) - len(fin)
         if not fin:
+            continue
+        if check_pending(s.get("first_minute_day") or "", fin, checks.get(sid)):
+            items.append(r)
+            out[sid] = fin
             continue
         if s.get("status") == "DONE" and (s.get("reason") or "").startswith("no ICICI minutes"):
             continue
@@ -844,7 +963,8 @@ def download(folder=None, client=None, priority=None, symbols=None, limit=None, 
             log(f"{n} run(s) left 'running' by a killed process marked ABORTED.")
         db.save("runs", ["run_id", "command", "started", "result"],
                 {"run_id": run_id, "command": "download", "started": stamp(clock()), "result": "running"})
-        items, need, deferred = work_items(folder, plan, days, inp, priority, symbols, limit, db.stocks(), clock())
+        items, need, deferred = work_items(folder, plan, days, inp, priority, symbols, limit, db.stocks(), clock(),
+                                           db.start_checks())
         stats = runner.stats
         stats["deferred_days"] += deferred
         log(f"Work list: {len(items):,} stocks; calls used today {runner.used_today():,} of {max_calls:,}.")
@@ -856,6 +976,8 @@ def download(folder=None, client=None, priority=None, symbols=None, limit=None, 
                 runner.client = ic.BreezeClient.from_env()
             if items:
                 runner.call("session", None, runner.client.customer)
+            for item in items:          # start checks of stocks searched by an earlier run, before any minute call
+                runner.precheck(item, need[item["security_id"]])
             for k, item in enumerate(items, 1):
                 runner.stock(item, need[item["security_id"]])
                 stats["stocks"] += 1
@@ -875,6 +997,9 @@ def download(folder=None, client=None, priority=None, symbols=None, limit=None, 
         except RateStop as e:
             stats["rate_stop"], result = str(e), "rate limit"
             log(str(e))
+        except ic.IciciFailed as e:     # the start-of-run session call failed 3 times (timeout, network, server)
+            stats["failed"], result = str(e), "failed: session"
+            log(f"Not run: {e}")
         for item in items:
             d = stored_days(folder, item["security_id"])
             if d is not None:
@@ -1044,6 +1169,7 @@ def status(folder=None, max_calls=ip.MAX_CALLS, now=None, log=print):
     used = db.calls_on(today)
     chunks = db.chunks()
     errors = db.rows("SELECT * FROM errors ORDER BY at DESC")
+    starts = db.start_checks()
     runs = db.rows("SELECT * FROM runs ORDER BY started")
     db.close()
     by_sid = {sid: len(g) for sid, g in days.groupby("security_id")}
@@ -1080,6 +1206,19 @@ def status(folder=None, max_calls=ip.MAX_CALLS, now=None, log=print):
                  f"{sum(1 for c in chunks if c['status'] == 'EMPTY'):,} empty, {len(failed):,} FAILED")
     for c in failed[:FAILED_LINES]:
         lines.append(f"  FAILED {c['security_id']} {c['interval']} {c['chunk_from']}..{c['chunk_to']}: {c['error']}")
+    first_day = {sid: min(g["date"]) for sid, g in days.groupby("security_id")}
+    pending = [sid for sid, s in stocks.items() if s.get("code") and
+               check_pending(s.get("first_minute_day") or "", [first_day[sid]] if sid in first_day else [],
+                             starts.get(sid))]
+    kept = [c for c in starts.values() if c["result"].startswith("KEPT")]
+    moved = [c for c in starts.values() if c["result"].startswith("MOVED")]
+    n_samples = sum(len(json.loads(c["samples"] or "[]")) for c in starts.values())
+    lines.append(f"Start checks: {len(starts):,} done ({len(kept):,} kept, of which "
+                 f"{sum(1 for c in kept if c['first_after'] == NONE):,} still NONE; {len(moved):,} moved, of which "
+                 f"{sum(1 for c in moved if c['first_before'] == NONE):,} from NONE), {n_samples:,} sample calls; "
+                 f"{len(pending):,} pending (late start or NONE, not checked yet)")
+    for c in moved[:FAILED_LINES]:
+        lines.append(f"  MOVED {c['security_id']}: {c['first_before']} -> {c['first_after']} ({c['rounds']} rounds)")
     review = [s for s in stocks.values() if s["status"] == "REVIEW"]
     lines.append(f"REVIEW stocks: {len(review):,}")
     for s in review[:FAILED_LINES]:

@@ -1,6 +1,7 @@
 """backfill/equity/icici_download.py, icici_store.py and icici_minute.py's download / status / checks / coverage / show
 on tests/test_icici_plan.py's synthetic world and FakeBreeze. No network; .env is never read; the Kite store is only
 read; pacing is a recording limiter (no sleep) except where a test checks it."""
+import json
 import os
 import shutil
 from datetime import datetime, time as dtime, timedelta
@@ -119,12 +120,13 @@ def test_download_stores_unchanged_candles_and_converts(downloaded):
     assert fake.calls[0] == ("session",)
     a = days_of(f, "DEADA")
     assert len(a) == 51
-    # the first-minute-day search: days 0, 3, 4 probed empty, 1 and 2 inferred; day 33 fetched empty
-    for i in (0, 3, 4, 33):
+    # the first-minute-day search: days 0, 3, 4 probed empty; the start check sampled 1 and 2 (the only unprobed
+    # days before day 5): fetched empty too, so no day is inferred; day 33 fetched empty
+    for i in (0, 1, 2, 3, 4, 33):
         assert a.loc[DAYS[i], "check"] == idl.EMPTY
     for i in (1, 2):
-        assert a.loc[DAYS[i], "check"] == idl.BEFORE_START and "inferred" in a.loc[DAYS[i], "note"]
-        assert a.loc[DAYS[i], "fetched_at"] == ""
+        assert a.loc[DAYS[i], "fetched_at"] != ""
+    assert not a["check"].str.contains(idl.BEFORE_START).any()
     # candles stored unchanged, ICICI's 09:07 and 15:31 bars included
     y = pq.read_table(os.path.join(st.stock_dir(f, sid(f, "DEADA")), "2015.parquet")).to_pandas()
     day6 = y[y["ts"].dt.date == DAYS[6]].reset_index(drop=True)
@@ -202,7 +204,7 @@ def test_loader_raw_ours_icici(downloaded):
 def test_checks_status_coverage(downloaded, capsys):
     f = downloaded[0]
     res = idl.rebuild_checks(f)
-    assert res["checks"]["ICICI_EMPTY"] == 4 and res["checks"]["ICICI_BEFORE_START"] == 2
+    assert res["checks"]["ICICI_EMPTY"] == 6 and "ICICI_BEFORE_START" not in res["checks"]     # days 1, 2 sampled
     assert res["bars_outside"] > 0
     steps = pd.read_csv(os.path.join(st.check_dir(f), "scale_steps.csv"))
     assert set(steps["flagged"]) == {"N"} and str(DAYS[BONUS]) in set(steps["date"])
@@ -212,13 +214,13 @@ def test_checks_status_coverage(downloaded, capsys):
     merged = idl.coverage(f)
     merged = merged[merged["reason"] == "MERGED"].set_index("symbols")
     deada = merged[merged.index.str.startswith("DEADA")].iloc[0]
-    assert deada["state"] == "PARTLY" and deada["icici_empty"] == 4 and deada["icici_before_start"] == 2
+    assert deada["state"] == "PARTLY" and deada["icici_empty"] == 6 and deada["icici_before_start"] == 0
     assert deada["icici_stored"] == 45 and deada["to_do"] == 0
     assert merged[merged.index.str.startswith("DEADD")].iloc[0]["state"] == "NOT_IN_ICICI"
     assert merged[merged.index.str.startswith("DEADC")].iloc[0]["state"] == "REVIEW"
     assert merged[merged.index.str.startswith("DEADB")].iloc[0]["state"] == "FILLED"
     out = idl.status(f, now=NOW, log=q)["text"]
-    assert "ICICI_EMPTY 4, ICICI_BEFORE_START 2" in out and "REVIEW stocks: 1" in out
+    assert "ICICI_EMPTY 6, ICICI_BEFORE_START 0" in out and "REVIEW stocks: 1" in out
     assert f"Calls used today ({NOW.date()})" in out and "Not in ICICI: 1 stocks" in out
     assert cli.main(["coverage", "--folder", f]) == 0
     assert "ICICI_BEFORE_START" in capsys.readouterr().out
@@ -369,7 +371,7 @@ def test_finished_day_rule(world, monkeypatch):
     ip.plan(other, client=FakeBreeze(), now=NOW, log=q)
     orig = idl.work_items
     late = datetime.combine(DAYS[3], dtime(2, 0), tzinfo=mp.IST)
-    monkeypatch.setattr(idl, "work_items", lambda *a: orig(*a[:-1], now=late))
+    monkeypatch.setattr(idl, "work_items", lambda *a: orig(*a[:8], late, *a[9:]))
     dl(other, symbols=["LIVE1"], now=evening)
     assert DAYS[2] not in days_of(other, "LIVE1").index
     monkeypatch.setattr(idl, "work_items", orig)
@@ -464,3 +466,126 @@ def test_symbol_only_scales():
     assert ok and s == 2.0
     assert not idl.scale_ok({"close": 70.0, "high": 77.0, "low": 63.0},
                             {"close": 100.0, "high": 110.0, "low": 90.0}, [1.0, 2.0])[0]
+
+
+# ---- the start check of the first-minute-day search ----
+
+def check_row(f, sym):
+    db = idl.Progress(f, write=False)
+    row = db.start_check(sid(f, sym))
+    db.close()
+    return row
+
+
+def samples_of(row, rnd=None):
+    return [(s["date"], s["bars"] > 0) for s in json.loads(row["samples"]) if rnd is None or s["round"] == rnd]
+
+
+def minute_calls(fake, sym):
+    return [c[2:] for c in fake.historical_calls("1minute") if c[0] == STOCKS[sym]["code"]]
+
+
+def test_start_check_sample_with_minutes_searches_again(world, monkeypatch):
+    monkeypatch.setitem(STOCKS["DEADA"], "empty", {12})        # an empty day on the search path: it says day 13
+    dl(world, symbols=["DEADA"])
+    row = check_row(world, "DEADA")
+    assert (row["first_before"], row["first_after"], row["result"], row["rounds"]) == \
+        (str(DAYS[13]), str(DAYS[5]), "MOVED", 2)
+    assert samples_of(row, 1) == [(str(DAYS[6]), True), (str(DAYS[3]), False), (str(DAYS[9]), True)]
+    assert samples_of(row, 2) == [(str(DAYS[1]), False), (str(DAYS[2]), False)]
+    a = days_of(world, "DEADA")
+    assert all(a.loc[DAYS[i], "minute_rows"] > 0 for i in range(5, 12)) and a.loc[DAYS[12], "check"] == idl.EMPTY
+    db = idl.Progress(world, write=False)
+    assert db.stock(sid(world, "DEADA"))["first_minute_day"] == str(DAYS[5])
+    db.close()
+    assert "1 moved" in idl.status(world, now=NOW, log=q)["text"]
+
+
+def test_start_check_keeps_the_start_and_is_not_repeated(world):
+    fake = FakeBreeze()
+    dl(world, fake, symbols=["DEADA"], days_per_stock=2)
+    row = check_row(world, "DEADA")
+    assert (row["first_before"], row["first_after"], row["result"], row["rounds"]) == \
+        (str(DAYS[5]), str(DAYS[5]), "KEPT", 1)
+    assert samples_of(row) == [(str(DAYS[1]), False), (str(DAYS[2]), False)]   # the only unprobed days before 5
+    assert (DAYS[1], DAYS[1]) in minute_calls(fake, "DEADA") and (DAYS[2], DAYS[2]) in minute_calls(fake, "DEADA")
+    again = FakeBreeze()
+    dl(world, again, symbols=["DEADA"], days_per_stock=2)
+    assert check_row(world, "DEADA") == row                                     # never repeated
+    assert not any(a == b and a < DAYS[5] for a, b in minute_calls(again, "DEADA"))
+    text = idl.status(world, now=NOW, log=q)["text"]
+    assert "Start checks: 1 done (1 kept, of which 0 still NONE; 0 moved, of which 0 from NONE), 2 sample calls; " \
+           "0 pending" in text
+
+
+def test_start_check_of_a_stock_searched_before_runs_first(world):
+    dl(world, symbols=["DEADA"], days_per_stock=2)
+    db = idl.Progress(world)                     # as a progress file from before the start check: no row, no samples
+    db.write("DELETE FROM start_checks")
+    for d in (DAYS[1], DAYS[2]):
+        db.write("DELETE FROM chunks WHERE security_id = ? AND interval = 'minute' AND chunk_from = ?",
+                 (sid(world, "DEADA"), str(d)))
+    db.close()
+    fake = FakeBreeze()
+    dl(world, fake, symbols=["DEADA"], days_per_stock=2)
+    assert minute_calls(fake, "DEADA")[:2] == [(DAYS[1], DAYS[1]), (DAYS[2], DAYS[2])]   # before any minute chunk
+    assert check_row(world, "DEADA")["result"] == "KEPT"
+
+
+def test_start_check_of_none_finds_the_minutes(world, monkeypatch):
+    monkeypatch.setitem(STOCKS["DEADA"], "empty", set(range(41, 51)))   # the last needed days are empty: NONE
+    dl(world, symbols=["DEADA"])
+    row = check_row(world, "DEADA")
+    assert (row["first_before"], row["first_after"], row["result"]) == (idl.NONE, str(DAYS[5]), "MOVED")
+    assert samples_of(row, 1) == [(str(DAYS[25]), True), (str(DAYS[12]), True), (str(DAYS[37]), True)]
+    a = days_of(world, "DEADA")
+    assert all(a.loc[DAYS[i], "minute_rows"] > 0 for i in range(5, 41) if i != 33)
+    assert all(a.loc[DAYS[i], "check"] == idl.EMPTY for i in range(41, 51))
+    db = idl.Progress(world, write=False)
+    assert db.stock(sid(world, "DEADA"))["first_minute_day"] == str(DAYS[5])     # not NONE
+    db.close()
+    assert "1 moved, of which 1 from NONE" in idl.status(world, now=NOW, log=q)["text"]
+
+
+def test_start_check_keeps_none(world, monkeypatch):
+    monkeypatch.setitem(STOCKS["DEADA"], "start", 99)                   # ICICI has no minutes at all
+    dl(world, symbols=["DEADA"])
+    row = check_row(world, "DEADA")
+    assert (row["first_before"], row["first_after"], row["result"]) == (idl.NONE, idl.NONE, "KEPT")
+    assert samples_of(row) == [(str(DAYS[25]), False), (str(DAYS[12]), False), (str(DAYS[37]), False)]
+    a = days_of(world, "DEADA")
+    note = a.loc[DAYS[1], "note"]
+    assert a.loc[DAYS[1], "check"] == idl.BEFORE_START and \
+        f"samples {DAYS[25]}, {DAYS[12]}, {DAYS[37]} without minutes" in note
+    assert a.loc[DAYS[25], "check"] == idl.EMPTY
+    assert "1 kept, of which 1 still NONE" in idl.status(world, now=NOW, log=q)["text"]
+
+
+def test_failed_sample_records_nothing_and_checks_next_run(world):
+    code = STOCKS["DEADA"]["code"]
+    fake = FakeBreeze(fail={(code, "1minute", DAYS[1])})
+    dl(world, fake, symbols=["DEADA"], days_per_stock=2)
+    assert check_row(world, "DEADA") == {}
+    assert sum(1 for c in fake.historical_calls() if c[:3] == (code, "1minute", DAYS[1])) == idl.RETRIES
+    later = FakeBreeze()
+    dl(world, later, symbols=["DEADA"], days_per_stock=2)
+    assert check_row(world, "DEADA")["result"] == "KEPT"
+    assert (DAYS[1], DAYS[1]) in minute_calls(later, "DEADA")
+
+
+def test_session_timeout_at_start_ends_the_run(world, monkeypatch, capsys):
+    res = dl(world, FakeBreeze(session_error=ic.IciciFailed("customerdetails: ReadTimeout: timed out")))
+    assert "ReadTimeout" in res["stats"]["failed"]
+    db = idl.Progress(world, write=False)
+    runs = db.rows("SELECT * FROM runs")
+    db.close()
+    assert len(runs) == 1 and runs[0]["result"] == "failed: session" and runs[0]["ended"]
+    assert os.path.isfile(os.path.join(st.check_dir(world), "summary.json"))
+    assert os.path.isfile(os.path.join(st.check_dir(world), "coverage.csv"))
+    monkeypatch.setattr(ic.BreezeClient, "from_env", classmethod(
+        lambda cls, env=None, session=None: FakeBreeze(session_error=ic.IciciFailed("timed out"))))
+    assert cli.main(["download", "--folder", world]) == 1
+    assert "Not run: timed out" in capsys.readouterr().err
+    db = idl.Progress(world, write=False)
+    assert all(r["result"] != "running" for r in db.rows("SELECT * FROM runs"))
+    db.close()

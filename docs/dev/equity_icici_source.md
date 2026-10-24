@@ -84,8 +84,26 @@ not used. `requests` calls only these three endpoints (a test checks that no oth
      - Days before the first minute day that were not probed are `ICICI_BEFORE_START`: inferred, not fetched.
      - Probed days without bars are `ICICI_EMPTY`: fetched, empty answer.
      - When even the last needed day is empty, the first minute day is `NONE`.
-     - Limit: an ICICI day without minutes on the search path can make the search land later. The days before it
-       are then `ICICI_BEFORE_START`, never wrong data.
+     - An ICICI day without minutes on the search path can make the search land late. The start check catches this
+       (below).
+  2b. **Start check** (24 Oct; `start_check`, `sample_days`). It runs when the search gave a first minute day D
+     after the first needed day, or NONE, and the progress db has no `start_checks` row for the stock.
+     - **Samples:** 3 single days (`START_SAMPLES`). Each is the middle of the largest run of unfetched needed days
+       before D (NONE: over the whole range), between boundaries (-1, D, and every day already fetched; ties: the
+       earlier run). Each pick becomes a boundary. Fewer unfetched days: all of them.
+     - **Calls:** normal single-day chunks, counted in the quota, not counted in `--days-per-stock`.
+     - **No sample with minutes:** `KEPT`. D (or NONE) stays, and the ICICI_BEFORE_START rows note "start check
+       <date>: samples a, b, c without minutes".
+     - **A sample with minutes:** search again over the needed days up to the earliest such sample, save the new
+       D, then a new round on it (at most `START_ROUNDS` = 5; each moves D earlier). Result `MOVED`.
+     - **Record:** `start_checks` (first_before, first_after, samples JSON [{date, bars, round}], result, rounds,
+       checked_at, run_id) is written once and never repeated.
+     - **A failed sample or re-search call:** no row is written. The next run checks again and reuses the samples
+       already fetched.
+     - **Stocks searched by an earlier run** (a pending check: a stored D, no row) are checked in a pass at the start
+       of `download`, in plan order, before any minute call of the run. A DONE stock with a pending check is put
+       back on the work list for it.
+     - The NONE case runs before the SYMBOL_ONLY "no minutes, nothing stored" shortcut.
   3. **SYMBOL_ONLY price check** on the first day with minutes, before anything is stored. ICICI's day candle (else
      its minute aggregates) must be within 2% of the bhavcopy close, high and low at an explainable scale. The
      allowed scales are 1.0, our cumulative factor that day, and that factor over each later factor level of the
@@ -108,7 +126,12 @@ not used. `requests` calls only these three endpoints (a test checks that no oth
   - a rejected session gives exit 2;
   - a rate-limit answer backs off 60 s and retries, and a second one in a row stops the run (exit 1);
   - another failure retries 3 times, then the chunk is FAILED with ICICI's redacted text in `errors`, and the run
-    goes on (exit 1; the next run retries it).
+    goes on (exit 1; the next run retries it);
+  - a start-of-run `customerdetails` call that fails 3 times (timeout, network, server) ends the run like the other
+    stops. The run row gets result `failed: session` and `ended`, the check and coverage files are rebuilt, and the
+    CLI prints "Not run: <error>" and exits 1.
+- **Timeouts:** each request has `timeout=60` (the master download 180 s). A timeout is `IciciFailed`, so a call
+  is tried at most 3 times (waits 2 s, 4 s), and every try counts in the quota.
 - **Resume:** a restart skips every DONE / EMPTY chunk and builds chunks a killed run left staged. A run left
   `running` by a killed process becomes `ABORTED`.
 - **Progress db** `download_progress.sqlite` (WAL):
@@ -200,8 +223,10 @@ rebuilds them at its end.
   - per priority: stocks done / partly / not started / REVIEW, NOT_IN_ICICI, days stored, `ICICI_EMPTY` and
     `ICICI_BEFORE_START`;
   - calls used today and left under the cap, and the calls still needed with the quota days;
-  - chunks and FAILED chunks with their error, REVIEW stocks, errors, ABORTED runs, and the last run with its peak
-    memory.
+  - chunks and FAILED chunks with their error;
+  - the start checks: done (kept, of which still NONE; moved, of which from NONE), sample calls, pending, and each
+    MOVED stock;
+  - REVIEW stocks, errors, ABORTED runs, and the last run with its peak memory.
 - **`coverage`** (`check/coverage.csv`, also printed after a download): per `kite_gaps.csv` 1MIN / BOTH row:
   - columns: days, Kite-covered, ICICI needed / stored / empty / before start, to do, still missing;
   - state `FILLED` (every ICICI day has minutes), `PARTLY`, `MISSING`, `NOT_IN_ICICI`, `REVIEW`, or `KITE` (the Kite
@@ -266,4 +291,12 @@ candle).
   - the finished-day rule on both nets;
   - `--days-per-stock`;
   - locks, `equity_update.lock` and ABORTED runs;
-  - `derive` on a hand-built example (levels, SCALE_UNSURE, next-day fallback, SCALE_STEP) and the allowed scales.
+  - `derive` on a hand-built example (levels, SCALE_UNSURE, next-day fallback, SCALE_STEP) and the allowed scales;
+  - the start check:
+    - a sample with minutes searches again (13 -> 5, 2 rounds);
+    - no minutes keeps the start, and the check is not repeated;
+    - a stock searched before the change is checked first in the next run;
+    - NONE moved to the real start, and NONE kept (noted);
+    - a failed sample records nothing;
+    - the status line;
+  - a session timeout at the start leaves no `running` row (exit 1).

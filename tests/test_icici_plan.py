@@ -197,14 +197,16 @@ class FakeBreeze:
     later raise IciciSignIn; rate_at: historical call numbers answering with a rate limit; fail: (code, interval,
     from) calls that fail; big: codes with 600 bars a day (a 2-day answer is cut to its last 1,000)."""
 
-    def __init__(self, auth_after=None, rate_at=(), fail=(), big=(), reject=False, extra_master=()):
+    def __init__(self, auth_after=None, rate_at=(), fail=(), big=(), reject=False, extra_master=(), session_error=None):
         self.calls, self.n = [], 0
         self.auth_after, self.rate_at, self.fail, self.big = auth_after, set(rate_at), set(fail), set(big)
-        self.reject, self.extra_master = reject, extra_master
+        self.reject, self.extra_master, self.session_error = reject, extra_master, session_error
         self.by_code = {s["code"]: sym for sym, s in STOCKS.items() if s["code"]}
 
     def customer(self):
         self.calls.append(("session",))
+        if self.session_error is not None:
+            raise self.session_error
         if self.reject:
             raise ic.IciciSignIn("ICICI rejected the session (HTTP 200: Invalid session.): " + ic.SIGN_IN)
         return ["idirect_userid"]
