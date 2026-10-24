@@ -2,15 +2,20 @@
 icici_store.py; docs/dev/equity_icici_source.md). A separate source and store: equity_1min_icici/; the Kite store
 equity_1min/ is only read.
 
-    python icici_minute.py plan [--market-wide 1|2|3] [--offline]
+    python icici_minute.py plan [--market-wide 1|2|3] [--offline] [--dry-run]
                                      the work list from kite_gaps.csv minus the days the Kite store has, matched to
-                                     ICICI stock codes (ISIN first); one download of ICICI's security master
+                                     ICICI stock codes (ISIN first); one download of ICICI's security master;
+                                     --dry-run: the saved master, nothing written, what the new list adds and that
+                                     the progress made so far is kept
     python icici_minute.py download [--priority 1|2|3] [--symbols A,B] [--limit N] [--max-calls 4800]
                                     [--days-per-stock N] [--speed 90]
                                      ICICI 1-minute and day candles, one stock at a time, paced (calls a minute) and
                                      capped (calls a day, counted across runs); resumable
     python icici_minute.py status    plan totals, progress, calls used today, errors, REVIEW stocks (offline)
     python icici_minute.py checks    rebuild check/icici_check.csv, summary.json, scale_steps.csv (offline)
+    python icici_minute.py checks --rederive [--apply]
+                                     derive every stored days.parquet again from the stored bars (offline) and show
+                                     the label changes; --apply writes them (backup in archive/rederive_<time>/)
     python icici_minute.py coverage  which kite_gaps.csv rows are filled, partly filled or still missing (offline)
     python icici_minute.py show KEY  the plan row, progress and stored days of one company (offline)
 
@@ -86,9 +91,9 @@ def show(key, folder, n):
     starts = db.start_checks()
     db.close()
     found = 0
-    cols = ["date", "symbol", "check", "minute_rows", "bars_outside", "first_bar", "last_bar", "icici_close",
-            "bhav_close", "ratio", "icici_scale", "icici_volume_scale", "vol_ratio", "minute_volume", "bhav_volume",
-            "conversion_from"]
+    cols = ["date", "symbol", "check", "minute_rows", "bars_outside", "first_bar", "last_bar", "session_high",
+            "session_low", "bhav_high", "bhav_low", "icici_close", "bhav_close", "ratio", "icici_scale",
+            "icici_volume_scale", "vol_ratio", "minute_volume", "bhav_volume", "conversion_from"]
     with pd.option_context("display.width", 250, "display.max_columns", 30, "display.max_colwidth", 60):
         for sid in ids:
             p = plan[plan["security_id"] == sid]
@@ -112,7 +117,7 @@ def show(key, folder, n):
                 print(f"Stored days: {len(d):,} ({int((d['minute_rows'] > 0).sum()):,} with minutes); checks: " +
                       ", ".join(f"{k} {v:,}" for k, v in sorted(counts.items())))
                 with_min = d[d["minute_rows"] > 0]
-                print(with_min[cols].head(n).to_string(index=False))
+                print(with_min[[c for c in cols if c in with_min]].head(n).to_string(index=False))
             print()
     if not found:
         print(f"{key}: not in the ICICI plan.", file=sys.stderr)
@@ -127,6 +132,8 @@ def main(argv=None):
     pl.add_argument("--market-wide", type=int, choices=(1, 2, 3), default=ip.MARKET_WIDE,
                     help="add the market-wide gap days for live stocks of priority <= N (default 1)")
     pl.add_argument("--offline", action="store_true", help="use the newest saved ICICI security master")
+    pl.add_argument("--dry-run", action="store_true",
+                    help="write nothing: compare the new work list with the current one and the progress")
     dl = sub.add_parser("download", help="ICICI 1-minute candles of the plan's stocks (resumable)")
     dl.add_argument("--priority", type=int, choices=(1, 2, 3), help="only this priority")
     dl.add_argument("--symbols", help="only these companies, comma-separated (any symbol they ever had)")
@@ -140,7 +147,11 @@ def main(argv=None):
                     help=f"calls a minute (default {ip.SPEED}, at most {ip.MAX_SPEED})")
     stt = sub.add_parser("status", help="progress, offline")
     stt.add_argument("--max-calls", type=positive, default=ip.MAX_CALLS, help="the daily cap to compare with")
-    sub.add_parser("checks", help="rebuild the check files, offline")
+    ck = sub.add_parser("checks", help="rebuild the check files, offline")
+    ck.add_argument("--rederive", action="store_true",
+                    help="derive every stored days.parquet again from the stored bars (a dry run without --apply)")
+    ck.add_argument("--apply", action="store_true", help="with --rederive: write (the current files are backed up "
+                                                         "to archive/rederive_<time>/ first)")
     sub.add_parser("coverage", help="which kite_gaps.csv rows are filled, offline")
     sh = sub.add_parser("show", help="one company: plan, progress, stored days")
     sh.add_argument("key", help="any symbol or ISIN it ever had")
@@ -153,6 +164,10 @@ def main(argv=None):
     folder = args.folder or equity_data_dir()
     try:
         if args.cmd == "plan":
+            if args.dry_run:
+                res = ip.plan(folder, market_wide=args.market_wide, dry_run=True, preview=idl.plan_preview)
+                print(res["preview"]["text"])
+                return 0
             res = ip.plan(folder, market_wide=args.market_wide, offline=args.offline)
             print(f"Written to {res['out']}")
             return 0
@@ -165,7 +180,12 @@ def main(argv=None):
             idl.status(folder, max_calls=args.max_calls)
             return 0
         if args.cmd == "checks":
-            idl.checks(folder)
+            if args.apply and not args.rederive:
+                p.error("--apply needs --rederive")
+            if args.rederive:
+                idl.rederive(folder, apply=args.apply)
+            else:
+                idl.checks(folder)
             return 0
         if args.cmd == "coverage":
             df = idl.coverage(folder, write=True)

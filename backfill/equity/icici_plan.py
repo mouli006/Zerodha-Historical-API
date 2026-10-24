@@ -380,18 +380,27 @@ def report(plan, rows_df, counts, master_path, max_calls=MAX_CALLS):
     return "\n".join(lines) + "\n"
 
 
-def plan(folder=None, client=None, market_wide=MARKET_WIDE, offline=False, now=None, log=print):
+def plan(folder=None, client=None, market_wide=MARKET_WIDE, offline=False, now=None, log=print, dry_run=False,
+         preview=None):
     """Build the ICICI work list (Part A). Refuses while equity_update.py or an input build runs, or the lock is
-    busy (exit 2); NotBuilt when kite_gaps.csv or an input is missing (exit 1)."""
+    busy (exit 2); NotBuilt when kite_gaps.csv or an input is missing (exit 1). dry_run: the saved master (no
+    network), no plan file written (only the derived bhavcopy cache may be refreshed, as by any plan); preview(folder,
+    result) runs under the lock and its text is returned as result["preview"]."""
     folder = folder or config.equity_data_dir()
     refuse_busy(folder)
     inp = mp.Inputs(folder, bhav=False)
-    lock = RunLock(st.lock_path(folder)).acquire("icici_minute.py plan")
+    lock = RunLock(st.lock_path(folder)).acquire("icici_minute.py plan" + (" --dry-run" if dry_run else ""))
     try:
         today = md.as_ist(now).date()
-        path, _ = get_master(folder, client, today, offline, log)
+        path, _ = get_master(folder, client, today, offline or dry_run, log)
         master = read_master(path)
         p, days, rows_df, counts = build(folder, inp, master, market_wide, log)
+        if dry_run:
+            res = {"plan": p, "days": days, "rows": rows_df, "counts": counts, "inp": inp, "master": path,
+                   "market_wide": market_wide, "report": report(p, rows_df, counts, path)}
+            if preview:
+                res["preview"] = preview(folder, res)
+            return res
         out = st.plan_dir(folder)
         os.makedirs(out, exist_ok=True)
         sm.write_csv(p, os.path.join(out, "icici_plan.csv"))

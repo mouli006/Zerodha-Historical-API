@@ -57,11 +57,11 @@ FIELDS = mp.FIELDS
 DAY_COLUMNS = ["date", "symbol", "series"] + [f"icici_{f}" for f in FIELDS] + [f"bhav_{f}" for f in FIELDS] + \
     ["our_factor", "ratio", "icici_scale", "icici_scale_measured", "icici_volume_scale", "vol_ratio", "kind",
      "minute_rows", "bars_outside", "first_bar", "last_bar", "minute_open", "minute_high", "minute_low",
-     "minute_close", "minute_volume", "check", "conversion_from", "note", "icici_code", "match_kind", "fetched_at",
-     "run_id"]
+     "minute_close", "minute_volume", "session_high", "session_low", "check", "conversion_from", "note",
+     "icici_code", "match_kind", "fetched_at", "run_id"]
 CHECK_COLUMNS = ["security_id", "symbol", "priority", "date", "check", "icici_scale", "icici_volume_scale",
-                 "minute_high", "minute_low", "minute_volume", "bars_outside", "bhav_high", "bhav_low", "bhav_close",
-                 "bhav_volume", "note"]
+                 "minute_high", "minute_low", "session_high", "session_low", "minute_volume", "bars_outside",
+                 "bhav_high", "bhav_low", "bhav_close", "bhav_volume", "note"]
 COVERAGE_COLUMNS = ["row", "data_missing", "security_id", "symbols", "reason", "need_from", "need_to", "priority",
                     "stocks", "days", "kite_covered", "icici_needed", "icici_stored", "icici_empty",
                     "icici_before_start", "to_do", "still_missing", "state"]
@@ -201,7 +201,9 @@ class Progress:
 
 def aggregates(minutes):
     """{date: minute aggregates} of stored bars: bars_outside counts the stored bars outside 09:15-15:29; the other
-    aggregates use minute_store.clean_bars (non-positive bars dropped), as Kite's."""
+    aggregates use minute_store.clean_bars (non-positive bars dropped), as Kite's. session_high / session_low (what
+    HIGHLOW_DIFF / CLOSE_DIFF compare) use only the clean bars inside 09:15-15:29, or every clean bar of a day with
+    none there (an evening session)."""
     out = {}
     if not len(minutes):
         return out
@@ -215,6 +217,10 @@ def aggregates(minutes):
                         "minute_open": g["open"].first(), "minute_high": g["high"].max(),
                         "minute_low": g["low"].min(), "minute_close": g["close"].last(),
                         "minute_volume": g["volume"].sum()})
+    inside = c[~st.outside_session(c["ts"])]
+    gi = inside.groupby("_d", sort=True)
+    agg["session_high"] = gi["high"].max().reindex(agg.index).fillna(agg["minute_high"])
+    agg["session_low"] = gi["low"].min().reindex(agg.index).fillna(agg["minute_low"])
     for day in sorted(set(d)):
         row = agg.loc[day].to_dict() if day in agg.index else {"minute_rows": 0, "first_bar": "", "last_bar": ""}
         row["bars_outside"] = int(outside.get(day, 0))
@@ -304,7 +310,10 @@ def derive(rows, day_candles, bhav, factors, sid, near_action=lambda d: "", code
     has_bhav = d["bhav_close"].notna().to_numpy()
     before = d["before_start"].to_numpy(bool)
     fetched = d["fetched"].to_numpy(bool)
-    mh, ml, mv = (d[f"minute_{x}"].to_numpy(float) for x in ("high", "low", "volume"))
+    for x in ("high", "low"):              # the 09:15-15:29 range (older frames without it: every bar)
+        d[f"session_{x}"] = d[f"session_{x}"].fillna(d[f"minute_{x}"]) if f"session_{x}" in d else d[f"minute_{x}"]
+    mh, ml = d["session_high"].to_numpy(float), d["session_low"].to_numpy(float)
+    mv = d["minute_volume"].to_numpy(float)
     bhh, bll, bcc, bvv = (d[f"bhav_{x}"].to_numpy(float) for x in ("high", "low", "close", "volume"))
     half = mp.HALF_TICK * scale
     with np.errstate(invalid="ignore"):
@@ -413,14 +422,27 @@ def allowed_scales(factors, sid, day):
 
 # ---- the run ----
 
+def covered_days(db, cal, sid, interval):
+    """{trading day: (bars that day, chunk row)} of the DONE / EMPTY chunks of a stock."""
+    out = {}
+    for c in db.chunks(sid):
+        if c["interval"] != interval or c["status"] not in ("DONE", "EMPTY"):
+            continue
+        a, b = sm.as_date(c["chunk_from"]), sm.as_date(c["chunk_to"])
+        bars = json.loads(c["day_bars"] or "{}")
+        for d in cal[bisect_left(cal, a):bisect_right(cal, b)]:
+            out[d] = (bars.get(iso(d), 0), c)
+    return out
+
+
 class Runner:
-    def __init__(self, folder, inp, client, speed, max_calls, days_per_stock, run_id, clock, log):
+    def __init__(self, folder, inp, client, speed, max_calls, days_per_stock, run_id, clock, log, db=None):
         self.folder, self.inp, self.client = folder, inp, client
         self.cal = inp.days
         self.limiter = RateLimiter(speed / 60)
         self.max_calls, self.days_per_stock = max_calls, days_per_stock
         self.run_id, self.clock, self.log = run_id, clock, log
-        self.db = Progress(folder)
+        self.db = db or Progress(folder)
         self.calls = 0
         self.rate_hits = 0
         self.stats = {"stocks": 0, "built": 0, "chunks": 0, "rows": 0, "calls": 0, "failed_chunks": 0,
@@ -481,16 +503,7 @@ class Runner:
     # -- per stock state --
 
     def covered(self, sid, interval):
-        """{trading day: (bars that day, chunk row)} of the DONE / EMPTY chunks of a stock."""
-        out = {}
-        for c in self.db.chunks(sid):
-            if c["interval"] != interval or c["status"] not in ("DONE", "EMPTY"):
-                continue
-            a, b = sm.as_date(c["chunk_from"]), sm.as_date(c["chunk_to"])
-            bars = json.loads(c["day_bars"] or "{}")
-            for d in self.cal[bisect_left(self.cal, a):bisect_right(self.cal, b)]:
-                out[d] = (bars.get(iso(d), 0), c)
-        return out
+        return covered_days(self.db, self.cal, sid, interval)
 
     def save_chunk(self, sid, code, interval, a, b, bars, day_bars, status, fetched, secs, error=""):
         self.db.save("chunks", CHUNK_FIELDS, {
@@ -839,6 +852,12 @@ class Runner:
         self.finish_stock(item, days)
 
     def write_days(self, item, days):
+        out = self.days_frame(item, days)
+        if out is not None:
+            ms.write_days(out, os.path.join(st.stock_dir(self.folder, item["security_id"]), st.DAYS_FILE))
+
+    def days_frame(self, item, days):
+        """The days.parquet frame of one stock from its stored bars, chunks and start check (None: no day)."""
         sid = item["security_id"]
         path = st.stock_dir(self.folder, sid)
         minutes = ms.read_minutes(path)
@@ -860,16 +879,15 @@ class Runner:
         for d in agg:
             rows.setdefault(d, {"fetched": True, "before_start": False, "fetched_at": "", "run_id": ""})
         if not rows:
-            return
+            return None
         frame = pd.DataFrame([{"date": d, **v, **agg.get(d, {"minute_rows": 0, "bars_outside": 0})}
                               for d, v in sorted(rows.items())])
         for c in ("first_bar", "last_bar", "minute_open", "minute_high", "minute_low", "minute_close",
-                  "minute_volume"):
+                  "minute_volume", "session_high", "session_low"):
             if c not in frame:
-                frame[c] = np.nan if c.startswith("minute") else ""
-        out = derive(frame, st.read_day_candles(path), self.bhav(sid), self.inp.factors, sid, self.near_action(sid),
-                     item["icici_code"], item["match_kind"])
-        ms.write_days(out, os.path.join(path, st.DAYS_FILE))
+                frame[c] = np.nan if c.startswith(("minute", "session")) else ""
+        return derive(frame, st.read_day_candles(path), self.bhav(sid), self.inp.factors, sid, self.near_action(sid),
+                      item["icici_code"], item["match_kind"])
 
     def finish_stock(self, item, days):
         sid = item["security_id"]
@@ -938,6 +956,202 @@ def work_items(folder, plan, days, inp, priority=None, symbols=None, limit=None,
     if limit:
         items = items[:limit]
     return items, out, deferred
+
+
+PREVIEW_LINES = 40
+START_CHECK_CALLS = "3-15"       # a start check: 3 samples a round, a new search when one has minutes
+
+
+def plan_preview(folder, res, max_calls=ip.MAX_CALLS):
+    """plan --dry-run: the new work list (res from ip.plan(dry_run=True)) against the current plan and the progress
+    db, read only. Returns {"text", "added", "kept", "watch", ...}. For every needed day a stock with progress gains,
+    what the download would do with it: no call (stored, or in a fetched chunk), inferred ICICI_BEFORE_START, a start
+    check, or a minute fetch (and the day-candle calls of spans no day chunk covers)."""
+    new_plan, new_days, cal = res["plan"], res["days"], res["inp"].days
+    try:
+        old_plan, old_days = ip.read_plan(folder)
+    except mp.NotBuilt:
+        old_plan, old_days = pd.DataFrame(columns=ip.PLAN_COLUMNS), pd.DataFrame(columns=ip.DAY_LIST_COLUMNS)
+    days_by = lambda df: {s: set(g["date"]) for s, g in df.groupby("security_id")}
+    od, nd = days_by(old_days), days_by(new_days)
+    oprio = dict(zip(old_plan["security_id"], old_plan["priority"]))
+    nrow = {r["security_id"]: r for r in new_plan.to_dict("records")}
+    opos = {s: i for i, s in enumerate(old_plan["security_id"], 1)}
+    npos = {s: i for i, s in enumerate(new_plan["security_id"], 1)}
+    db = Progress(folder, write=False)
+    try:
+        stocks, checks, chunks = db.stocks(), db.start_checks(), db.chunks()
+        new_stocks, grown, removed, reprio, watch = [], [], [], [], []
+        refetch = []
+        for sid in sorted(set(nd) | set(od)):
+            add, gone = sorted(nd.get(sid, set()) - od.get(sid, set())), sorted(od.get(sid, set()) - nd.get(sid, set()))
+            r = nrow.get(sid)
+            if gone:
+                removed.append((sid, len(gone)))
+            if r is not None and sid in oprio and int(oprio[sid]) != int(r["priority"]):
+                reprio.append((sid, r["symbol"], int(oprio[sid]), int(r["priority"])))
+            if not add or r is None:
+                continue
+            if sid not in od:
+                new_stocks.append(r)
+                continue
+            s = stocks.get(sid, {})
+            g = {"security_id": sid, "symbol": r["symbol"], "priority": int(r["priority"]), "match_kind":
+                 r["match_kind"], "status": s.get("status") or "not started", "added": len(add), "stored": 0,
+                 "chunk": 0, "inferred": 0, "start_check": 0, "fetch": 0, "minute_calls": 0, "day_calls": 0,
+                 "not_fetched": 0, "note": ""}
+            if r["match_kind"] not in ip.FETCHABLE or s.get("status") == "REVIEW":
+                g["not_fetched"], g["note"] = len(add), r["match_kind"] if s.get("status") != "REVIEW" else "REVIEW"
+                grown.append(g)
+                continue
+            if not s:                                  # not started: new days join its normal work
+                g["fetch"] = len(add)
+                g["minute_calls"] = ip.minute_calls(add, cal)
+                grown.append(g)
+                continue
+            if s.get("status") == "DONE" and (s.get("reason") or "").startswith("no ICICI minutes"):
+                g["not_fetched"], g["note"] = len(add), "DONE without ICICI minutes: skipped by the download"
+                watch.append(f"{sid} {r['symbol']}: {len(add)} new day(s) never fetched ({s.get('reason')})")
+                grown.append(g)
+                continue
+            resolved = resolved_days(folder, sid)
+            have = covered_days(db, cal, sid, "minute")
+            dhave = covered_days(db, cal, sid, "day")
+            first = s.get("first_minute_day") or ""
+            alldays = sorted(nd[sid])
+            pending = check_pending(first, alldays, checks.get(sid))
+            start = None if not first or first == NONE else sm.as_date(first)
+            fetch_days = []
+            for d in add:
+                if d in resolved:
+                    g["stored"] += 1
+                elif d in have:
+                    g["chunk"] += 1
+                elif first and (start is None or d < start):
+                    if pending:
+                        g["start_check"] += 1
+                    else:
+                        g["inferred"] += 1
+                else:
+                    fetch_days.append(d)
+            g["fetch"] = len(fetch_days)
+            g["minute_calls"] = ip.minute_calls(fetch_days, cal)
+            if start:                       # the download's minute days (stock()): from the start, not in a chunk
+                refetch += [(sid, d) for d in alldays if d >= start and d not in have and d in resolved]
+            if any(d not in have for d in alldays):
+                span = [d for d in cal[bisect_left(cal, alldays[0]):bisect_right(cal, alldays[-1])] if d not in dhave]
+                g["day_calls"] = sum(len(ip.day_call_ranges(a, b, cal)) for a, b, _ in ip.runs_of(span, cal))
+            if g["inferred"] and checks.get(sid):
+                watch.append(f"{sid} {r['symbol']}: {g['inferred']} new day(s) before the first minute day {first} "
+                             f"inferred ICICI_BEFORE_START without a sample (start check already "
+                             f"{checks[sid]['result']})")
+            unresolved = g["added"] - g["stored"]
+            if s.get("status") == "DONE" and unresolved and not (g["fetch"] or g["day_calls"] or pending):
+                watch.append(f"{sid} {r['symbol']}: {unresolved} new day(s) need no call, but nothing is staged, so "
+                             "build keeps the old days.parquet and the stock stays PARTIAL")
+            g["note"] = f"first minute day {first or '-'}" + (", start check pending" if pending else "")
+            grown.append(g)
+        # progress so far (a plan rebuild writes only plan/)
+        kept = {"chunks": {}, "failed_chunks": 0, "start_checks": len(checks), "stocks": {}, "stored_days": 0,
+                "partial": []}
+        for c in chunks:
+            if c["status"] in ("DONE", "EMPTY"):
+                kept["chunks"][c["interval"]] = kept["chunks"].get(c["interval"], 0) + 1
+            else:
+                kept["failed_chunks"] += 1
+        for sid, s in stocks.items():
+            st_ = s.get("status") or "-"
+            kept["stocks"][st_] = kept["stocks"].get(st_, 0) + 1
+            d = stored_days(folder, sid)
+            if d is not None:
+                kept["stored_days"] += int((d["minute_rows"] > 0).sum())
+            if st_ == "PARTIAL":
+                res_d = set() if d is None else set(d["date"])
+                kept["partial"].append({"security_id": sid, "symbol": nrow.get(sid, {}).get("symbol", ""),
+                                        "resolved": len(res_d), "old_needed": len(od.get(sid, ())),
+                                        "new_needed": len(nd.get(sid, ())),
+                                        "left_old": len(od.get(sid, set()) - res_d),
+                                        "left_new": len(nd.get(sid, set()) - res_d),
+                                        "old_pos": opos.get(sid), "new_pos": npos.get(sid)})
+    finally:
+        db.close()
+    fetchable_new = [r for r in new_stocks if r["match_kind"] in ip.FETCHABLE]
+    new_calls = sum(int(r["est_calls"]) for r in fetchable_new)
+    grown_calls = sum(g["minute_calls"] + g["day_calls"] for g in grown)
+    checks_pending = sum(1 for g in grown if g["start_check"])
+    out = {"new_stocks": new_stocks, "grown": grown, "removed": removed, "reprio": reprio, "watch": watch,
+           "kept": kept, "refetch": refetch, "new_calls": new_calls, "grown_calls": grown_calls,
+           "start_checks_new": checks_pending}
+    out["text"] = preview_text(res, out, old_plan, max_calls)
+    return out
+
+
+def preview_text(res, out, old_plan, max_calls):
+    L = [f"plan --market-wide {res['market_wide']} --dry-run (master {os.path.basename(res['master'])}): nothing "
+         "written.", ""]
+    new_plan = res["plan"]
+    L.append(f"Plan now: {len(old_plan):,} stocks; after: {len(new_plan):,} stocks, {len(res['days']):,} days.")
+    mw = res["rows"][res["rows"]["security_id"] == ""]
+    if len(mw):
+        L.append("Market-wide rows (after):")
+        L += [f"  {r.reason} {r.need_from}..{r.need_to}: {r.stocks:,} stocks, {r.days:,} days, "
+              f"{r.kite_covered:,} Kite-covered, {r.icici_days:,} for ICICI" for r in mw.itertuples()]
+    ns = out["new_stocks"]
+    L += ["", f"Added: {len(ns):,} stocks new to the plan, {sum(int(r['trading_days']) for r in ns):,} days, "
+              f"~{out['new_calls']:,} calls (fetchable only)."]
+    by = {}
+    for r in ns:
+        k = (int(r["priority"]), r["life"], r["match_kind"])
+        by[k] = by.get(k, [0, 0, 0])
+        by[k][0] += 1
+        by[k][1] += int(r["trading_days"])
+        by[k][2] += int(r["est_calls"]) if r["match_kind"] in ip.FETCHABLE else 0
+    L += [f"  P{p} {life:<4} {kind:<12} {n:>5,} stocks {d:>7,} days {c:>7,} calls"
+          for (p, life, kind), (n, d, c) in sorted(by.items())]
+    L += [f"  P{r['priority']} {r['symbol']:<14} {r['match_kind']:<12} {int(r['trading_days']):>5,} days "
+          f"{int(r['est_calls']):>4,} calls  {r['need_ranges']}" for r in ns[:PREVIEW_LINES]]
+    if len(ns) > PREVIEW_LINES:
+        L.append(f"  ... {len(ns) - PREVIEW_LINES:,} more")
+    gr = out["grown"]
+    tot = {k: sum(g[k] for g in gr) for k in ("added", "stored", "chunk", "inferred", "start_check", "fetch",
+                                              "not_fetched", "minute_calls", "day_calls")}
+    L += ["", f"Stocks already in the plan that gain days: {len(gr):,}, {tot['added']:,} days: {tot['stored']:,} "
+              f"already stored (no call), {tot['chunk']:,} in a fetched chunk (no call), {tot['inferred']:,} "
+              f"inferred ICICI_BEFORE_START (no call), {tot['start_check']:,} before the start on "
+              f"{out['start_checks_new']:,} stock(s) with a start check pending ({START_CHECK_CALLS} calls each), "
+              f"{tot['fetch']:,} to fetch ({tot['minute_calls']:,} minute + {tot['day_calls']:,} day calls), "
+              f"{tot['not_fetched']:,} never fetched (not in ICICI / REVIEW / no minutes)."]
+    L += [f"  P{g['priority']} {g['symbol']:<14} {g['status']:<11} +{g['added']:,}: stored {g['stored']}, chunk "
+          f"{g['chunk']}, inferred {g['inferred']}, start check {g['start_check']}, fetch {g['fetch']} "
+          f"({g['minute_calls']} + {g['day_calls']} calls), not fetched {g['not_fetched']}; {g['note']}"
+          for g in gr[:PREVIEW_LINES]]
+    if len(gr) > PREVIEW_LINES:
+        L.append(f"  ... {len(gr) - PREVIEW_LINES:,} more")
+    calls = out["new_calls"] + out["grown_calls"]
+    L += ["", f"Calls added: ~{calls:,} (+ {START_CHECK_CALLS} per pending start check) = about "
+              f"{calls / max_calls:.1f} days at {max_calls:,} a day."]
+    L.append(f"Days removed from the plan: {sum(n for _, n in out['removed']):,} on {len(out['removed']):,} stocks"
+             + "".join(f"\n  {sid}: {n:,}" for sid, n in out["removed"][:PREVIEW_LINES]))
+    L.append(f"Priority changes: {len(out['reprio']):,}"
+             + "".join(f"\n  {sid} {sym}: {a} -> {b}" for sid, sym, a, b in out["reprio"][:PREVIEW_LINES]))
+    k = out["kept"]
+    L += ["", "Progress kept (a plan rebuild writes only plan/; the progress db and data/ are not touched):",
+          f"  chunks DONE / EMPTY: " + ", ".join(f"{i} {n:,}" for i, n in sorted(k["chunks"].items()))
+          + f"; FAILED {k['failed_chunks']:,}",
+          f"  start checks recorded: {k['start_checks']:,}",
+          "  stocks: " + ", ".join(f"{s} {n:,}" for s, n in sorted(k["stocks"].items())),
+          f"  stored days with minutes: {k['stored_days']:,}"]
+    for p in k["partial"]:
+        L.append(f"  partly done {p['security_id']} {p['symbol']}: {p['resolved']:,} days resolved; left "
+                 f"{p['left_old']:,} of {p['old_needed']:,} now, {p['left_new']:,} of {p['new_needed']:,} after; "
+                 f"position {p['old_pos']} -> {p['new_pos']}")
+    L.append(f"Stored or fetched days that would be fetched again: {len(out['refetch']):,}")
+    L += ["", f"Points to watch: {len(out['watch']):,}"] + [f"  {w}" for w in out["watch"][:PREVIEW_LINES]]
+    if len(out["watch"]) > PREVIEW_LINES:
+        L.append(f"  ... {len(out['watch']) - PREVIEW_LINES:,} more")
+    L.append("Nothing written. Rebuild with: python icici_minute.py plan --market-wide "
+             f"{res['market_wide']} (only after your OK).")
+    return "\n".join(L) + "\n"
 
 
 def download(folder=None, client=None, priority=None, symbols=None, limit=None, max_calls=ip.MAX_CALLS,
@@ -1046,6 +1260,9 @@ def rebuild_checks(folder, plan=None):
         if d is None:
             continue
         p = int(prio.get(sid, 3))
+        for c in ("session_high", "session_low"):      # a days.parquet written before these columns
+            if c not in d:
+                d[c] = np.nan
         sym = d["symbol"].dropna().iat[-1] if d["symbol"].notna().any() else ""
         outside += int(d["bars_outside"].sum())
         if (d["icici_scale"] != 1).any() or (d["icici_volume_scale"] != 1).any():
@@ -1087,6 +1304,156 @@ def checks(folder=None, log=print):
     log(f"Bars outside 09:15-15:29 (stored unchanged): {res['bars_outside']:,}")
     log(f"Written to {st.check_dir(folder)}")
     return res
+
+
+REDERIVE_GONE = {"HIGHLOW_DIFF", "CLOSE_DIFF"}   # the labels the 09:15-15:29 range may remove
+
+
+def label_counts(frames, prio):
+    """({label: days}, {priority: {label: days}}) over {sid: days frame}."""
+    total, per = {}, {}
+    for sid, d in frames.items():
+        p = str(int(prio.get(sid, 3)))
+        for c in d["check"]:
+            for x in c.split("|"):
+                total[x] = total.get(x, 0) + 1
+                per.setdefault(p, {}).setdefault(x, 0)
+                per[p][x] += 1
+    return total, per
+
+
+def same_value(a, b):
+    if isinstance(a, float) or isinstance(b, float):
+        try:
+            fa, fb = float(a), float(b)
+        except (TypeError, ValueError):
+            return False
+        return (np.isnan(fa) and np.isnan(fb)) or abs(fa - fb) <= 1e-9 * max(1.0, abs(fa), abs(fb))
+    return a == b or (pd.isna(a) and pd.isna(b))
+
+
+def day_changes(sid, old, new):
+    """(label changes, other changes) of one stock: a label change is (sid, symbol, date, old, new); other changes
+    are label changes that are not only HIGHLOW_DIFF / CLOSE_DIFF removed, any other column that moved, and days
+    added or dropped."""
+    labels, other = [], []
+    o, n = old.set_index("date"), new.set_index("date")
+    for d in sorted(set(o.index) - set(n.index)):
+        other.append((sid, o.at[d, "symbol"], d, "day dropped", o.at[d, "check"], ""))
+    for d in sorted(set(n.index) - set(o.index)):
+        other.append((sid, n.at[d, "symbol"], d, "day added", "", n.at[d, "check"]))
+    cols = [c for c in o.columns if c in n.columns and c not in ("check", "session_high", "session_low")]
+    for d in sorted(set(o.index) & set(n.index)):
+        a, b = o.at[d, "check"], n.at[d, "check"]
+        if a != b:
+            labels.append((sid, n.at[d, "symbol"], d, a, b))
+            left = set(a.split("|")) - REDERIVE_GONE or {"OK"}
+            if left != set(b.split("|")):
+                other.append((sid, n.at[d, "symbol"], d, "check", a, b))
+        for c in cols:
+            if not same_value(o.at[d, c], n.at[d, c]):
+                other.append((sid, n.at[d, "symbol"], d, c, o.at[d, c], n.at[d, c]))
+    return labels, other
+
+
+def rederive(folder=None, apply=False, now=None, log=print):
+    """icici_minute.py checks --rederive [--apply]: derive every stored stock's days.parquet again from its stored
+    bars (offline; no ICICI call) and compare with the stored one. The dry run writes nothing (a stale bhavcopy cache
+    raises CacheStale). --apply first backs up every days.parquet and check/ to archive/rederive_<time>/, then
+    replaces the files (all or nothing: restored from the backup on an error) and rebuilds the checks."""
+    folder = folder or config.equity_data_dir()
+    ip.refuse_busy(folder)
+    inp = mp.Inputs(folder, bhav=False)
+    plan, pdays = ip.read_plan(folder)
+    clock = (lambda: md.as_ist(now)) if now else md.now_ist
+    lock = RunLock(st.lock_path(folder)).acquire("icici_minute.py checks --rederive" + (" --apply" if apply else ""))
+    db = None
+    try:
+        db = Progress(folder, write=False)
+        runner = Runner(folder, inp, None, ip.SPEED, ip.MAX_CALLS, None, "rederive", clock, quiet, db=db)
+        runner.cache = md.bhav_cache(folder, inp, quiet, write=apply, out=ip.cache_out(folder))
+        rows = {r["security_id"]: r for r in plan.to_dict("records")}
+        need = {sid: sorted(g["date"]) for sid, g in pdays.groupby("security_id")}
+        prio = dict(zip(plan["security_id"], plan["priority"]))
+        data = st.data_dir(folder)
+        old, new = {}, {}
+        for sid in sorted(os.listdir(data)) if os.path.isdir(data) else []:
+            d = stored_days(folder, sid)
+            if d is None:
+                continue
+            s = db.stock(sid)
+            r = rows.get(sid) or {"icici_code": s.get("code") or "", "match_kind": s.get("match_kind") or ""}
+            item = {"security_id": sid, "icici_code": r["icici_code"], "match_kind": r["match_kind"]}
+            out = runner.days_frame(item, need.get(sid, []))
+            if out is None:
+                continue
+            old[sid], new[sid] = d, out.reset_index(drop=True)
+        labels, other = [], []
+        for sid in old:
+            a, b = day_changes(sid, old[sid], new[sid])
+            labels += a
+            other += b
+        before, per_before = label_counts(old, prio)
+        after, per_after = label_counts(new, prio)
+        res = {"stocks": len(old), "before": before, "after": after, "per_priority_before": per_before,
+               "per_priority_after": per_after, "labels": labels, "other": other, "applied": False, "backup": ""}
+        if apply:
+            res["backup"] = apply_rederive(folder, new, clock())
+            res["applied"] = True
+            rebuild_checks(folder, plan)
+    finally:
+        if db:
+            db.close()
+        lock.release()
+    log(rederive_text(res))
+    return res
+
+
+def apply_rederive(folder, frames, when):
+    """Back up every days.parquet and check/ to archive/rederive_<time>/, then write frames (each file atomic); on an
+    error every file already replaced is put back from the backup. Returns the backup folder."""
+    backup = os.path.join(st.archive_dir(folder), f"rederive_{when:%Y-%m-%d_%H%M%S}")
+    os.makedirs(os.path.join(backup, "data"))
+    for sid in frames:
+        dst = os.path.join(backup, "data", sid)
+        os.makedirs(dst)
+        shutil.copy2(os.path.join(st.stock_dir(folder, sid), st.DAYS_FILE), os.path.join(dst, st.DAYS_FILE))
+    if os.path.isdir(st.check_dir(folder)):
+        shutil.copytree(st.check_dir(folder), os.path.join(backup, "check"))
+    done = []
+    try:
+        for sid, df in frames.items():
+            done.append(sid)
+            ms.write_days(df, os.path.join(st.stock_dir(folder, sid), st.DAYS_FILE))
+    except BaseException:
+        for sid in done:
+            src = os.path.join(backup, "data", sid, st.DAYS_FILE)
+            sm.write_atomic(os.path.join(st.stock_dir(folder, sid), st.DAYS_FILE),
+                            lambda tmp, src=src: shutil.copy2(src, tmp))
+        raise
+    return backup
+
+
+def rederive_text(res, lines=200):
+    out = [f"Re-derived {res['stocks']:,} stocks offline (HIGHLOW_DIFF / CLOSE_DIFF on 09:15-15:29 bars)"
+           + ("" if res["applied"] else ": dry run, nothing written") + "."]
+    keys = sorted(set(res["before"]) | set(res["after"]))
+    out.append(f"{'label':<20} {'before':>8} {'after':>8}")
+    out += [f"{k:<20} {res['before'].get(k, 0):>8,} {res['after'].get(k, 0):>8,}" for k in keys]
+    for p in sorted(set(res["per_priority_before"]) | set(res["per_priority_after"])):
+        b, a = res["per_priority_before"].get(p, {}), res["per_priority_after"].get(p, {})
+        out.append(f"priority {p}: " + ", ".join(f"{k} {b.get(k, 0):,} -> {a.get(k, 0):,}"
+                                                 for k in sorted(set(a) | set(b)) if a.get(k, 0) != b.get(k, 0))
+                   if a != b else f"priority {p}: no change")
+    out.append(f"Days whose label changes: {len(res['labels']):,}")
+    out += [f"  {sid} {sym} {iso(d)}: {a} -> {b}" for sid, sym, d, a, b in res["labels"][:lines]]
+    out.append(f"Other changes (not only HIGHLOW_DIFF / CLOSE_DIFF -> OK): {len(res['other']):,}")
+    out += [f"  {sid} {sym} {iso(d)} {c}: {a} -> {b}" for sid, sym, d, c, a, b in res["other"][:lines]]
+    if res["applied"]:
+        out.append(f"Written; the previous files are in {res['backup']}")
+    else:
+        out.append("Run again with --apply to write (the current files are backed up to archive/ first).")
+    return "\n".join(out)
 
 
 def coverage(folder, write=False):

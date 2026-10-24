@@ -615,3 +615,168 @@ def test_before_start_counted_apart_after_the_start_check(world, monkeypatch, ca
     cov = pd.read_csv(os.path.join(st.check_dir(world), "coverage.csv"), dtype=str, keep_default_na=False)
     deada = cov[(cov["reason"] == "MERGED") & cov["symbols"].str.startswith("DEADA")].iloc[0]
     assert (deada["icici_empty"], deada["icici_before_start"], deada["state"]) == ("8", "13", "PARTLY")
+
+# ---- HIGHLOW_DIFF / CLOSE_DIFF on the 09:15-15:29 bars; checks --rederive ----
+
+def bar_frame(day, bars):
+    return pd.DataFrame([{"ts": pd.Timestamp(datetime.combine(day, t), tz=mp.IST), "open": o, "high": h, "low": l,
+                          "close": c, "volume": 10} for t, o, h, l, c in bars])
+
+
+def test_session_range_skips_pre_open_and_keeps_evening_sessions():
+    m = pd.concat([bar_frame(DAYS[0], [(dtime(9, 7), 100, 150, 100, 100), (dtime(9, 15), 100, 110, 90, 100),
+                                       (dtime(15, 31), 100, 100, 60, 100)]),
+                   bar_frame(DAYS[1], [(dtime(18, 15), 100, 120, 95, 100), (dtime(19, 0), 100, 101, 80, 100)])])
+    agg = idl.aggregates(m)
+    a, b = agg[DAYS[0]], agg[DAYS[1]]
+    assert (a["minute_high"], a["minute_low"], a["session_high"], a["session_low"]) == (150, 60, 110, 90)
+    assert a["bars_outside"] == 2 and a["minute_rows"] == 3
+    assert (b["session_high"], b["session_low"]) == (120, 80) and b["bars_outside"] == 2     # evening: every bar
+
+
+def edit_bars(f, sym, edits):
+    """Change ICICI's stored bars of sym: edits = {day index: {"HH:MM": {column: value}}}."""
+    path = os.path.join(st.stock_dir(f, sid(f, sym)), f"{DAYS[0].year}.parquet")
+    y = pq.read_table(path).to_pandas()
+    for i, by_time in edits.items():
+        for hm, values in by_time.items():
+            at = (y["ts"].dt.date == DAYS[i]) & (y["ts"].dt.strftime("%H:%M") == hm)
+            assert at.sum() == 1
+            for c, v in values.items():
+                y.loc[at, c] = v
+    ms.write_minutes(y, path)
+
+
+def test_pre_open_bar_outside_the_bhav_range_is_ok_a_session_bar_is_not(done_copy):
+    f = done_copy
+    d = days_of(f, "DEADA")
+    bh, bl, bc = (d.loc[DAYS[i], f"bhav_{x}"] for i, x in ((40, "high"), (41, "low"), (44, "close")))
+    hi42 = d.loc[DAYS[42], "bhav_high"]
+    edit_bars(f, "DEADA", {40: {"09:07": {"high": bh * 1.05}},            # pre-open print above the bhav high
+                           41: {"09:07": {"low": bl * 0.9}},              # pre-open print below the bhav low
+                           42: {"12:00": {"high": hi42 * 1.05}},          # a real session bar above the bhav high
+                           44: {"09:07": {"open": bc, "high": bc, "low": bc * 0.99, "close": bc},   # the bhav close
+                                "09:15": {"open": bc * 1.01, "low": bc * 1.01, "close": bc * 1.01},   # only pre-open
+                                "12:00": {"open": bc * 1.01, "low": bc * 1.01, "close": bc * 1.01},
+                                "15:29": {"open": bc * 1.01, "low": bc * 1.01, "close": bc * 1.01,
+                                          "high": bc * 1.011}}})
+    bars = hashes(f, os.path.join("equity_1min_icici", "data"))
+    days_files = {k: v for k, v in bars.items() if k.endswith(st.DAYS_FILE)}
+    res = idl.rederive(f, log=q)                                           # the dry run writes nothing
+    assert hashes(f, os.path.join("equity_1min_icici", "data")) == bars
+    assert not os.path.exists(st.archive_dir(f)) or not any(n.startswith("rederive_")
+                                                            for n in os.listdir(st.archive_dir(f)))
+    changed = {(s, d_): (a, b) for s, _, d_, a, b in res["labels"]}
+    deada = sid(f, "DEADA")
+    assert changed == {(deada, DAYS[42]): ("OK", "HIGHLOW_DIFF"), (deada, DAYS[44]): ("OK", "CLOSE_DIFF")}
+    assert res["after"]["HIGHLOW_DIFF"] == res["before"].get("HIGHLOW_DIFF", 0) + 1
+    assert {(s, d_) for s, _, d_, c, _, _ in res["other"] if c == "check"} == set(changed)   # new labels, not removed
+    assert "dry run, nothing written" in idl.rederive_text(res)
+    res = idl.rederive(f, apply=True, now=NOW, log=q)
+    assert res["applied"] and os.path.isdir(res["backup"]) and os.path.isdir(os.path.join(res["backup"], "check"))
+    backed = hashes(res["backup"], "data")
+    assert sorted(backed.values()) == sorted(days_files.values())         # every old days.parquet backed up
+    after = hashes(f, os.path.join("equity_1min_icici", "data"))
+    assert {k: v for k, v in after.items() if not k.endswith(st.DAYS_FILE)} == \
+        {k: v for k, v in bars.items() if not k.endswith(st.DAYS_FILE)}   # stored bars unchanged
+    a = days_of(f, "DEADA")
+    assert a.loc[DAYS[40], "check"] == "OK" and a.loc[DAYS[41], "check"] == "OK"
+    assert a.loc[DAYS[40], "minute_high"] > bh and a.loc[DAYS[40], "session_high"] < a.loc[DAYS[40], "minute_high"]
+    assert a.loc[DAYS[41], "minute_low"] < bl and (a.loc[DAYS[40:42], "bars_outside"] == 2).all()
+    assert a.loc[DAYS[42], "check"] == "HIGHLOW_DIFF" and a.loc[DAYS[44], "check"] == "CLOSE_DIFF"
+    rows = pd.read_csv(os.path.join(st.check_dir(f), "icici_check.csv"))
+    assert {"session_high", "session_low"} <= set(rows.columns)
+    assert set(rows[rows["symbol"] == "DEADA"]["date"]) >= {str(DAYS[42]), str(DAYS[44])}
+    again = idl.rederive(f, log=q)
+    assert again["labels"] == [] and again["other"] == []                  # derived once, stable
+
+
+def test_rederive_apply_restores_on_an_error(done_copy, monkeypatch):
+    f = done_copy
+    before = hashes(f, os.path.join("equity_1min_icici", "data"))
+    real, calls = ms.write_days, []
+
+    def failing(df, path):
+        calls.append(path)
+        real(df.assign(note="changed"), path)
+        if len(calls) == 2:
+            raise OSError("disk full")
+    monkeypatch.setattr(ms, "write_days", failing)
+    with pytest.raises(OSError):
+        idl.rederive(f, apply=True, now=NOW, log=q)
+    assert len(calls) == 2 and hashes(f, os.path.join("equity_1min_icici", "data")) == before
+    assert any(n.startswith("rederive_") for n in os.listdir(st.archive_dir(f)))
+    assert tmp_files(f) == []
+
+
+def test_rederive_refusals_and_cli(done_copy, capsys):
+    f = done_copy
+    data = hashes(f, os.path.join("equity_1min_icici", "data"))
+    lock = RunLock(st.lock_path(f)).acquire("test")
+    try:
+        assert cli.main(["checks", "--rederive", "--folder", f]) == 2
+        assert cli.main(["checks", "--rederive", "--apply", "--folder", f]) == 2
+    finally:
+        lock.release()
+    up = RunLock(os.path.join(f, "equity_update.lock")).acquire("test")
+    try:
+        assert cli.main(["checks", "--rederive", "--folder", f]) == 2
+    finally:
+        up.release()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--apply", "--folder", f])
+    assert e.value.code == 2
+    capsys.readouterr()
+    assert cli.main(["checks", "--rederive", "--folder", f]) == 0
+    assert "dry run, nothing written" in capsys.readouterr().out
+    assert hashes(f, os.path.join("equity_1min_icici", "data")) == data
+
+
+# ---- plan --dry-run: what a new work list adds, progress kept ----
+
+def preview(f, market_wide=2):
+    return ip.plan(f, market_wide=market_wide, dry_run=True, preview=idl.plan_preview, now=NOW, log=q)
+
+
+def test_plan_dry_run_writes_nothing_and_keeps_progress(done_copy, monkeypatch, capsys):
+    f = done_copy
+    monkeypatch.setattr(config, "load_env", lambda: {})
+    plan, days = ip.read_plan(f)
+    live1 = sid(f, "LIVE1")
+    old = days[~((days["security_id"] == live1) & days["date"].isin(DAYS[:3]))]    # as if added by the new list
+    sm.write_parquet(old, os.path.join(st.plan_dir(f), "icici_plan_days.parquet"))
+    keep = {sub: hashes(f, os.path.join("equity_1min_icici", sub)) for sub in ("plan", "data", "reference")}
+    db = open(idl.db_path(f), "rb").read()
+    res = preview(f)
+    for sub, h in keep.items():
+        assert hashes(f, os.path.join("equity_1min_icici", sub)) == h
+    assert open(idl.db_path(f), "rb").read() == db
+    pv = res["preview"]
+    assert [r["symbol"] for r in pv["new_stocks"]] == ["LIVE2"]
+    assert pv["new_stocks"][0]["priority"] == 2 and pv["new_stocks"][0]["trading_days"] == 3
+    g = {x["symbol"]: x for x in pv["grown"]}
+    assert g["LIVE1"]["added"] == 3 and g["LIVE1"]["stored"] == 3 and g["LIVE1"]["fetch"] == 0
+    assert g["LIVE1"]["minute_calls"] == 0 and g["LIVE1"]["day_calls"] == 0
+    assert pv["refetch"] == [] and pv["removed"] == [] and pv["reprio"] == []
+    assert pv["kept"]["stocks"]["DONE"] >= 3 and pv["kept"]["chunks"]["minute"] > 0
+    assert pv["new_calls"] == int(res["plan"].set_index("symbol").loc["LIVE2", "est_calls"])
+    assert "nothing written" in pv["text"] and "LIVE2" in pv["text"]
+    assert cli.main(["plan", "--market-wide", "2", "--dry-run", "--folder", f]) == 0
+    assert "Progress kept" in capsys.readouterr().out
+    assert hashes(f, os.path.join("equity_1min_icici", "plan")) == keep["plan"]
+    lock = RunLock(st.lock_path(f)).acquire("test")
+    try:
+        assert cli.main(["plan", "--market-wide", "2", "--dry-run", "--folder", f]) == 2
+    finally:
+        lock.release()
+
+
+def test_plan_dry_run_shows_the_partly_done_stock(world, monkeypatch):
+    monkeypatch.setattr(config, "load_env", lambda: {})
+    dl(world, symbols=["DEADA"], days_per_stock=4)
+    pv = preview(world)["preview"]
+    part = {p["symbol"]: p for p in pv["kept"]["partial"]}
+    a = part["DEADA"]
+    assert a["old_needed"] == a["new_needed"] == 51 and 0 < a["left_old"] == a["left_new"] < 51
+    assert a["old_pos"] == a["new_pos"] == 1
+    assert pv["refetch"] == [] and "partly done" in pv["text"]

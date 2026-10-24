@@ -690,6 +690,8 @@ python icici_minute.py plan                     # the work list (kite_gaps.csv m
 python icici_minute.py download --priority 1    # NIFTY 50 stocks first; --max-calls 4800 a day (ICICI allows 5,000), --speed 90 a minute
 python icici_minute.py status                   # progress, calls used today, stocks to review
 python icici_minute.py coverage                 # which kite_gaps.csv rows are now filled
+python icici_minute.py plan --market-wide 2 --dry-run   # what a new work list would add; writes nothing
+python icici_minute.py checks --rederive        # the stored days' checks derived again (a dry run; --apply writes, with a backup)
 ```
 
 - ICICI allows about 5,000 calls a day, and one call covers 1-2 trading days, so the whole list takes several weeks
@@ -701,7 +703,8 @@ python icici_minute.py coverage                 # which kite_gaps.csv rows are n
   `load_minute_icici("HDFC", "2023-02-01", "2023-02-28")`. `prices="ours"` gives split / bonus adjusted prices,
   `prices="icici"` ICICI's own.
 - ICICI also has a 09:07 pre-open bar and 1-3 bars after 15:29 on recent days. They are kept (counted in
-  `bars_outside`). The official close is the bhavcopy close.
+  `bars_outside`). The high / low and close checks against the bhavcopy only look at the 09:15-15:29 bars. The
+  official close is the bhavcopy close.
 - Stocks matched by symbol only are price-checked first. A failed check is listed as REVIEW in `status`, and nothing
   is stored for it.
 - Exit codes: 0 done, stopped, or the daily cap reached; 1 not ready, some calls failed (run it again), or ICICI kept

@@ -64,8 +64,23 @@ not used. `requests` calls only these three endpoints (a test checks that no oth
    - `plan_rows.csv`: per gap row, its days, the Kite-covered days and the ICICI days (for coverage);
    - `plan_report.txt`: stocks / days / calls per priority x life x match, and quota days at 4,800;
    - `plan_info.json`.
-6. **Order:** priority 1, 2, 3; DEAD before LIVE; trading days, largest first; then security_id.
-7. **Estimate:** day calls of up to 900 trading days, plus minute calls in pairs of consecutive needed trading days.
+6. **Dry run** (`plan --dry-run`, 24 Oct): the same refusals and lock, the newest saved master (no network), and
+   no plan file written (only the derived bhavcopy cache may be refreshed, as by any plan). `plan_preview` compares
+   the new list with the current plan and the progress db (read only) and prints:
+   - the stocks new to the plan (per priority x life x match, with calls) and the market-wide rows;
+   - per stock already in the plan, what happens to each day it gains. A day is either already stored or in a
+     fetched chunk (no call), inferred ICICI_BEFORE_START (before the stored first minute day, start check already
+     recorded: no call), before the start with a start check now pending (3-15 calls), or fetched (minute pairs,
+     plus day calls over spans no day chunk covers);
+   - days removed and priority changes;
+   - the progress kept (chunks, start checks, stocks per status, stored days, each PARTIAL stock with its days
+     left and its position before / after);
+   - the stored days the download would fetch again (must be 0);
+   - points to watch: new days inferred without a sample after a recorded start check, a DONE "no ICICI minutes"
+     stock that gains days, and a DONE stock whose new days need no call (build would not rewrite its
+     `days.parquet`).
+7. **Order:** priority 1, 2, 3; DEAD before LIVE; trading days, largest first; then security_id.
+8. **Estimate:** day calls of up to 900 trading days, plus minute calls in pairs of consecutive needed trading days.
    It is an upper bound for most stocks: a stock whose ICICI minutes start later costs up to about 12 search calls
    and skips the days before.
 
@@ -157,11 +172,15 @@ not used. `requests` calls only these three endpoints (a test checks that no oth
   - `our_factor`;
   - `ratio` = bhav close / ICICI close and `vol_ratio` = bhav volume / ICICI day volume (both information only);
   - `icici_scale`, `icici_scale_measured`, `icici_volume_scale`, `kind` (MULTIPLICATIVE);
-  - `minute_rows, bars_outside, first_bar, last_bar, minute_open .. minute_volume`;
+  - `minute_rows, bars_outside, first_bar, last_bar, minute_open .. minute_volume, session_high, session_low`;
   - `check, conversion_from, note, icici_code, match_kind, fetched_at, run_id`.
 - **Aggregates and `bars_outside`:** the minute aggregates use `minute_store.clean_bars`, over all bars. `bars_outside`
   counts the stored bars outside 09:15-15:29 (normally 2-3 a day from about 2023: 09:07, 15:30-15:32). They are kept
   and loaded unchanged; whether a backtest should drop them is left for later.
+- **`session_high` / `session_low`** (24 Oct): the high / low of the clean bars inside 09:15-15:29. A day with no bar
+  there (a Muhurat evening session) uses all its bars. HIGHLOW_DIFF and CLOSE_DIFF compare these, so ICICI's 09:07
+  pre-open print no longer flags a day. A `days.parquet` written before has no such columns: the checks then use
+  `minute_high` / `minute_low`.
 
 ## Conversion to the bhavcopy (decided 24 Oct; evidence from 14 read-only calls that day)
 ICICI's prices are **partly adjusted**: adjusted for the actions up to a freeze around 2017-2018, never for later ones.
@@ -205,8 +224,8 @@ ICICI's day candle is built from its own minutes, so the scaled minutes are chec
 | `DAY_EMPTY` | minutes, no ICICI day candle (converted as the previous day) |
 | `SCALE_UNSURE` | no day candle, and the day lies between two different levels |
 | `SHORT_DAY` | a daytime session whose first bar is after 10:00 or whose last bar is before 15:00 (an evening session from 16:00 is not short) |
-| `HIGHLOW_DIFF` | scaled minute high above the bhav high, or low below the bhav low |
-| `CLOSE_DIFF` | the bhav close outside the scaled minute range |
+| `HIGHLOW_DIFF` | scaled `session_high` (09:15-15:29 bars) above the bhav high, or `session_low` below the bhav low |
+| `CLOSE_DIFF` | the bhav close outside the scaled `session_low .. session_high` |
 | `CLOSING_AUCTION` | the same, with the last bar in 15:00..15:28 (Kite's rule; the official close is the bhavcopy close) |
 | `VOLUME_DIFF` | minute volume x level above bhav x 1.01 + 1 or below bhav x 0.5 |
 | `SCALE_STEP` | a level step with no corporate action within 5 trading days (`minute_download.corporate_actions`) |
@@ -216,6 +235,22 @@ ICICI's day candle is built from its own minutes, so the scaled minutes are chec
 `checks` (offline, takes the lock) rebuilds `check/icici_check.csv` (problem days), `summary.json` (counts per label
 and priority, total `bars_outside`, stocks with a scale) and `scale_steps.csv` from every `days.parquet`. A download
 rebuilds them at its end.
+
+`checks --rederive [--apply]` (24 Oct) derives every stored stock's `days.parquet` again from its stored bars, chunks,
+start check, our bhavcopy cache, the factors and the corporate actions. It is offline (no ICICI call), takes the
+lock and refuses while `equity_update.py` runs.
+- **Dry run** (the default): writes nothing; a stale bhavcopy cache stops it (`CacheStale`, exit 1). It prints the
+  label counts before / after (total and per priority) and every day whose label changes. Shown apart: any change
+  other than HIGHLOW_DIFF / CLOSE_DIFF removed (a new label, another column, a day added or dropped).
+- **`--apply`:**
+  1. Copy every `days.parquet` and `check/` to `archive/rederive_<time>/`.
+  2. Write the new files, each atomic. This is all-or-nothing: on an error, every file already written is put back
+     from the copy.
+  3. Rebuild the check files.
+
+First dry run on the store (24 Oct, 57 stocks): HIGHLOW_DIFF 19 -> 0, OK 9,188 -> 9,205, CLOSE_DIFF 2 -> 4. The two
+new CLOSE_DIFFs are 2021-02-24 (IDFC, JBCHEPHARM), NSE's outage day. ICICI has no bars from about 11:40, then one
+bar after 17:00, so the bhav close from the late session lies outside the 09:15-15:29 range.
 
 ## Status and coverage
 - **`status`** (offline, writes nothing) shows:
@@ -251,8 +286,8 @@ with a `source` column. For a day both sources have, Kite wins (its conversion i
 candle).
 
 ## CLI and exit codes
-`plan [--market-wide 1|2|3] [--offline]`, `download [--priority N] [--symbols A,B] [--limit N] [--max-calls 4800]
-[--days-per-stock N] [--speed 90]`, `status [--max-calls N]`, `checks`, `coverage`, `show KEY [--days N]`, each with
+`plan [--market-wide 1|2|3] [--offline] [--dry-run]`, `download [--priority N] [--symbols A,B] [--limit N] [--max-calls 4800]
+[--days-per-stock N] [--speed 90]`, `status [--max-calls N]`, `checks [--rederive [--apply]]`, `coverage`, `show KEY [--days N]`, each with
 `--folder` (absolute).
 
 | exit | meaning |
@@ -299,4 +334,21 @@ candle).
     - NONE moved to the real start, and NONE kept (noted);
     - a failed sample records nothing;
     - the status line;
-  - a session timeout at the start leaves no `running` row (exit 1).
+  - a session timeout at the start leaves no `running` row (exit 1);
+  - the 09:15-15:29 range:
+    - `aggregates` without the pre-open / 15:31 bars, and an evening session on all its bars;
+    - a 09:07 bar above the bhav high or below the low gives OK;
+    - a 12:00 bar above the bhav high stays HIGHLOW_DIFF;
+    - a bhav close only inside the pre-open bar gives CLOSE_DIFF;
+  - `checks --rederive`:
+    - the dry run leaves every file byte-identical;
+    - `--apply` makes the archive backup, keeps the bars unchanged and rewrites the labels, and a second run
+      finds no change;
+    - an error part-way restores every file;
+    - refusals on the lock and `equity_update.lock`, and `--apply` without `--rederive`;
+  - `plan --dry-run`:
+    - plan, data, reference and the progress db are byte-identical afterwards;
+    - LIVE2 is added at priority 2;
+    - re-added stored days show as "stored", with nothing fetched again;
+    - the partly done stock is shown with its position;
+    - a busy lock gives exit 2.
