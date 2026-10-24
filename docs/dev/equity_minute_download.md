@@ -5,7 +5,8 @@ over several evenings (resumable). Each day is checked against Kite's day candle
 stored by `security_id`, and a loader rebuilds raw or adjusted prices. A small daily `update` follows. Code:
 `backfill/equity/minute_download.py` (work list, download, build, checks, update, status) and
 `backfill/equity/minute_store.py` (file layout, `load_minute`, `clean_bars`); CLI `equity_minute.py download | update |
-status | checks | retoken`.
+status | checks | retoken | fix-negative-volume` (the last: `backfill/equity/minute_negvol.py`,
+docs/dev/equity_minute_negative_volume.md).
 Not part of `equity_update.py` (it needs a Kite sign-in); no dashboard UI.
 
 ## Part 0 findings (Kite, 2026-10-19, 214 requests; also `PART0_FINDINGS`)
@@ -174,7 +175,9 @@ reading the 12 year files), `Calc` grouped it again, and a build held all of a s
 last minute bar is in 15:00..15:28), `HIGHLOW_DIFF` (the scaled minute high above
 the day high, or the low below the day low; a wider day range is normal), `VOLUME_DIFF` (scaled minute volume >
 day x 1.01 + 1 or < day x 0.5), `CANDLE_UNCONFIRMED` (set by `update` only, on a day stored after the deferral cap whose Kite day volume is still the
-summed minute volume; never derived, `checks` keeps it: docs/dev/equity_minute_finished_days.md), `MINUTE_EMPTY` (a day candle and a bhavcopy row, no minutes), `DAY_EMPTY` (minutes
+summed minute volume; never derived, `checks` keeps it: docs/dev/equity_minute_finished_days.md), `NEGATIVE_VOLUME`
+(`neg_volume_bars` > 0: that many minute bars have a negative, i.e. garbage, volume, counted as 0; their volume is
+missing from the day: docs/dev/equity_minute_negative_volume.md), `MINUTE_EMPTY` (a day candle and a bhavcopy row, no minutes), `DAY_EMPTY` (minutes
 and a bhavcopy row, no day candle), `EXTRA_SESSION` (no bhavcopy row), `SCALE_STEP`. A day can carry several,
 `|`-joined. Files in `check/` are rebuilt from every `days.parquet` at the end of a run:
 - `minute_check.csv`: the problem days;
@@ -249,13 +252,15 @@ clean=True)`:
   `clean=False` returns the stored bars exactly (no attrs). The stored files are never rewritten.
 - The day checks use the same cleaned bars: `minute_aggregates` (new builds and `update`'s new days) runs on
   `clean_bars`, so zero bars do not count in `minute_rows`, `first_bar`, OHLC or volume, and a day of only zero bars
-  is MINUTE_EMPTY. Days already stored keep their aggregates (`checks` re-derives from them). `stocks.minute_rows`
+  is MINUTE_EMPTY. A negative volume counts as 0 and `neg_volume_bars` counts those bars (`NEGATIVE_VOLUME`); the
+  volume of such a day from `load_minute` lacks those bars' volume (they read as 0). Days already stored keep their aggregates (`checks` re-derives from them). `stocks.minute_rows`
   stays the number of stored bars.
 
 ## CLI and exit codes
 `download [--dry-run] [--priority N] [--symbols A,B] [--limit N] [--speed 2.5] [--workers 1-4]`, `update`, `status`,
 `checks [--apply]`, `retoken [--apply] [--speed 2.5]`, `repair [--apply] [--limit N] [--speed 2.5]`
-(docs/dev/equity_minute_finished_days.md), each with `--folder`. Exit codes: 0 done / stopped by the user /
+(docs/dev/equity_minute_finished_days.md), `fix-negative-volume [--apply]` (docs/dev/equity_minute_negative_volume.md),
+each with `--folder`. Exit codes: 0 done / stopped by the user /
 dry run; 1 FAILED chunks, not built, stale input, history not done, no bhavcopy for today, retoken left a stock to
 REVIEW; 2 arguments, a lock busy, a Kite F&O run, Kite sign-in needed, not enough
 disk.
@@ -283,6 +288,7 @@ PROBE_RECOVERED (price check on the day before the last bhavcopy day; dry run wr
 plan rows change, kite_gaps.csv etc. untouched, backup, then `download` and `gaps`), still empty -> NO_KITE_DATA,
 price off -> REVIEW (not applied), GEN3 not a candidate, the build never writes the plan folder before the replace,
 an error on the third replace restores every file.
+`tests/test_equity_minute_negative_volume.py`: negative minute volumes (docs/dev/equity_minute_negative_volume.md).
 `tests/test_equity_minute_memory.py`: worlds of 10 and 40 plain stocks over two years (`PlainKite`), the
 tracemalloc peak of a two-worker download plus check rebuild must not grow with the stocks (40 ≤ 10 x 1.15 +
 0.5 MB; the old code grew 2.97 -> 7.43 MB and fails it, the new one 2.76 -> 3.05 MB); the cache rows equal

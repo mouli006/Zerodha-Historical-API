@@ -11,7 +11,8 @@ load_minute() rebuilds raw prices from the stored conversion of each day (docs/d
     volume: raw = Kite minute volume x minute_volume_scale x vol_ratio
 and "ours" divides raw prices by today's cumulative factor of the day (adjustments.factor_on), volume times it.
 With clean=True (default) the stored bars are cleaned first (clean_bars): Kite pads some sessions with all-zero bars,
-and a few bars have a negative volume or a high / low that does not contain the open / close."""
+and a few bars have a negative volume or a high / low that does not contain the open / close. A day whose check has
+NEGATIVE_VOLUME misses the volume of neg_volume_bars bars (counted as 0)."""
 import os
 import re
 from datetime import date
@@ -92,6 +93,8 @@ def read_days(path):
         return None
     df = pq.read_table(p).to_pandas()
     df["date"] = [sm.as_date(d) for d in df["date"]]
+    if "kite_close" in df and "neg_volume_bars" not in df:       # a Kite file stored before the column existed
+        df.insert(df.columns.get_loc("minute_volume") + 1, "neg_volume_bars", np.zeros(len(df), "int64"))
     return df
 
 

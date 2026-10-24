@@ -79,7 +79,8 @@ PROGRESS_EVERY = 10
 AUCTION_FROM, AUCTION_TO = "15:00", "15:29"   # CLOSING_AUCTION: the last minute bar in [15:00, 15:29) (F&O stocks end
 #                                               at 15:14 from 2026-08-03; the 2021-02-24 outage ended 11:43)
 CHECKS = ["EXTRA_SESSION", "DAY_EMPTY", "MINUTE_EMPTY", "HIGHLOW_DIFF", "CLOSE_DIFF", "CLOSING_AUCTION", "VOLUME_DIFF",
-          "SCALE_STEP", "CANDLE_UNCONFIRMED"]
+          "NEGATIVE_VOLUME", "SCALE_STEP", "CANDLE_UNCONFIRMED"]
+NEGATIVE = "NEGATIVE_VOLUME"     # minute bars with a negative volume (Kite garbage, e.g. INT64_MIN): counted as 0
 FINISHED_AT = dtime(1, 0)        # a day's Kite day candle is final from 01:00 IST the next day (22-23 Oct 2026: fetched
 #                                  on its own day it is provisional, around midnight Kite returned none)
 DEFER_DAYS = 3                   # an unfinished day up to 3 trading days before the target is deferred, older: stored
@@ -88,12 +89,12 @@ FIELDS = mp.FIELDS
 
 INPUT_COLUMNS = ["date"] + [f"kite_{f}" for f in FIELDS] + \
     ["minute_rows", "first_bar", "last_bar", "minute_open", "minute_high", "minute_low", "minute_close",
-     "minute_volume", "fetched_at", "run_id"]
+     "minute_volume", "neg_volume_bars", "fetched_at", "run_id"]
 DAY_COLUMNS = ["date", "symbol", "series"] + [f"kite_{f}" for f in FIELDS] + [f"bhav_{f}" for f in FIELDS] + \
     ["our_factor", "ratio", "kite_multiplier", "kite_difference", "kind", "vol_ratio", "minute_scale",
      "minute_scale_measured", "minute_volume_scale", "minute_rows", "first_bar", "last_bar", "minute_open",
-     "minute_high", "minute_low", "minute_close", "minute_volume", "check", "conversion_from", "note", "fetched_at",
-     "run_id"]
+     "minute_high", "minute_low", "minute_close", "minute_volume", "neg_volume_bars", "check", "conversion_from",
+     "note", "fetched_at", "run_id"]
 CHECK_COLUMNS = ["security_id", "symbol", "priority", "date", "check", "kite_high", "kite_low", "kite_close",
                  "kite_volume", "minute_high", "minute_low", "minute_close", "minute_volume", "minute_scale",
                  "minute_volume_scale", "bhav_close", "note"]
@@ -842,9 +843,10 @@ def minute_aggregates(minutes):
     """{date: minute aggregates} of minute rows (the stored columns plus run_id / fetched_at). Every date's rows must
     be in the frame: a build calls it per staged chunk (chunks start at 00:00, so they never split a day). The bars go
     through ms.clean_bars first (as load_minute's default): Kite's all-zero padding bars do not count, so a day of
-    only zero bars has no minutes (MINUTE_EMPTY). The stored files keep every bar."""
+    only zero bars has no minutes (MINUTE_EMPTY). A negative volume counts as 0 (no int64 overflow in the sum);
+    neg_volume_bars counts those bars. The stored files keep every bar."""
     rows = {}
-    minutes = ms.clean_bars(minutes)[0]
+    minutes = ms.clean_bars(minutes.assign(_neg=(minutes["volume"] < 0).astype("int64")))[0]
     if len(minutes):
         m = minutes.sort_values("ts", kind="stable")
         m = m.assign(_d=m["ts"].dt.date, _hm=m["ts"].dt.strftime("%H:%M"))
@@ -852,7 +854,8 @@ def minute_aggregates(minutes):
         agg = pd.DataFrame({"minute_rows": g.size(), "first_bar": g["_hm"].first(), "last_bar": g["_hm"].last(),
                             "minute_open": g["open"].first(), "minute_high": g["high"].max(),
                             "minute_low": g["low"].min(), "minute_close": g["close"].last(),
-                            "minute_volume": g["volume"].sum(), "run_id": g["run_id"].last(),
+                            "minute_volume": g["volume"].sum(), "neg_volume_bars": g["_neg"].sum(),
+                            "run_id": g["run_id"].last(),
                             "fetched_at": g["fetched_at"].last()})
         for d, r in agg.iterrows():
             rows[d] = r.to_dict()
@@ -876,6 +879,7 @@ def inputs_from(rows, runs_of_day, day_frames):
         if c not in out:
             out[c] = np.nan if c not in ("first_bar", "last_bar", "run_id", "fetched_at") else ""
     out["minute_rows"] = out["minute_rows"].fillna(0).astype("int64")
+    out["neg_volume_bars"] = out["neg_volume_bars"].fillna(0).astype("int64")
     return out[INPUT_COLUMNS]
 
 
@@ -914,6 +918,7 @@ class Calc:
         b = (b[["date", "symbol", "series"] + FIELDS].rename(columns={f: f"bhav_{f}" for f in FIELDS})
              if b is not None else pd.DataFrame(columns=["date", "symbol", "series"] + [f"bhav_{f}" for f in FIELDS]))
         d = d.merge(b, on="date", how="left")
+        d["neg_volume_bars"] = d["neg_volume_bars"].fillna(0).astype("int64")
         has_min = d["minute_rows"].to_numpy() > 0
         has_day = d["kite_close"].notna().to_numpy()
         has_bhav = d["bhav_close"].notna().to_numpy()
@@ -995,8 +1000,8 @@ class Calc:
         # it on the days it stores after the deferral cap (add_check), checks keeps it
         flags = {"EXTRA_SESSION": ~has_bhav, "DAY_EMPTY": has_min & has_bhav & ~has_day,
                  "MINUTE_EMPTY": has_day & has_bhav & ~has_min, "HIGHLOW_DIFF": hl, "CLOSE_DIFF": cl & ~auction,
-                 "CLOSING_AUCTION": auction, "VOLUME_DIFF": vol, "SCALE_STEP": np.zeros(n, bool),
-                 "CANDLE_UNCONFIRMED": np.zeros(n, bool)}
+                 "CLOSING_AUCTION": auction, "VOLUME_DIFF": vol, NEGATIVE: d["neg_volume_bars"].to_numpy() > 0,
+                 "SCALE_STEP": np.zeros(n, bool), "CANDLE_UNCONFIRMED": np.zeros(n, bool)}
         notes = [[] for _ in range(n)]
         vscale = d["minute_volume_scale"].to_numpy(float)
         for i in range(1, n):
@@ -1010,9 +1015,16 @@ class Calc:
         for i in np.flatnonzero(flags["DAY_EMPTY"] | flags["EXTRA_SESSION"]):
             if d.at[i, "conversion_from"]:
                 notes[i].append(f"converted as {d.at[i, 'conversion_from']}")
+        for i in np.flatnonzero(flags[NEGATIVE]):
+            notes[i].append(negative_note(d.at[i, "neg_volume_bars"]))
         d["check"] = ["|".join(c for c in CHECKS if flags[c][i]) or "OK" for i in range(n)]
         d["note"] = ["; ".join(x) for x in notes]
         return d[DAY_COLUMNS]
+
+
+def negative_note(n):
+    """The day note of a day with n minute bars of a negative volume."""
+    return f"negative volume on {int(n)} minute bar(s), counted as 0"
 
 
 def scale_steps(sid, symbol, days):
@@ -1048,7 +1060,7 @@ class Runner:
         self.stats = {"stocks": 0, "built": 0, "updated": 0, "up_to_date": 0, "failed_stocks": 0, "chunks": 0,
                       "failed_chunks": 0, "rows": 0, "new_days": 0, "problem_days": 0, "stopped": False,
                       "auth": None, "started": time.monotonic(), "done": 0, "deferred_days": 0, "deferred_stocks": 0,
-                      "unconfirmed_days": 0}
+                      "unconfirmed_days": 0, "negative_volume_days": 0}
         self.deferred, self.unconfirmed = [], []     # (symbol, date, reason[, days held back])
         self.priority = None
 
@@ -1090,6 +1102,15 @@ class Runner:
                 self.stats["deferred_stocks"] += 1
                 self.deferred.append((item["symbol"], cut, bad[cut], held))
         return cut, label
+
+    def warn_negative(self, item, days):
+        """A warning line per stored day (days.parquet rows) with minute bars of a negative volume: the bars are
+        stored unchanged and count as 0 (NEGATIVE_VOLUME)."""
+        bad = days[days["neg_volume_bars"] > 0]
+        for d, k in zip(bad["date"], bad["neg_volume_bars"]):
+            self.log(f"  WARNING {item['symbol']} {iso(d)}: {int(k)} minute bar(s) with a negative volume (stored "
+                     f"unchanged, counted as 0; {NEGATIVE})")
+        self.add(negative_volume_days=len(bad))
 
     # history of one stock
     def history(self, item):
@@ -1204,6 +1225,7 @@ class Runner:
             n -= cut_minutes(tmp, cut)
         days = self.calc.derive(sid, inputs, bhav=bhav)
         ms.write_days(days, os.path.join(tmp, ms.DAYS_FILE))
+        self.warn_negative(item, days)
         if os.path.isdir(final):
             archive(self.folder, sid, "rebuilt")
         os.replace(tmp, final)
@@ -1274,6 +1296,7 @@ class Runner:
                 merged = merged.drop_duplicates("ts", keep="last").sort_values("ts", kind="stable")
                 ms.write_minutes(merged, p)
         ms.write_days(days, os.path.join(path, ms.DAYS_FILE))
+        self.warn_negative(item, added)
         self.save_stock(item, days, int(st["minute_rows"] or 0) + len(new))
         self.add(updated=1, rows=len(new), new_days=len(added),
                  problem_days=int((added["check"] != "OK").sum()))
@@ -1707,6 +1730,9 @@ def update(folder=None, kite=None, speed=SPEED, workers=WORKERS, now=None, log=p
             f"{stats['failed_stocks']:,} failed.")
         for line in held_text(stats):
             log(line)
+        if stats["negative_volume_days"]:
+            log(f"Days with minute bars of a negative volume (counted as 0, {NEGATIVE}): "
+                f"{stats['negative_volume_days']:,}")
         if fresh:
             log("New listings: " + ", ".join(stats["new_listings"]))
         if exits:

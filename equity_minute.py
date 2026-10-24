@@ -22,12 +22,16 @@ Phase 2 (backfill/equity/minute_download.py), each with --folder:
                                                   update/tokens.csv and marks NO_KITE_DATA stocks
     python equity_minute.py repair [--apply] [--limit N] [--speed 2.5]   day candles stored before they were final,
                                                   fetched again (Kite requests even in the dry run; --apply writes)
+    python equity_minute.py fix-negative-volume [--apply]   days.parquet rows of days with minute bars of a negative
+                                                  volume (counted as 0, NEGATIVE_VOLUME), offline (dry run unless
+                                                  --apply, which backs up first)
 --workers is 1 to 4 (default 2); all workers share one --speed limit.
 
 Every command takes --folder (absolute; default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data) and --include-etf.
 Output: <folder>/equity_1min/plan/. Only tokens (not --rematch) and probe use the network (Kite only; the token
 from .env is never printed). Exit codes: 0 done; 1 an input not built or stale, tokens not run yet (or no saved list
-for --rematch), some probes failed or the probe stopped, show found nothing, retoken left a stock to REVIEW; 2 bad
+for --rematch), some probes failed or the probe stopped, show found nothing, retoken left a stock to REVIEW,
+fix-negative-volume --apply failed (files restored); 2 bad
 arguments, a lock busy, an input
 build or bhavcopy download running, a Kite F&O run busy, or Kite sign-in needed."""
 import argparse
@@ -40,6 +44,7 @@ from backfill.equity import adjustments as adj
 from backfill.equity import exits as ex
 from backfill.equity import index_membership as im
 from backfill.equity import minute_download as md
+from backfill.equity import minute_negvol as mn
 from backfill.equity import minute_plan as mp
 from backfill.equity import minute_repair as mr
 from backfill.equity import security_master as sm
@@ -158,6 +163,10 @@ def main(argv=None):
     rp.add_argument("--limit", type=positive, help="at most this many stocks (a small trial)")
     rp.add_argument("--speed", type=speed, default=md.SPEED, help="requests per second (default 2.5, at most 3)")
     rp.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
+    nv = sub.add_parser("fix-negative-volume",
+                        help="phase 2: fix the days with minute bars of a negative volume, offline (dry run)")
+    nv.add_argument("--apply", action="store_true", help="write the fixed days.parquet rows (backup first)")
+    nv.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
     for sp in (dl, up, st):
         sp.add_argument("--speed", type=speed, default=md.SPEED, help="requests per second (default 2.5, at most 3)")
         sp.add_argument("--workers", type=int, choices=range(1, md.MAX_WORKERS + 1), default=md.WORKERS,
@@ -202,6 +211,9 @@ def main(argv=None):
             return 1 if md.checks(folder, apply=args.apply)["refused"] else 0
         if args.cmd == "repair":
             return 1 if mr.repair(folder, apply=args.apply, limit=args.limit, speed=args.speed)["refused"] else 0
+        if args.cmd == "fix-negative-volume":
+            mn.fix(folder, apply=args.apply)
+            return 0
         if args.cmd == "retoken":
             return 1 if md.retoken(folder, apply=args.apply, speed=args.speed)["review"] else 0
         return show(args.key, folder)

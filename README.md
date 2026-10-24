@@ -640,6 +640,7 @@ python equity_minute.py download                    # everything left; --symbols
 python equity_minute.py status                      # progress, offline
 python equity_minute.py checks                      # the check labels again with the current rules (dry run; --apply)
 python equity_minute.py retoken                     # stocks not done: match again in Kite's list (dry run; --apply)
+python equity_minute.py fix-negative-volume         # days with a garbage minute volume, offline (dry run; --apply)
 ```
 
 Every evening (or the next morning), once the history is complete:
@@ -656,6 +657,11 @@ python equity_minute.py update                      # then: minutes up to the pr
   and tried again by the next `update`; after 3 trading days it is stored anyway, labelled `CANDLE_UNCONFIRMED`.
 - Rows stored before this rule: `python equity_minute.py repair` (a dry run that fetches the day candles again and
   shows what would change, about 25 minutes), then `--apply` (backup in `equity_1min/archive/repair_<time>/`).
+- Kite sends a few minute bars with a garbage volume (stored as a negative number, e.g. -9,223,372,036,854,775,808).
+  They count as 0 in the day's checks: the day is labelled `NEGATIVE_VOLUME` (column `neg_volume_bars` = how many
+  bars' volume is missing) and `download` / `update` print a `WARNING` line. Rows stored before this rule (the full
+  download of October 2026): `python equity_minute.py fix-negative-volume` (offline dry run, a few minutes), then
+  `--apply` (backup in `equity_1min/archive/negvol_<time>/`). The minute bars themselves are never changed.
 
 - Kite's prices are adjusted by Kite's own rules, so the files keep Kite's candles unchanged plus, per day, the conversion back to the bhavcopy's raw prices. Read them in Python with `from backfill.equity.minute_store import load_minute`: `load_minute("RELIANCE", "2024-01-01", "2024-01-31", prices="raw")`. `prices="ours"` gives our split / bonus adjusted prices (for indicators), `prices="kite"` Kite's own. By default
 (`clean=True`) Kite's all-zero padding bars are left out, a negative volume reads as 0 and high / low always contain
