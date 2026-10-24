@@ -589,3 +589,29 @@ def test_session_timeout_at_start_ends_the_run(world, monkeypatch, capsys):
     db = idl.Progress(world, write=False)
     assert all(r["result"] != "running" for r in db.rows("SELECT * FROM runs"))
     db.close()
+
+def test_before_start_counted_apart_after_the_start_check(world, monkeypatch, capsys):
+    monkeypatch.setitem(STOCKS["DEADA"], "start", 20)     # ICICI's minutes begin on day 20
+    dl(world, symbols=["DEADA"])
+    row = check_row(world, "DEADA")
+    assert (row["first_before"], row["first_after"], row["result"], row["rounds"]) == \
+        (str(DAYS[20]), str(DAYS[20]), "KEPT", 1)
+    assert samples_of(row) == [(str(DAYS[6]), False), (str(DAYS[3]), False), (str(DAYS[9]), False)]
+    a = days_of(world, "DEADA")
+    empty = [0, 12, 18, 19, 3, 6, 9, 33]                 # search probes, start-check samples, day 33
+    before = [1, 2, 4, 5, 7, 8, 10, 11, 13, 14, 15, 16, 17]  # inferred, never fetched
+    for i in empty:
+        assert a.loc[DAYS[i], "check"] == idl.EMPTY
+    for i in before:
+        assert a.loc[DAYS[i], "check"] == idl.BEFORE_START and a.loc[DAYS[i], "fetched_at"] == ""
+        assert f"samples {DAYS[6]}, {DAYS[3]}, {DAYS[9]} without minutes" in a.loc[DAYS[i], "note"]
+    assert cli.main(["checks", "--folder", world]) == 0
+    capsys.readouterr()
+    with open(os.path.join(st.check_dir(world), "summary.json"), encoding="utf-8") as fh:
+        summary = json.load(fh)
+    assert summary["checks"]["ICICI_EMPTY"] == 8 and summary["checks"]["ICICI_BEFORE_START"] == 13
+    text = idl.status(world, now=NOW, log=q)["text"]
+    assert "ICICI_EMPTY 8, ICICI_BEFORE_START 13" in text
+    cov = pd.read_csv(os.path.join(st.check_dir(world), "coverage.csv"), dtype=str, keep_default_na=False)
+    deada = cov[(cov["reason"] == "MERGED") & cov["symbols"].str.startswith("DEADA")].iloc[0]
+    assert (deada["icici_empty"], deada["icici_before_start"], deada["state"]) == ("8", "13", "PARTLY")
