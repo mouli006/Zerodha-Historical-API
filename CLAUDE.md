@@ -42,6 +42,7 @@ A local Flask app ("Kite Backfill", one machine) that:
 - `equity_minute.py download / update / status / checks`: phase 2, the Kite 1-minute history (2 workers, resumable) and evening update; `load_minute` loader. See docs/dev/equity_minute_download.md.
 - `equity_minute.py update` stores only finished days (target day T = finished by 01:00 IST next day; unfinished days deferred, capped); `repair [--apply]` re-fetches day candles stored before that. See docs/dev/equity_minute_finished_days.md.
 - `equity_minute.py retoken [--apply]`: re-match failed stocks (price-checked tokens, NO_KITE_DATA), re-probe probe-empty stocks (PROBE_RECOVERED); `load_minute(clean=True)` drops zero bars. See docs/dev/equity_minute_download.md.
+- `icici_minute.py plan / download / status / checks / coverage / show`: ICICI Breeze 1-minute data for the Kite gaps (own store `equity_1min_icici/`; `.env` BREEZE_API_KEY + daily BREEZE_SESSION_TOKEN; never orders). See docs/dev/equity_icici_source.md.
 - Never run a CLI against real Kite or Dhan unless the user asks.
 
 ## Code map
@@ -72,6 +73,7 @@ Equity
 - `backfill/equity/index_fetch.py` / `index_notices.py` / `index_membership.py` (+ `index_membership.py`): downloads, notice / AMFI parsers, build, `members`, `amfi_category`.
 - `backfill/equity/minute_plan.py` (+ `equity_minute.py`): Kite tokens, availability probe, adjustment periods, `kite_gaps.csv`.
 - `backfill/equity/minute_download.py` / `minute_store.py`: 1-minute download, checks, update, status; store layout and `load_minute`.
+- `backfill/equity/icici_client.py` / `icici_plan.py` / `icici_download.py` / `icici_store.py` (+ `icici_minute.py`): Breeze REST calls, work list, download + conversion + checks, `load_minute_icici`.
 - `backfill/instruments.py`, `storage.py`, `runner.py`: the Kite bulk candle download.
 
 Web
@@ -108,3 +110,4 @@ Web
 | Kite 1-minute / EOD plan (Part 0 findings, tokens, probe, adjustment periods, gap list) | docs/dev/equity_minute_plan.md |
 | Kite 1-minute download (Part 0 findings, scales, checks, workers, update, loader) | docs/dev/equity_minute_download.md |
 | 1-minute finished days (target day, safety net, deferral cap, `repair`) | docs/dev/equity_minute_finished_days.md |
+| ICICI Breeze 1-minute source (endpoints, limits, work list, conversion evidence, checks, loader) | docs/dev/equity_icici_source.md |

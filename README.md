@@ -672,6 +672,41 @@ open / close (`df.attrs["clean"]` counts the fixes); `clean=False` returns the b
 - Memory stays under about 1.5 GB with two workers (the bhavcopy is read one stock at a time); the progress lines and `status` show the memory used. A run whose process was killed (for example by Windows for low memory) shows in `status` as `ABORTED` after the next `download` or `update` starts; nothing is lost, the same command resumes it.
 - During the history weeks, `download` rebuilds `plan.csv` itself (offline) after an `equity_update.py`. It refuses while a Kite F&O download runs. If the Kite session expires it stops: sign in (`python app.py`) and run the same command again. Exit codes: 0 done or stopped by you, 1 some chunks failed (run it again) or not ready, 2 bad arguments, busy, Kite sign-in needed or not enough disk.
 
+## ICICI 1-minute data for the Kite gaps
+Kite has no 1-minute data for delisted and merged stocks, for January 2015, 2016-01-01 and the two Muhurat sessions,
+and for some old periods of live stocks. ICICI Breeze has most of them. `icici_minute.py` fetches them into a
+separate folder, `<data folder>/equity_1min_icici/`. It only reads the Kite data, and it only reads prices from
+ICICI: it never places orders.
+
+Every day you download: log in to ICICI Breeze, then put the day's session token in `.env`:
+
+```
+BREEZE_API_KEY=...          # once
+BREEZE_SESSION_TOKEN=...    # new every day
+```
+
+```
+python icici_minute.py plan                     # the work list (kite_gaps.csv minus what Kite already has); one download of ICICI's scrip list
+python icici_minute.py download --priority 1    # NIFTY 50 stocks first; --max-calls 4800 a day (ICICI allows 5,000), --speed 90 a minute
+python icici_minute.py status                   # progress, calls used today, stocks to review
+python icici_minute.py coverage                 # which kite_gaps.csv rows are now filled
+```
+
+- ICICI allows about 5,000 calls a day, and one call covers 1-2 trading days, so the whole list takes several weeks
+  of daily runs. `download` stops by itself at the daily cap; run the same command the next day and it continues.
+  Ctrl+C is safe too.
+- If ICICI rejects the session, the run stops ("log in to ICICI again"): put a new token in `.env` and run it again.
+- ICICI's prices are adjusted only for older splits and bonuses. The files keep ICICI's candles unchanged plus, per
+  day, the conversion to the bhavcopy. Read them with `from backfill.equity.icici_store import load_minute_icici`:
+  `load_minute_icici("HDFC", "2023-02-01", "2023-02-28")`. `prices="ours"` gives split / bonus adjusted prices,
+  `prices="icici"` ICICI's own.
+- ICICI also has a 09:07 pre-open bar and 1-3 bars after 15:29 on recent days. They are kept (counted in
+  `bars_outside`). The official close is the bhavcopy close.
+- Stocks matched by symbol only are price-checked first. A failed check is listed as REVIEW in `status`, and nothing
+  is stored for it.
+- Exit codes: 0 done, stopped, or the daily cap reached; 1 not ready, some calls failed (run it again), or ICICI kept
+  answering "rate limit"; 2 bad arguments, busy, or ICICI log-in needed.
+
 ## Credentials
 Your API keys, secrets and access tokens (Kite and Dhan) are stored only in a local `.env` file, which the app creates when you sign in. It is gitignored and never committed. `.env.example` shows the format.
 
