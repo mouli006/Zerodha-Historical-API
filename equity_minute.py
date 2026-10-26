@@ -25,13 +25,16 @@ Phase 2 (backfill/equity/minute_download.py), each with --folder:
     python equity_minute.py fix-negative-volume [--apply]   days.parquet rows of days with minute bars of a negative
                                                   volume (counted as 0, NEGATIVE_VOLUME), offline (dry run unless
                                                   --apply, which backs up first)
+    python equity_minute.py fix-zero-padding [--apply]   days.parquet rows whose aggregates still count Kite's
+                                                  all-zero padding bars, offline (dry run unless --apply, which backs
+                                                  up first)
 --workers is 1 to 4 (default 2); all workers share one --speed limit.
 
 Every command takes --folder (absolute; default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data) and --include-etf.
 Output: <folder>/equity_1min/plan/. Only tokens (not --rematch) and probe use the network (Kite only; the token
 from .env is never printed). Exit codes: 0 done; 1 an input not built or stale, tokens not run yet (or no saved list
 for --rematch), some probes failed or the probe stopped, show found nothing, retoken left a stock to REVIEW,
-fix-negative-volume --apply failed (files restored); 2 bad
+fix-negative-volume / fix-zero-padding --apply failed (files restored); 2 bad
 arguments, a lock busy, an input
 build or bhavcopy download running, a Kite F&O run busy, or Kite sign-in needed."""
 import argparse
@@ -47,6 +50,7 @@ from backfill.equity import minute_download as md
 from backfill.equity import minute_negvol as mn
 from backfill.equity import minute_plan as mp
 from backfill.equity import minute_repair as mr
+from backfill.equity import minute_zeropad as mz
 from backfill.equity import security_master as sm
 from config import equity_data_dir
 
@@ -167,6 +171,10 @@ def main(argv=None):
                         help="phase 2: fix the days with minute bars of a negative volume, offline (dry run)")
     nv.add_argument("--apply", action="store_true", help="write the fixed days.parquet rows (backup first)")
     nv.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
+    zp = sub.add_parser("fix-zero-padding",
+                        help="phase 2: fix the days whose aggregates count Kite's zero padding bars, offline (dry run)")
+    zp.add_argument("--apply", action="store_true", help="write the fixed days.parquet rows (backup first)")
+    zp.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
     for sp in (dl, up, st):
         sp.add_argument("--speed", type=speed, default=md.SPEED, help="requests per second (default 2.5, at most 3)")
         sp.add_argument("--workers", type=int, choices=range(1, md.MAX_WORKERS + 1), default=md.WORKERS,
@@ -213,6 +221,9 @@ def main(argv=None):
             return 1 if mr.repair(folder, apply=args.apply, limit=args.limit, speed=args.speed)["refused"] else 0
         if args.cmd == "fix-negative-volume":
             mn.fix(folder, apply=args.apply)
+            return 0
+        if args.cmd == "fix-zero-padding":
+            mz.fix(folder, apply=args.apply)
             return 0
         if args.cmd == "retoken":
             return 1 if md.retoken(folder, apply=args.apply, speed=args.speed)["review"] else 0
