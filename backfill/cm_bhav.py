@@ -3,7 +3,7 @@
 Store: <folder>/NSE_CM_bhav/ (folder = .env EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data):
     raw/<YYYY>/<zip as downloaded>   never changed after download; a zip saved there by hand is used as is
     <YYYY>.parquet                   every series of every ok day of the year (SCHEMA), rebuilt from raw/
-    days.csv                         one row per weekday checked (DAYS_COLUMNS)
+    days.csv                         one row per weekday checked (DAYS_COLUMNS), plus each weekend session saved
     holidays.log                     weekdays NSE answers 404 for (not asked again unless force)
     cm_bhav.log                      run log
     cm_bhav_progress.sqlite          this downloader's own progress (table days)
@@ -16,16 +16,21 @@ tried first and the old one after a 404; days.csv records the format each day us
 Only a real HTTP 404 makes a past weekday a holiday. A page instead of the zip (200 + HTML), 401/403 or network
 errors make the day "failed" (retried next run, listed with the path to save the file under). Today counts only
 after READY_AT (19:00 IST); before that, or on a 404 for today, it is "pending".
+Weekend sessions (Muhurat, budget weekends, special Saturdays) are asked for only from the special-sessions file
+(backfill/equity/special_sessions.py; cm_bhav.py --special): a 404 there is "not found", never a holiday.
 The bhavcopy is the exchange's official record and belongs to no broker: broker data is checked against it."""
 import csv
 import io
 import os
 import re
+import shutil
 import sqlite3
 import statistics
+import tempfile
 import time
 import zipfile
 from datetime import date, datetime, time as dtime, timedelta
+from urllib.request import pathname2url
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -33,7 +38,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import requests
 
-from backfill.locks import LockBusy, RunLock  # noqa: F401 - LockBusy is re-exported for the CLI
+from backfill.equity import special_sessions as ss
+from backfill.locks import LockBusy, RunLock, held  # noqa: F401 - LockBusy is re-exported for the CLI
 from backfill.nse_ref.fetch import Blocked, FetchError, NotFound, NseClient, Throttle, write_bytes
 
 IST = ZoneInfo("Asia/Kolkata")
@@ -503,14 +509,21 @@ def get_file(store, day, client, force, now):
     return "pending", "", "", not_found[0], "404: not yet published", []
 
 
-def process_day(store, con, day, client, force, now, rlog):
-    """Fetch, validate and record one weekday; returns (status, failures)."""
+def process_day(store, con, day, client, force, now, rlog, special=False):
+    """Fetch, validate and record one weekday; returns (status, failures). special (a weekend session from the
+    special-sessions file): a day without a file (404 / not yet / download failed) is listed, never recorded."""
     saved = any(os.path.exists(raw_path(store, day, f)) for f in formats_for(day))
     if day == today_ist(now) and now.astimezone(IST).time() < READY_AT and not saved:
+        if special:
+            rlog(f"{day} not asked: before {READY_AT:%H:%M} IST (special session, nothing recorded)")
+            return "not_found", []
         set_day(con, day, "pending", note=f"not yet published (NSE publishes after {READY_AT:%H:%M} IST)")
         rlog(f"{day} pending: before {READY_AT:%H:%M} IST")
         return "pending", []
     kind, fmt, path, url, note, failures = get_file(store, day, client, force, now)
+    if special and kind in ("failed", "pending", "holiday"):
+        rlog(f"{day} {'failed' if kind == 'failed' else 'not found'}: {note} (special session, nothing recorded)")
+        return ("failed", failures) if kind == "failed" else ("not_found", [])
     if kind in ("failed", "pending", "holiday"):
         set_day(con, day, kind, url=url, note=note)
         if kind == "holiday":
@@ -552,9 +565,11 @@ def scan_raw(store):
 
 
 def run(folder, days=(), force=False, offline=False, sleep=SLEEP, use_browser=True, client=None, now=None,
-        log=print):
+        log=print, special=False):
     """Download/validate days (weekdays; ok and holiday days skipped unless force) or, offline, every zip in raw/;
     then rebuild the parquet of every stale year, days.csv and the report. LockBusy when another run holds the lock.
+    special: days are weekend sessions from the special-sessions file (cm_bhav.py --special --apply); they pass the
+    weekday filter, and one without a file is counted "not_found" and recorded nowhere.
     Returns {"counts", "failures" [(day, url, path, error)], "report", "flagged", "store", "years", "requests"}."""
     store = store_dir(folder)
     os.makedirs(store, exist_ok=True)
@@ -565,7 +580,7 @@ def run(folder, days=(), force=False, offline=False, sleep=SLEEP, use_browser=Tr
         con = open_db(store)
         rlog = RunLog(store, log)
         now = now or now_ist()
-        counts = dict.fromkeys(STATUSES + ("skipped",), 0)
+        counts = dict.fromkeys(STATUSES + ("skipped",) + (("not_found",) if special else ()), 0)
         failures, touched = [], set()
         if offline:
             client = None
@@ -573,8 +588,8 @@ def run(folder, days=(), force=False, offline=False, sleep=SLEEP, use_browser=Tr
             days = sorted(found)
             rlog(f"=== offline run: {len(days)} file day(s) in raw/")
         else:
-            days = sorted(d for d in set(days) if d.weekday() < 5)
-            rlog(f"=== run started: {len(days)} weekday(s)"
+            days = sorted(d for d in set(days) if special or d.weekday() < 5)
+            rlog(f"=== run started: {len(days)} {'special weekend day' if special else 'weekday'}(s)"
                  + (f", {days[0]} to {days[-1]}" if days else "") + (", force" if force else ""))
             if client is None and days:
                 client = CmClient(sleep=sleep, use_browser=use_browser, log=log)
@@ -585,7 +600,7 @@ def run(folder, days=(), force=False, offline=False, sleep=SLEEP, use_browser=Tr
                 if not offline and not force and prev and prev["status"] in ("ok", "holiday"):
                     counts["skipped"] += 1
                     continue
-                status, fails = process_day(store, con, day, client, force and not offline, now, rlog)
+                status, fails = process_day(store, con, day, client, force and not offline, now, rlog, special)
                 counts[status] += 1
                 failures += fails
                 if status == "ok":
@@ -606,3 +621,120 @@ def run(folder, days=(), force=False, offline=False, sleep=SLEEP, use_browser=Tr
         if own_client:
             client.close()
         lock.release()
+
+
+# --- special sessions (cm_bhav.py --special) ---------------------------------------------------
+
+def open_db_readonly(store):
+    """The progress db opened read only (an empty in-memory one when there is none): the dry run writes nothing."""
+    path = os.path.join(store, "cm_bhav_progress.sqlite")
+    if not os.path.isfile(path):
+        con = sqlite3.connect(":memory:")
+        con.execute("CREATE TABLE days (date TEXT PRIMARY KEY, status TEXT NOT NULL, format TEXT, file TEXT, url TEXT, "
+                    "rows INTEGER, eq_be_bz_rows INTEGER, downloaded_at TEXT, note TEXT)")
+        return con
+    return sqlite3.connect(f"file:{pathname2url(path)}?mode=ro", uri=True)
+
+
+def special_plan(folder, now=None):
+    """[{day, kind, status, saved}]: each weekend session of the special-sessions file (backfill/equity/
+    special_sessions.py) and what --special does with it: "in store" (ok in the db), "future" (after today, or today
+    before READY_AT), "in raw/" (a zip saved there: read, no request) or "to ask". Read only."""
+    store = store_dir(folder)
+    now = now or now_ist()
+    today = today_ist(now)
+    sessions = ss.load_special_sessions(folder)
+    con = open_db_readonly(store)
+    rows = []
+    try:
+        for day, kind in zip(sessions["date"], sessions["kind"]):
+            if day.weekday() < 5:
+                continue
+            prev = get_day(con, day)
+            saved = [(f, raw_path(store, day, f)) for f in formats_for(day) if os.path.exists(raw_path(store, day, f))]
+            if prev and prev["status"] == "ok":
+                status = "in store"
+            elif day > today or (day == today and now.astimezone(IST).time() < READY_AT and not saved):
+                status = "future"
+            elif saved:
+                status = "in raw/"
+            else:
+                status = "to ask"
+            rows.append({"day": day, "kind": kind, "status": status, "saved": saved[0] if saved else None})
+    finally:
+        con.close()
+    return rows
+
+
+def check_special(folder, client=None, now=None, sleep=SLEEP, use_browser=True, log=print):
+    """The --special dry run: asks NSE for each "to ask" weekend session (special_plan), validates the answer with
+    parse_zip in a temporary folder outside the store (removed afterwards) and lists what --apply would write: the
+    raw/ zips and the parquet years it rebuilds (marked "touched" by a found day, "stale" when the parquet already
+    differs from the db). Writes nothing in the store, not even the lock: LockBusy when a run holds it.
+    Returns {"rows", "years" [(year, mark)], "raw", "requests", "store"}."""
+    store = store_dir(folder)
+    lock = os.path.join(store, ".lock")
+    if held(lock):
+        raise LockBusy(f"Another {STORE} run is in progress ({lock}).")
+    now = now or now_ist()
+    rows = special_plan(folder, now)
+    own_client = False
+    if client is None and any(r["status"] == "to ask" for r in rows):
+        client = CmClient(sleep=sleep, use_browser=use_browser, log=log)
+        own_client = True
+    tmp = tempfile.mkdtemp(prefix="cm_bhav_special_")
+    try:
+        for r in rows:
+            day = r["day"]
+            if r["status"] == "in raw/":
+                fmt, path = r["saved"]
+                check_file(r, path, day, fmt, url_for(day, fmt))
+                continue
+            if r["status"] != "to ask":
+                continue
+            errors, not_found = [], []
+            for fmt in formats_for(day):
+                url = url_for(day, fmt)
+                try:
+                    data = client.get(url, "zip")
+                except NotFound:
+                    not_found.append(url)
+                    continue
+                except FetchError as e:
+                    errors.append(f"{url}: {e}")
+                    continue
+                path = os.path.join(tmp, os.path.basename(raw_path(store, day, fmt)))
+                with open(path, "wb") as f:
+                    f.write(data)
+                check_file(r, path, day, fmt, url)
+                r["raw"] = raw_path(store, day, fmt)
+                break
+            else:
+                r.update(result="failed" if errors else "not found",
+                         note="; ".join(errors) if errors else "404 for " + " and ".join(not_found))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if own_client:
+            client.close()
+    touched = {r["day"].year for r in rows if r.get("result") == "found"}
+    con = open_db_readonly(store)
+    try:
+        stale = set(stale_years(store, con)) if os.path.isdir(store) else set()
+    finally:
+        con.close()
+    years = [(y, ", ".join(m for m, s in (("touched", touched), ("stale", stale)) if y in s))
+             for y in sorted(touched | stale)]
+    return {"rows": rows, "years": years, "raw": [r["raw"] for r in rows if r.get("raw")],
+            "requests": getattr(client, "requests", 0), "store": store}
+
+
+def check_file(r, path, day, fmt, url):
+    """Validate one zip for the dry run: result "found" (rows, EQ/BE/BZ rows, EQ trades) or "bad file"."""
+    r.update(format=fmt, url=url)
+    try:
+        df = parse_zip(path, day, fmt)
+    except BadFile as e:
+        r.update(result="bad file", note=str(e))
+        return
+    r.update(result="found", rows=len(df), main=eq_be_bz(df),
+             trades=int(df.loc[df["series"] == "EQ", "trades"].sum()), note="")

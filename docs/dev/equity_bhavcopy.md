@@ -5,6 +5,11 @@ Downloads NSE's equity bhavcopy for every trading day since 2015 into per-year p
 
 ## CLI
 - Equity bhavcopy CLI: `python cm_bhav.py (YYYY-MM-DD | --from D --to D | --missing | --offline) [--folder PATH] [--sleep 1.5] [--force] [--no-browser]` (no login; folder default `config.equity_data_dir()`; `--offline` runs alone; weekends, future dates, from > to and a missing mode are argparse errors). Exit codes: 0 all done (today pending is not a failure), 1 some days failed (each printed with its URL and the `raw\<YYYY>\` path to save it under), 2 bad arguments (argparse's own code is kept here) or `LockBusy`. Run manually; no cron.
+- Weekend sessions: `python cm_bhav.py --special [--apply] [--folder PATH] [--sleep 1.5] [--no-browser]` asks NSE
+  only for the Saturday / Sunday dates of `manual_special_sessions.csv`. The dry run saves nothing (not even the
+  lock) and lists the raw/ zips and parquet years an `--apply` would write; `--apply` saves the files found like a
+  normal day, and a 404 records nothing (no `holiday`). Every other mode still asks weekdays only. See
+  docs/dev/special_sessions.md.
 
 ## Store
 - NSE equity (CM) bhavcopy store (`backfill/cm_bhav.py`, `cm_bhav.py`, run by hand):

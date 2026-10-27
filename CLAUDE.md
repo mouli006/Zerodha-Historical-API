@@ -32,6 +32,7 @@ A local Flask app ("Kite Backfill", one machine) that:
 - `nifty_bhav.py`: the F&O bhavcopy check and its exports. See docs/dev/fno_bhavcopy_check.md.
 - `fno_store.py`: the F&O stores (move-raw, split-stores, derive-without, compare-variants, publish, clear, restore, import). See docs/dev/fno_store.md.
 - `cm_bhav.py`: the NSE equity bhavcopy store. See docs/dev/equity_bhavcopy.md.
+- `cm_bhav.py --special [--apply]`: the weekend sessions of `manual_special_sessions.csv` (dry run asks NSE, writes nothing). See docs/dev/special_sessions.md.
 - `nse_reference.py`: the NSE delisting / suspension / merger reference. See docs/dev/nse_reference.md.
 - `security_master.py`: build / show / check the security master (one `security_id` per company). See docs/dev/security_master.md.
 - `adjustments.py`: build / show / check split / bonus factors (price move confirmed by ISIN change or NSE CSV), fetch-actions (NSE corporate actions). See docs/dev/adjustments.md.
@@ -68,6 +69,7 @@ Equity
 - `backfill/cm_bhav.py` (+ `cm_bhav.py`): NSE equity bhavcopy store.
 - `backfill/nse_ref/` (+ `nse_reference.py`): NSE reference lists.
 - `backfill/equity/`: home for new equity modules (security master, split/bonus factors, exits, index membership).
+- `backfill/equity/special_sessions.py`: the special-sessions calendar (`load_special_sessions`, `session_kind`, `is_special`).
 - `backfill/equity/security_master.py` (+ `security_master.py`): security master from the bhavcopy parquet, and its loaders.
 - `backfill/equity/adjustments.py` / `corp_actions.py` (+ `adjustments.py`): split / bonus factors, `factor_on`, `adjusted_history`; NSE corporate-actions download.
 - `backfill/equity/exits.py` (+ `exits.py`): exit list, listing kinds, `exit_info`, `exits_between`, `status_on`, `listing_info`.
@@ -104,6 +106,7 @@ Web
 | Dhan sign-in, Dhan F&O page, `DhanClient` | docs/dev/dhan.md |
 | F&O stores: with/without, derive, move-raw, publish, backtest, clear/restore, import | docs/dev/fno_store.md |
 | NSE equity bhavcopy store (`cm_bhav`) | docs/dev/equity_bhavcopy.md |
+| special sessions (Muhurat, budget weekends, `cm_bhav.py --special`, what each tool does on a Sunday) | docs/dev/special_sessions.md |
 | NSE delisting / suspension / merger reference | docs/dev/nse_reference.md |
 | security master (linking rules, events, review, loaders) | docs/dev/security_master.md |
 | split / bonus factors (detection, confirmation, manual overrides, loaders) | docs/dev/adjustments.md |

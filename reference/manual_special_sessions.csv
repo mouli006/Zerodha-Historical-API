@@ -1,0 +1,21 @@
+date,weekday,kind,start,end,in_bhavcopy,evidence,note
+2015-02-28,Sat,BUDGET_WEEKEND,09:15,15:30,no,Kite 1068 stocks with minutes 09:15-15:29 (median 375 bars); no bhavcopy row; all EXTRA_SESSION,Union Budget Saturday
+2015-11-11,Wed,MUHURAT,17:38,18:46,yes,bhav EQ trades 1.31 M vs 20-day median 7.02 M (0.19); Kite 1083 stocks 17:38-18:45 (median 62 bars),first bar 17:38 for most stocks and 17:45 for others; ICICI has no minutes (ICICI_EMPTY)
+2016-10-30,Sun,MUHURAT,18:30,19:16,no,Kite 1189 stocks 18:30-19:15 (some to 19:29; median 46 bars); no bhavcopy row; all EXTRA_SESSION,
+2017-07-10,Mon,OUTAGE,12:30,15:30,yes,bhav EQ trades 1.89 M vs 20-day median 8.66 M (0.22); Kite 1237 stocks 12:30-15:29 (median 180 bars),late open after an outage; Kite VOLUME_DIFF on 916 stocks
+2017-10-19,Thu,MUHURAT,18:30,19:16,yes,bhav EQ trades 2.17 M vs 20-day median 9.81 M (0.22); Kite 1261 stocks 18:30-19:15 (median 46 bars),Kite has no day candle (DAY_EMPTY 1256); kite_gaps KITE_MISSING_SESSION
+2018-11-07,Wed,MUHURAT,17:30,18:30,yes,bhav EQ trades 1.91 M vs 20-day median 12.95 M (0.15); Kite 1321 stocks 17:30-18:29 (median 60 bars),Kite has no day candle (DAY_EMPTY 1307); kite_gaps KITE_MISSING_SESSION
+2019-10-27,Sun,MUHURAT,18:15,19:15,no,Kite 1369 stocks 18:15-19:14 (median 58 bars); no bhavcopy row; all EXTRA_SESSION,
+2020-02-01,Sat,BUDGET_WEEKEND,09:15,15:30,no,Kite 1399 stocks 09:15-15:29 (median 292 bars); no bhavcopy row; all EXTRA_SESSION,Union Budget Saturday
+2020-11-14,Sat,MUHURAT,18:15,19:15,no,Kite 1460 stocks 18:15-19:14 (median 60 bars); no bhavcopy row; all EXTRA_SESSION,
+2021-11-04,Thu,MUHURAT,18:15,19:15,yes,bhav EQ trades 6.44 M vs 20-day median 25.57 M (0.25); Kite 1596 stocks 18:15-19:14 (median 60 bars),
+2022-10-24,Mon,MUHURAT,18:15,19:15,yes,bhav EQ trades 5.59 M vs 20-day median 17.67 M (0.32); Kite 1739 stocks 18:15-19:14 (median 60 bars),
+2023-11-12,Sun,MUHURAT,18:15,19:15,no,Kite 1874 stocks 18:15-19:14 (median 60 bars); no bhavcopy row; all EXTRA_SESSION,
+2024-01-20,Sat,SPECIAL_SATURDAY,09:15,15:30,no,Kite 1878 stocks 09:15-15:29 (median 370 bars); no bhavcopy row; all EXTRA_SESSION,full-day Saturday session
+2024-03-02,Sat,SPECIAL_SATURDAY,09:15,12:30,no,Kite 1880 stocks 09:15-12:29 (median 105 bars); no bhavcopy row; all EXTRA_SESSION,105 bars in a 195-minute span: the session had a break (two blocks)
+2024-05-18,Sat,SPECIAL_SATURDAY,09:15,12:30,no,Kite 1911 stocks 09:15-12:29 (median 105 bars); no bhavcopy row; all EXTRA_SESSION,105 bars in a 195-minute span: the session had a break (two blocks)
+2024-11-01,Fri,MUHURAT,18:00,19:00,yes,bhav EQ trades 9.48 M vs 20-day median 36.28 M (0.26); Kite 1987 stocks 18:00-18:59 (median 60 bars),
+2025-02-01,Sat,BUDGET_WEEKEND,09:15,15:30,no,Kite 2035 stocks 09:15-15:29 (median 371 bars); no bhavcopy row; all EXTRA_SESSION,Union Budget Saturday
+2025-10-21,Tue,MUHURAT,13:45,14:45,yes,bhav EQ trades 8.93 M vs 20-day median 31.84 M (0.28); Kite 2165 stocks 13:45-14:44 (median 60 bars),afternoon session; ICICI labels it SHORT_DAY
+2026-02-01,Sun,BUDGET_WEEKEND,09:15,15:30,no,Kite 2222 stocks 09:15-15:29 (median 358 bars); no bhavcopy row; all EXTRA_SESSION,Union Budget Sunday
+2026-11-08,Sun,MUHURAT,,,no,announced session; no data yet,timings to be announced by NSE

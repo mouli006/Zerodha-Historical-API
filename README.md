@@ -473,8 +473,12 @@ python cm_bhav.py 2026-10-16                          # one day
 python cm_bhav.py --from 2015-01-01 --to 2026-10-16   # a range (weekdays only)
 python cm_bhav.py --missing                           # every weekday from 2015-01-01 to today not done yet
 python cm_bhav.py --offline                           # no downloads: re-read every zip in raw\ and rebuild the yearly files
+python cm_bhav.py --special                           # weekend sessions (Muhurat, budget, special Saturdays): dry run
+python cm_bhav.py --special --apply                   # ... save the files NSE has for them
 options: --folder PATH, --sleep 1.5 (seconds between requests), --force (download again), --no-browser
 ```
+
+Normal runs ask NSE for weekdays only. NSE sometimes trades on a Saturday or Sunday (Diwali Muhurat, the Union Budget, special Saturdays); those dates are listed by hand in `reference\manual_special_sessions.csv` (a copy in `NSE_CM_bhav\reference\` wins). `--special` shows what NSE has for them and saves nothing; run it with `--apply` only after checking that list. Details: `docs/dev/special_sessions.md`.
 
 The folder is `EQUITY_DATA_DIR` in `.env` (e.g. `D:\Data\NSE_equity`), else `KITE_DATA_DIR`, else `./data`. `nse_reference.py` uses the same folder, so all equity data lives in one place:
 
