@@ -11,7 +11,7 @@ from kiteconnect import KiteConnect
 from kiteconnect import exceptions as kex
 
 import dhan
-from backfill import bhav, bhav_export, fno, fno_days
+from backfill import bhav, bhav_export, bhav_review, fno, fno_days
 from backfill.dhan_api import DhanClient, data_plan_error, token_ok
 from backfill.fetch import INTERVALS, MAX_INDEX_RANGE_DAYS, MAX_RANGE_DAYS
 from backfill.instruments import INDEX_CHOICES
@@ -363,7 +363,112 @@ def fno_bhav_status():
     if err:
         return jsonify({"error": err})
     days = bhav.list_days(folder, underlying, source)
-    return jsonify({"days": days, "banners": bhav.banners(days, fno.today_ist())})
+    # reviewed days and days marked "bhavcopy not published" leave the banners (backfill/bhav_review.py)
+    return jsonify({"days": days, "banners": bhav_review.banners(days, fno.today_ist(),
+                                                                 bhav_review.load_events(folder, underlying, source))})
+
+
+@bp.route("/fno/bhav-marks")
+def fno_bhav_marks():
+    """The review / "bhavcopy not published" records of the folder's days (bhav_review.marks). Reads only."""
+    source, err = fno_source()
+    if err:
+        return jsonify({"error": err})
+    if not signed_in(source):
+        return jsonify({"error": "Not logged in."}), 403
+    folder, _, underlying, err = fno_args(need_date=False)
+    if err:
+        return jsonify({"error": err})
+    return jsonify(bhav_review.marks(folder, underlying, source, fno.today_ist()))
+
+
+@bp.route("/fno/bhav-review", methods=["POST"])
+def fno_bhav_review():
+    """Mark a checked day reviewed (action=review, refused with missing contracts) or undo it (action=unreview);
+    nifty_bhav.py --review / --unreview. Writes only <root>/bhav_review.json, under the F&O lock."""
+    source, err = fno_source()
+    if err:
+        return jsonify({"error": err})
+    if not signed_in(source):
+        return jsonify({"error": "Not logged in."}), 403
+    folder, run_date, underlying, err = fno_args()
+    action = request.values.get("action", "review")
+    if not err and action not in ("review", "unreview"):
+        err = "action must be review or unreview."
+    if err:
+        return jsonify({"error": err})
+    lock, err = locked_fno(folder, underlying, "dashboard review", source)
+    if err:
+        return jsonify({"error": err})
+    try:
+        do = bhav_review.review if action == "review" else bhav_review.unreview
+        message, err = do(folder, underlying, source, run_date, request.values.get("note", "").strip())
+    except OSError as e:
+        message, err = "", str(e)
+    finally:
+        lock.release()
+    return jsonify({"error": err} if err else {"message": message})
+
+
+@bp.route("/fno/bhav-no-bhav", methods=["POST"])
+def fno_bhav_no_bhav():
+    """Mark a past pending day whose last bhavcopy fetch was a 404 "bhavcopy not published" (action=mark) or undo it
+    (action=undo) in every Kite / Dhan store of the underlying and this folder; nifty_bhav.py --no-bhav / --undo-no-bhav."""
+    source, err = fno_source()
+    if err:
+        return jsonify({"error": err})
+    if not signed_in(source):
+        return jsonify({"error": "Not logged in."}), 403
+    folder, run_date, underlying, err = fno_args()
+    action = request.values.get("action", "mark")
+    if not err and action not in ("mark", "undo"):
+        err = "action must be mark or undo."
+    if err:
+        return jsonify({"error": err})
+    with JOB_LOCK:
+        if JOB["state"] == "running":
+            return jsonify({"error": "A download is running. Try again when it has finished."})
+    lines = []
+    roots = bhav_review.store_roots(underlying, load_env(), also=[(source, folder)])
+    done = bhav_review.no_bhav(underlying, run_date, roots, fno.today_ist(), request.values.get("note", "").strip(),
+                               undo=action == "undo", owner="dashboard no-bhav", log=lines.append)
+    if not done:
+        return jsonify({"error": f"{run_date}: no store qualifies. " + " ".join(x.strip() for x in lines), "lines": lines})
+    return jsonify({"message": f"{run_date}: {'unmarked' if action == 'undo' else 'marked'} in {done} "
+                               f"{'store' if done == 1 else 'stores'}.", "lines": lines})
+
+
+@bp.route("/fno/bhav-check-all", methods=["POST"])
+def fno_bhav_check_all():
+    """nifty_bhav.py --missing-all from the dashboard: the pending days of NIFTY kite, NIFTY dhan, SENSEX kite, SENSEX
+    dhan in that order, on the default folders of the keep_zero store. All four locks are taken first: refused while a
+    download job runs or any of them is busy. Runs in the request, like Check all pending."""
+    if "access_token" not in session and not dhan.status(load_env())["connected"]:
+        return jsonify({"error": "Not logged in."}), 403
+    with JOB_LOCK:
+        if JOB["state"] == "running":
+            return jsonify({"error": "A download is running. Try again when it has finished."})
+    keep = read_flag("keep_zero")
+    sets, locks, rows = [], {}, []
+    try:
+        for underlying, source, folder in bhav_review.default_sets(load_env(), keep):
+            folder, err = check_folder(folder)
+            if err:
+                rows.append({"underlying": underlying, "source": source, "folder": folder, "checked": 0,
+                             "still_pending": 0, "no_bhav_marked": 0, "failed": 1, "red": 0, "code": 1, "error": err})
+                continue
+            try:
+                locks[(underlying, source)] = fno.acquire_lock(folder, underlying, "dashboard check all", source)
+            except fno.LockBusy as e:
+                return jsonify({"error": f"Not run: {e}"})
+            sets.append((underlying, source, folder))
+        rows += bhav_review.check_all(sets, run=bhav.run_bhav, locks=locks, owner="dashboard check all")
+    finally:
+        for lock in locks.values():
+            lock.release()
+    order = {k: i for i, k in enumerate(bhav_review.SETS)}
+    rows.sort(key=lambda r: order[(r["underlying"], r["source"])])
+    return jsonify({"rows": rows, "code": bhav_review.worst([r["code"] for r in rows])})
 
 
 @bp.route("/fno/bhav-diff")
@@ -424,9 +529,11 @@ def fno_bhav_check():
         folder, err = check_folder(folder)
     if err:
         return jsonify({"error": err})
-    dates = bhav.unchecked_days(folder, underlying, source) if missing else [run_date]
+    dates, marked = bhav_review.pending_days(folder, underlying, source) if missing else ([run_date], [])
     if not dates:
-        return jsonify({"results": [], "message": "Every saved day has a bhavcopy check."})
+        return jsonify({"results": [], "message": "Every saved day has a bhavcopy check." if not marked else
+                        f"Nothing to check: {len(marked)} pending {'day is' if len(marked) == 1 else 'days are'} "
+                        "marked \"bhavcopy not published\"."})
     lock, err = locked_fno(folder, underlying, "dashboard bhavcopy check", source)
     if err:
         return jsonify({"error": err})

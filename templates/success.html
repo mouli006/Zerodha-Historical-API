@@ -232,6 +232,12 @@
   .banner.bad { background: rgba(255,92,122,.1); border: 1px solid rgba(255,92,122,.4); color: #FFB3C1; }
   .banner.warn, .banner.minor { background: rgba(255,181,71,.08); border: 1px solid rgba(255,181,71,.35); color: #FFD59A; }
   .banner .btn { padding: 7px 14px; }
+  .banner.quiet { background: rgba(148,163,184,.06); border: 1px solid var(--border); color: var(--muted); font-size: 13px; padding: 8px 16px; }
+  .pill.grey { color: var(--muted); background: rgba(148,163,184,.14); margin-left: 6px; }
+  .check-four { display: flex; justify-content: flex-end; margin: -8px 0 18px; }
+  .review-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 0 0 10px; font-size: 13px; color: var(--muted); }
+  .review-bar input { background: rgba(7,11,22,.55); color: var(--text); border: 1px solid var(--border-2); border-radius: 10px;
+                      padding: 6px 10px; font: inherit; font-size: 13px; min-width: 220px; }
 
   @media (max-width: 1060px) { .grid { grid-template-columns: minmax(0, 1fr); } }   /* wide tables scroll inside their card */
   @media (max-width: 560px) {
@@ -254,6 +260,8 @@
   "urls": {"start": url_for("dashboard.download_start"), "fno": url_for("dashboard.download_fno_start"), "fnoWindow": url_for("dashboard.download_fno_window"),
            "bhavStatus": url_for("dashboard.fno_bhav_status"), "bhavDiff": url_for("dashboard.fno_bhav_diff"), "bhavExport": url_for("dashboard.fno_bhav_export"),
            "bhavCheck": url_for("dashboard.fno_bhav_check"), "redownload": url_for("dashboard.fno_redownload"),
+           "bhavMarks": url_for("dashboard.fno_bhav_marks"), "bhavReview": url_for("dashboard.fno_bhav_review"),
+           "bhavNoBhav": url_for("dashboard.fno_bhav_no_bhav"), "bhavCheckAll": url_for("dashboard.fno_bhav_check_all"),
            "stop": url_for("dashboard.download_stop"), "status": url_for("dashboard.download_status"),
            "browse": url_for("dashboard.browse_folder"), "logout": url_for("auth.logout"), "dhan": url_for("dhan.index"),
            "dhanLogout": url_for("dhan.logout", next="dashboard"), "dhanPageLogout": url_for("dhan.logout"),
@@ -792,7 +800,17 @@
     } catch (e) { toast("Couldn't reach the app. Check that python app.py is running.", "err"); return []; }
   }
 
+  // POST a review / "bhavcopy not published" change (backfill/bhav_review.py) and toast the answer; true when done
+  async function markPost(url, params, toast) {
+    try {
+      const j = await (await fetch(url, { method: "POST", body: new URLSearchParams({ ...Q, ...params }) })).json();
+      toast(j.error || j.message, j.error ? "err" : "ok");
+      return !j.error;
+    } catch (e) { toast("Couldn't reach the app. Check that python app.py is running.", "err"); return false; }
+  }
+
   const BHAV_LABEL = { ok: "OK", diffs: "CHECK", pending: "pending" };
+  const NO_MARKS = { reviewed: [], no_bhav: [], days: {} };
 
   // "Download" button with a small menu; each item is [label, /fno/bhav-export params]. The file is fetched
   // first, so a day without a check shows a toast instead of an error page.
@@ -834,11 +852,22 @@
   }
 
   // One row per saved Kite day with its bhavcopy check (backfill/bhav.py list_days); click to see differences
-  function BhavCard({ job, toast, onPoll, folder, rawFolder, days, onBhav, openDay, setOpenDay, checkAll, checkingAll, keepZero, und }) {
+  function BhavCard({ job, toast, onPoll, folder, rawFolder, days, onBhav, openDay, setOpenDay, checkAll, checkingAll, keepZero, und, marks }) {
     const [busy, setBusy] = useState("");
+    const [note, setNote] = useState("");
+    useEffect(() => setNote(""), [openDay]);
+    const mk = date => (marks.days || {})[date] || {};
+    // review a checked day, or mark a pending one "bhavcopy not published" (and the undos)
+    const change = async (key, url, params) => {
+      setBusy(key);
+      await markPost(url, { folder, ...params }, toast);
+      await onBhav();
+      setBusy("");
+    };
     const [diff, setDiff] = useState(null);          // { date, rows, units, line } or { date, error }
     const running = !!job && job.state === "running";
-    const pending = days.filter(d => d.status === "pending").length;
+    // days marked "bhavcopy not published" are not asked for again (backfill/bhav_review.py pending_days)
+    const pending = days.filter(d => d.status === "pending" && ((marks.days || {})[d.date] || {}).no_bhav !== "active").length;
     const c = (d, k) => d.status === "pending" ? "" : n((d.counts || {})[k]);
     const q = v => v === "" || v == null ? "-" : n(v);   // volumes and OI; prices are shown as saved
     // red: missing contracts or volume diffs where Kite has volume; amber: known Kite limitations (backfill/bhav.py severity)
@@ -899,9 +928,19 @@
           <td>${d.expiry ? long(parse(d.expiry)) : ""}</td><td>${{ with: "With", no: "No" }[d.zero_volume] || ""}</td><td>${d.downloaded || ""}</td>
           <td>${d.status === "pending"
             ? html`<button type="button" className="btn btn-ghost btn-sm" disabled=${running || checkingAll || !!busy} onClick=${e => { e.stopPropagation(); checkNow(d.date); }}>
-                ${busy === d.date ? html`<span className="spinner"></span>` : "Check now"}</button>`
+                ${busy === d.date ? html`<span className="spinner"></span>` : "Check now"}</button>
+                ${mk(d.date).no_bhav === "active"
+                  ? html`<span className="pill grey" title=${mk(d.date).no_bhav_note || "Marked: the exchange never published this day's bhavcopy"}>no bhavcopy</span>
+                      <button type="button" className="btn btn-ghost btn-sm" style=${{ marginLeft: 6 }} disabled=${running || checkingAll || !!busy}
+                              onClick=${e => { e.stopPropagation(); change("nb" + d.date, U.bhavNoBhav, { date: d.date, action: "undo" }); }}>Undo</button>`
+                  : html`<button type="button" className="btn btn-ghost btn-sm" style=${{ marginLeft: 6 }}
+                              disabled=${running || checkingAll || !!busy || mk(d.date).no_bhav_why !== ""}
+                              title=${mk(d.date).no_bhav_why || "The last fetch was a 404: stop asking the exchange for this day (it stays unchecked)"}
+                              onClick=${e => { e.stopPropagation(); change("nb" + d.date, U.bhavNoBhav, { date: d.date, action: "mark" }); }}>
+                      ${busy === "nb" + d.date ? html`<span className="spinner"></span>` : "Bhavcopy not published"}</button>`}`
             : html`<span className=${"pill " + sev(d)} title=${sev(d) === "minor" ? brand("No missing contracts or volume differences; only known Kite limitations (zero-volume, extra files, OI, price)") : ""}>
-                ${sev(d) === "minor" ? "CHECK (minor)" : BHAV_LABEL[d.status]}</span>`}</td>
+                ${sev(d) === "minor" ? "CHECK (minor)" : BHAV_LABEL[d.status]}</span>${mk(d.date).review === "active"
+                ? html`<span className="pill grey" title=${mk(d.date).review_note || "Differences reviewed; hidden from the banner while the counts stay the same"}>reviewed</span>` : ""}`}</td>
           <td>${liquid(d)}</td>
           <td className="num">${c(d, "bhav_traded")}</td><td className="num">${c(d, "kite_files")}</td><td className="num">${c(d, "missing")}</td>
           <td className="num">${c(d, "extra")}</td><td className="num">${c(d, "volume_diffs")}${(d.counts || {}).zero_volume ? html`<small style=${{ display: "block", color: "var(--dim)" }}>${n(d.counts.zero_volume)} zero-volume</small>` : ""}</td><td className="num">${c(d, "oi_diffs")}</td>
@@ -926,6 +965,21 @@
             ["Full report (Excel)", { date: diff.date, scope: "xlsx" }]]} />`}
           </div>
         </div>
+        ${!diff.error && (() => {
+          const m = mk(diff.date);
+          if (!("review_why" in m)) return "";
+          if (m.review === "active") return html`<div className="review-bar">
+            <span className="pill grey">reviewed</span><span>${m.review_note ? `Note: ${m.review_note}` : "Hidden from the banner while a re-check gives the same counts."}</span>
+            <button type="button" className="btn btn-ghost btn-sm" disabled=${!!busy} onClick=${() => change("rv", U.bhavReview, { date: diff.date, action: "unreview" })}>
+              ${busy === "rv" ? html`<span className="spinner"></span>` : "Unreview"}</button></div>`;
+          return html`<div className="review-bar">
+            ${m.review === "void" && html`<span>An earlier review no longer applies: the counts changed.</span>`}
+            ${m.review_why ? html`<span>Can't mark reviewed: ${brand(m.review_why)}.</span>`
+              : html`<input type="text" placeholder="Note (optional)" aria-label="Review note" value=${note} onInput=${e => setNote(e.target.value)} />
+                <button type="button" className="btn btn-ghost btn-sm" disabled=${!!busy} title="Hide this day from the banner; it shows again if a re-check gives other counts"
+                        onClick=${() => change("rv", U.bhavReview, { date: diff.date, action: "review", note })}>
+                  ${busy === "rv" ? html`<span className="spinner"></span>` : "Mark reviewed"}</button>`}</div>`;
+        })()}
         ${diff.rows && (all.length === 0 ? html`<div className="empty">No differences.</div>` : !shown.length ? html`<div className="empty">No differences in this bucket.</div>` : html`<div className="table-wrap"><table>
           <thead><tr><th>Contract</th><th>Expiry</th><th>Bucket</th><th>Type</th><th className="num">Strike</th>
             <th className="num" title=${`Bhavcopy volume in shares (contracts x ${(diff.units || {}).volume || 1})`}>${brand("Volume, bhav / Kite")}</th>
@@ -946,7 +1000,8 @@
         </table></div>`)}
       </div>`; })()}
       <p className="hint">Each download checks its day once the bhavcopy is published; check pending days here, or with${" "}
-        <code>python nifty_bhav.py YYYY-MM-DD${bhavCli}</code> / <code>--missing${bhavCli}</code>.</p>
+        <code>python nifty_bhav.py YYYY-MM-DD${bhavCli}</code> / <code>--missing${bhavCli}</code> / <code>--missing-all</code>.
+        Reviews and "bhavcopy not published" marks: <code>--review</code>, <code>--no-bhav</code>, <code>--reviewed-list</code>.</p>
     </section>`;
   }
 
@@ -1173,8 +1228,10 @@
     Q.underlying = und;
     const setUnd = v => { Q.underlying = v; setUndState(v); try { localStorage.setItem("fno-underlying", v); } catch (e) {} };
     const [bhav, setBhav] = useState({ days: [], banners: { check: [], minor: [], pending_old: [] } });
+    const [marks, setMarks] = useState(NO_MARKS);
     const [openDay, setOpenDay] = useState("");
     const [checkingAll, setCheckingAll] = useState(false);
+    const [checkingFour, setCheckingFour] = useState(false);
     const last = useRef(null);
     const seen = useRef({ job: -1, count: 0 });
 
@@ -1208,13 +1265,16 @@
 
     // Bhavcopy check of every saved Kite day in the F&O folder (backfill/bhav.py list_days / banners)
     const loadBhav = useCallback(async () => {
-      if (!FULL_PATH.test(fnoStore.trim())) { setBhav({ days: [], banners: { check: [], minor: [], pending_old: [] } }); return; }
+      if (!FULL_PATH.test(fnoStore.trim())) { setBhav({ days: [], banners: { check: [], minor: [], pending_old: [] } }); setMarks(NO_MARKS); return; }
       try {
-        const j = await (await fetch(`${U.bhavStatus}?${new URLSearchParams({ folder: fnoStore, ...Q })}`, { cache: "no-store" })).json();
+        const q = new URLSearchParams({ folder: fnoStore, ...Q });
+        const [j, m] = await Promise.all([fetch(`${U.bhavStatus}?${q}`, { cache: "no-store" }).then(r => r.json()),
+                                          fetch(`${U.bhavMarks}?${q}`, { cache: "no-store" }).then(r => r.json())]);
         if (!j.error) setBhav(j);
+        setMarks(m.error ? NO_MARKS : m);
       } catch (e) {}
     }, [fnoStore, und]);
-    useEffect(() => { setOpenDay(""); setBhav({ days: [], banners: { check: [], minor: [], pending_old: [] } }); }, [und]);
+    useEffect(() => { setOpenDay(""); setBhav({ days: [], banners: { check: [], minor: [], pending_old: [] } }); setMarks(NO_MARKS); }, [und]);
     useEffect(() => { const t = setTimeout(loadBhav, 600); return () => clearTimeout(t); }, [loadBhav]);
     const jobRunning = !!job && job.state === "running";
     useEffect(() => { if (job && !jobRunning) loadBhav(); }, [jobRunning]);
@@ -1223,6 +1283,19 @@
       await bhavCheck({ folder: fnoStore, missing: "1" }, toast);
       await loadBhav(); poll();
       setCheckingAll(false);
+    };
+    // nifty_bhav.py --missing-all: NIFTY / SENSEX x Kite / Dhan on the default folders of this keep-zero store
+    const checkFour = async () => {
+      setCheckingFour(true);
+      try {
+        const j = await (await fetch(U.bhavCheckAll, { method: "POST", body: new URLSearchParams({ keep_zero: keepZero ? "1" : "0" }) })).json();
+        if (j.error) toast(j.error, "err");
+        else j.rows.forEach(r => toast(`${r.underlying} ${r.source === "dhan" ? "Dhan" : "Kite"}: ${r.error ? `not run (${r.error})` :
+          `${r.checked} checked, ${r.still_pending} still pending, ${r.no_bhav_marked} marked no bhavcopy, ${r.failed} failed, ${r.red} red`}`,
+          r.code === 0 ? "ok" : r.code === 4 ? "info" : "err"));
+      } catch (e) { toast("Couldn't reach the app. Check that python app.py is running.", "err"); }
+      await loadBhav(); poll();
+      setCheckingFour(false);
     };
     const showDay = d => { setOpenDay(d); setTimeout(() => document.getElementById("bhav-title")?.scrollIntoView({ behavior: "smooth", block: "start" }), 50); };
     useEffect(() => { if (boot.error) toast(boot.error, "err"); else if (boot.dhan_connected) toast("Dhan connected", "ok"); }, []);
@@ -1255,6 +1328,14 @@
         <span>${bhav.banners.pending_old.length} ${bhav.banners.pending_old.length === 1 ? "day" : "days"} not checked against the bhavcopy.</span>
         <button type="button" className="btn btn-ghost" disabled=${checkingAll || jobRunning} onClick=${checkAll}>
           ${checkingAll ? html`<span className="spinner"></span> Checking` : "Check all pending"}</button></div>`}
+      ${marks.reviewed.length > 0 && html`<div className="banner quiet">
+        <span>Reviewed (differences looked at, hidden while the counts stay the same): ${marks.reviewed.map(d => short(parse(d))).join(", ")}.</span></div>`}
+      ${marks.no_bhav.length > 0 && html`<div className="banner quiet">
+        <span>No bhavcopy (marked; not checked): ${marks.no_bhav.map(d => short(parse(d))).join(", ")}.</span></div>`}
+      <div className="check-four">
+        <button type="button" className="btn btn-ghost" disabled=${checkingFour || checkingAll || jobRunning} onClick=${checkFour}
+                title="Check the pending days of NIFTY and SENSEX, Kite and Dhan (default folders), one after another">
+          ${checkingFour ? html`<span className="spinner"></span> Checking all four` : "Check all pending (all four)"}</button></div>
       <div className="grid">
         <div>
           ${!DHAN && html`<${Planner} job=${job} toast=${toast} onPoll=${poll} folder=${folder} setFolder=${setFolder} />`}
@@ -1270,7 +1351,7 @@
       </div>
       <div className="full-row">
         <${BhavCard} job=${job} toast=${toast} onPoll=${poll} folder=${fnoStore} rawFolder=${fnoFolder} days=${bhav.days} onBhav=${loadBhav}
-                     openDay=${openDay} setOpenDay=${setOpenDay} checkAll=${checkAll} checkingAll=${checkingAll} keepZero=${keepZero} und=${und} />
+                     openDay=${openDay} setOpenDay=${setOpenDay} checkAll=${checkAll} checkingAll=${checkingAll || checkingFour} keepZero=${keepZero} und=${und} marks=${marks} />
       </div>
       <${Toasts} items=${toasts} />
     </div>`;

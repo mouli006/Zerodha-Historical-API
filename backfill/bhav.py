@@ -430,14 +430,24 @@ def run_bhav(run_date, data_root, underlying="NIFTY", bhav_file=None, log=print,
             log_line(os.path.join(root, "bhavcopy.log"), f"{run_date}: {e}")
             echo(str(e))
             return "not_available", PENDING, None
+        except BhavError as e:   # logged too, so bhavcopy.log's last line for the day is the last fetch (bhav_review)
+            os.makedirs(root, exist_ok=True)
+            log_line(os.path.join(root, "bhavcopy.log"), f"{run_date}: {e}")
+            raise
         original = os.path.basename(source)
-    header, rows = read_bhav(data)
-    dates = {r["TradDt"] for r in rows if r.get("TradDt")}
-    if dates and dates != {run_date.isoformat()}:
-        raise BhavError(f"This bhavcopy is for {', '.join(sorted(dates))}, not {run_date}.")
-    mine = [r for r in rows if r["TckrSymb"] == underlying and r["FinInstrmTp"] in BHAV_TYPES]
-    if not mine:
-        raise BhavError(f"No {underlying} index futures or options in this bhavcopy.")
+    try:
+        header, rows = read_bhav(data)
+        dates = {r["TradDt"] for r in rows if r.get("TradDt")}
+        if dates and dates != {run_date.isoformat()}:
+            raise BhavError(f"This bhavcopy is for {', '.join(sorted(dates))}, not {run_date}.")
+        mine = [r for r in rows if r["TckrSymb"] == underlying and r["FinInstrmTp"] in BHAV_TYPES]
+        if not mine:
+            raise BhavError(f"No {underlying} index futures or options in this bhavcopy.")
+    except BhavError as e:
+        if not bhav_file:
+            os.makedirs(root, exist_ok=True)
+            log_line(os.path.join(root, "bhavcopy.log"), f"{run_date}: {e}")
+        raise
 
     day_dir = fno.find_day_dir(root, run_date)
     if day_dir is None:

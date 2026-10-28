@@ -239,6 +239,22 @@ Grouping never hides anything: every difference still has its row, counts in the
 
 The check also fills six columns of the day's `summary.csv`: `Bhav_traded_contracts, Kite_files, Missing_in_kite, Extra_in_kite, OI_diffs, Price_diffs`. There is one row per option expiry and one `Futures` row per future expiry. Until a check has run, these columns are blank and `run.log` ends with `Bhavcopy: pending`. Downloading the day again keeps the check. Exit codes: `0` OK, `1` differences found (or the check couldn't run), `4` bhavcopy not available yet.
 
+### Check all four at once, reviewed days and unpublished bhavcopies
+
+```
+python nifty_bhav.py --missing-all                                  # NIFTY Kite, NIFTY Dhan, SENSEX Kite, SENSEX Dhan
+python nifty_bhav.py --review 2026-10-20 --underlying NIFTY --source kite --note "Kite volume, accepted"
+python nifty_bhav.py --unreview 2026-10-20 --underlying NIFTY --source kite
+python nifty_bhav.py --no-bhav 2026-11-08 --underlying NIFTY --note "Muhurat: no F&O bhavcopy"
+python nifty_bhav.py --undo-no-bhav 2026-11-08 --underlying NIFTY
+python nifty_bhav.py --reviewed-list
+```
+
+- `--missing-all` checks every pending day of the four sets, one after another, on the default folders (as `--missing` would for each). A set that fails (its lock busy, a bad folder) doesn't stop the others. At the end it prints one table: days checked, still pending, marked "no bhavcopy", failed, and red days. The exit code is the worst of the four (`1` over `4` over `0`). On the dashboard, **Check all pending (all four)** above the cards does the same. It refuses while a download runs or any of the four is locked. The per-card buttons stay.
+- **Mark reviewed** (diff panel, or `--review`) records that you looked at a checked day's differences. The day then leaves the red or amber banner and shows in a grey "Reviewed" line instead. If the day is checked again and its counts change, the review no longer applies and the day is red again. A day with **missing contracts can't be reviewed**: re-download them while the contract is still live.
+- **Bhavcopy not published** (on a pending row, or `--no-bhav`) is for a past day whose last bhavcopy fetch was a 404, such as a special session the exchange never published. It applies in every Kite and Dhan store of that index. `--missing`, `--missing-all` and the buttons stop asking for the day, and it moves from the yellow banner to a grey "No bhavcopy (marked)" line. The day stays unchecked and publishing is unchanged. `--bhav-file` still checks it, and then the mark no longer applies.
+- Nothing is deleted and the checks themselves are never changed. The records live in `bhav_review.json` in each `<INDEX>_FnO_1min[_Dhan]` folder, and an undo adds a new record.
+
 ### Reading the data in a backtest
 `backfill/fno_loader.py` reads the saved files back into pandas, with a leading `Datetime` column (IST, tz-naive):
 ```python
