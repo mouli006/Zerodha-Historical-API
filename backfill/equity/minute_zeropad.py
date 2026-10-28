@@ -400,12 +400,12 @@ def one_stock(r, calc, sid, path, cand, apply, backup, backed, tmps, me_after, n
     pre = [c for c in different(stored, st.base, ones)[0] if c != "check"]
     if pre:
         r["refused_before"][sid] = (symbol, pre)
-    if not st.fixes:
-        return
-    new, fixed = st.new_frame()
+    new, fixed = st.new_frame() if st.fixes else (stored, np.zeros(len(stored), bool))
     post = [c for c in different(new, st.trial, ones)[0] if c != "check"]
     if post:
         r["refused_after"][sid] = (symbol, post)
+    if not st.fixes:
+        return
     last = len(stored) - 1
     if any(not same(st.trial.at[last, c], stored.at[last, c]) for c in SCALES):
         r["next_update"].append((symbol, sid))

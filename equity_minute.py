@@ -28,13 +28,17 @@ Phase 2 (backfill/equity/minute_download.py), each with --folder:
     python equity_minute.py fix-zero-padding [--apply]   days.parquet rows whose aggregates still count Kite's
                                                   all-zero padding bars, offline (dry run unless --apply, which backs
                                                   up first)
+    python equity_minute.py fix-rescale [--apply --expect N]   held padded days.parquet rows loaded at the wrong
+                                                  minute_scale level, offline (dry run unless --apply; --apply needs
+                                                  --expect = the dry run's count, backs up first)
 --workers is 1 to 4 (default 2); all workers share one --speed limit.
 
 Every command takes --folder (absolute; default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data) and --include-etf.
 Output: <folder>/equity_1min/plan/. Only tokens (not --rematch) and probe use the network (Kite only; the token
 from .env is never printed). Exit codes: 0 done; 1 an input not built or stale, tokens not run yet (or no saved list
 for --rematch), some probes failed or the probe stopped, show found nothing, retoken left a stock to REVIEW,
-fix-negative-volume / fix-zero-padding --apply failed (files restored); 2 bad
+fix-negative-volume / fix-zero-padding / fix-rescale --apply failed (files restored), fix-rescale found another
+count than --expect; 2 bad
 arguments, a lock busy, an input
 build or bhavcopy download running, a Kite F&O run busy, or Kite sign-in needed."""
 import argparse
@@ -50,6 +54,7 @@ from backfill.equity import minute_download as md
 from backfill.equity import minute_negvol as mn
 from backfill.equity import minute_plan as mp
 from backfill.equity import minute_repair as mr
+from backfill.equity import minute_rescale as mrs
 from backfill.equity import minute_zeropad as mz
 from backfill.equity import security_master as sm
 from config import equity_data_dir
@@ -175,6 +180,12 @@ def main(argv=None):
                         help="phase 2: fix the days whose aggregates count Kite's zero padding bars, offline (dry run)")
     zp.add_argument("--apply", action="store_true", help="write the fixed days.parquet rows (backup first)")
     zp.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
+    rs = sub.add_parser("fix-rescale",
+                        help="phase 2: fix the held padded days loaded at the wrong minute_scale level, offline "
+                             "(dry run)")
+    rs.add_argument("--apply", action="store_true", help="write the fixed days.parquet rows (backup first)")
+    rs.add_argument("--expect", type=int, help="the count of rows the dry run found (needed with --apply)")
+    rs.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
     for sp in (dl, up, st):
         sp.add_argument("--speed", type=speed, default=md.SPEED, help="requests per second (default 2.5, at most 3)")
         sp.add_argument("--workers", type=int, choices=range(1, md.MAX_WORKERS + 1), default=md.WORKERS,
@@ -183,6 +194,8 @@ def main(argv=None):
     args = p.parse_args(argv)   # argparse errors exit with 2
     if args.folder and not os.path.isabs(args.folder):
         p.error("--folder must be an absolute path")
+    if args.cmd == "fix-rescale" and args.apply and args.expect is None:
+        p.error("fix-rescale --apply needs --expect N (the count of rows the dry run found)")
     folder = args.folder or equity_data_dir()
     try:
         if args.cmd == "tokens":
@@ -224,6 +237,9 @@ def main(argv=None):
             return 0
         if args.cmd == "fix-zero-padding":
             mz.fix(folder, apply=args.apply)
+            return 0
+        if args.cmd == "fix-rescale":
+            mrs.fix(folder, apply=args.apply, expect=args.expect)
             return 0
         if args.cmd == "retoken":
             return 1 if md.retoken(folder, apply=args.apply, speed=args.speed)["review"] else 0

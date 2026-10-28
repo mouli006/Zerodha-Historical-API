@@ -675,6 +675,7 @@ python equity_minute.py checks                      # the check labels again wit
 python equity_minute.py retoken                     # stocks not done: match again in Kite's list (dry run; --apply)
 python equity_minute.py fix-negative-volume         # days with a garbage minute volume, offline (dry run; --apply)
 python equity_minute.py fix-zero-padding            # days whose aggregates count Kite's zero bars, offline (dry run; --apply)
+python equity_minute.py fix-rescale                 # held padded days loaded at the wrong scale, offline (dry run; --apply --expect N)
 ```
 
 Every evening (or the next morning), once the history is complete:
@@ -703,6 +704,13 @@ python equity_minute.py update                      # then: minutes up to the pr
   conversion levels a fresh derive would move (never written). Its report folder is
   `equity_1min/zeropad/dryrun_<time>/`. Then `--apply` (backup in `equity_1min/archive/zeropad_<time>/`). The minute
   bars, the volume and the conversion columns are never changed.
+- A few rows `fix-zero-padding` held are padded days at the edge of a Kite minute scale period: they load at the wrong
+  price level (BALKRISIND 2015-03-24 at 2x the bhavcopy, JMA 2015-03-30 at 0.2x). `python equity_minute.py
+  fix-rescale` (offline dry run) lists the rows whose loaded high / low / close are more than 1% off the bhavcopy and
+  would be within 1% after the fix, and every held row that stays as it is, with the reason. Its report folder is
+  `equity_1min/zeropad/rescale_dryrun_<time>/`. Then `--apply --expect N`, where N is the dry run's count (any other
+  count is refused; backup in `equity_1min/archive/zeropad_rescale_<time>/`). It writes the row's day aggregates,
+  `minute_scale` and labels, and the next row's labels; nothing else.
 
 - Kite's prices are adjusted by Kite's own rules, so the files keep Kite's candles unchanged plus, per day, the conversion back to the bhavcopy's raw prices. Read them in Python with `from backfill.equity.minute_store import load_minute`: `load_minute("RELIANCE", "2024-01-01", "2024-01-31", prices="raw")`. `prices="ours"` gives our split / bonus adjusted prices (for indicators), `prices="kite"` Kite's own. By default
 (`clean=True`) Kite's all-zero padding bars are left out, a negative volume reads as 0 and high / low always contain
