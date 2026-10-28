@@ -31,6 +31,7 @@ A local Flask app ("Kite Backfill", one machine) that:
 - `nifty_daily.py`: the daily F&O download (one date, `--missing`, `--refetch-no-trade`, inspect, `--rename-folders`, `--update-day-count`). See docs/dev/fno_download.md.
 - `nifty_bhav.py`: the F&O bhavcopy check and its exports. See docs/dev/fno_bhavcopy_check.md.
 - `nifty_bhav.py --missing-all` / `--review` / `--no-bhav` / `--reviewed-list`: check all four sets, reviewed days and "bhavcopy not published" marks (sidecar `bhav_review.json`; checks never changed). See docs/dev/fno_check_all_and_reviewed.md.
+- `fno_redownload.py DATE --source --underlying [--only|--limit] [--apply]`: re-download a checked day's MISSING_IN_KITE contracts via `fno.redownload_contract` (dry run default; backup, lock, one check). See docs/dev/fno_redownload_missing.md.
 - `fno_store.py`: the F&O stores (move-raw, split-stores, derive-without, compare-variants, publish, clear, restore, import). See docs/dev/fno_store.md.
 - `cm_bhav.py`: the NSE equity bhavcopy store. See docs/dev/equity_bhavcopy.md.
 - `cm_bhav.py --special [--apply]`: the weekend sessions of `manual_special_sessions.csv` (dry run asks NSE, writes nothing). See docs/dev/special_sessions.md.
@@ -65,6 +66,7 @@ F&O
 - `backfill/fno_loader.py`: reads raw F&O days back.
 - `backfill/fno_store.py` / `fno_derive.py` / `fno_clear.py` / `fno_import.py`: move-raw / split-stores, without-zero-volume copies, clear/restore, import.
 - `backfill/fno_publish.py` / `fno_backtest.py`: raw -> backtest store, and its reader.
+- `backfill/fno_redownload.py`: missing contracts of a day, re-downloaded one by one (`fno_redownload.py`).
 - CLIs: `nifty_daily.py`, `nifty_bhav.py`, `fno_store.py`.
 
 Equity
@@ -107,6 +109,7 @@ Web
 | F&O bhavcopy check (statuses, severity, routes, exports, BhavCard) | docs/dev/fno_bhavcopy_check.md |
 | check all four, Mark reviewed, bhavcopy not published (sidecar, states, routes) | docs/dev/fno_check_all_and_reviewed.md |
 | Dhan sign-in, Dhan F&O page, `DhanClient` | docs/dev/dhan.md |
+| re-download a day's missing contracts (`fno_redownload.py`: dry run, backup, lock, token, one check) | docs/dev/fno_redownload_missing.md |
 | F&O stores: with/without, derive, move-raw, publish, backtest, clear/restore, import | docs/dev/fno_store.md |
 | NSE equity bhavcopy store (`cm_bhav`) | docs/dev/equity_bhavcopy.md |
 | special sessions (Muhurat, budget weekends, `cm_bhav.py --special`, what each tool does on a Sunday) | docs/dev/special_sessions.md |

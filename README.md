@@ -255,6 +255,19 @@ python nifty_bhav.py --reviewed-list
 - **Bhavcopy not published** (on a pending row, or `--no-bhav`) is for a past day whose last bhavcopy fetch was a 404, such as a special session the exchange never published. It applies in every Kite and Dhan store of that index. `--missing`, `--missing-all` and the buttons stop asking for the day, and it moves from the yellow banner to a grey "No bhavcopy (marked)" line. The day stays unchecked and publishing is unchanged. `--bhav-file` still checks it, and then the mark no longer applies.
 - Nothing is deleted and the checks themselves are never changed. The records live in `bhav_review.json` in each `<INDEX>_FnO_1min[_Dhan]` folder, and an undo adds a new record.
 
+### Re-downloading all missing contracts of a day
+
+```
+python fno_redownload.py 2026-10-22 --source dhan --underlying NIFTY                            # dry run: lists only
+python fno_redownload.py 2026-10-22 --source dhan --underlying NIFTY --only NIFTY2260023NOV26CE --apply
+python fno_redownload.py 2026-10-22 --source dhan --underlying NIFTY --apply
+```
+
+- Re-downloads every `MISSING_IN_KITE` contract of a checked day, one at a time, the same way as the dashboard's **Re-download** button. It works on any saved day, including one outside the download window. Expired contracts are skipped because the broker no longer serves them.
+- Without `--apply` it only shows the contracts by expiry and type, live vs. expired, the backup folder, the speed and a time estimate. It writes nothing and makes no network call.
+- `--apply` first copies the day folder to `<F&O home>\archive\<time>_redownload_<INDEX>_<source>_<date>\` with a SHA-256 `manifest.json`, and verifies the copy. It then checks the token, fetches at 2.5 requests/s and runs the bhavcopy check once at the end. Last, it prints saved / still no candles / skipped expired / failed and Missing before -> after.
+- If the token or network fails mid-run, it stops (exit `2`). Saved files stay, so run the same command again to continue. Keep zero-volume is ON by default (the with store). The without store and the backtest store are not touched: refresh them with `fno_store.py clear` + `derive-without` and `publish`.
+
 ### Reading the data in a backtest
 `backfill/fno_loader.py` reads the saved files back into pandas, with a leading `Datetime` column (IST, tz-naive):
 ```python
