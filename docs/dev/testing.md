@@ -21,6 +21,7 @@ docs/dev/equity_minute_finished_days.md; the same world and fakes plus an `EdgeK
 
 ## Adding a test
 - Put it in `tests/test_<topic>.py`; reuse the fakes above (`FakeKite`, fake `requests`, `FakeSession`/`FakeBrowser`) and the conftest fixtures (`trim_on`, `derive_on`).
+- Zip fixtures use a fixed entry date (`zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))`), never now, so byte comparisons never depend on the clock (P7, P42).
 - Stub `load_env`/`save_env`/`keep_zero_volume` wherever a route or CLI reads them; never depend on a real token, never make a network call.
 - `tests/test_equity_imports.py` scans `backfill/equity/**/*.py` with `ast` and fails on any import of `backfill.fno*`, `backfill.bhav*`, `backfill.dhan_api`, `dhan`, `nifty_*` or `fno_store`; its checker is also tested on sample sources so it is not vacuous while the package is nearly empty.
 - New tests are added, never weakened: run the full `pytest` before and after and compare the count.

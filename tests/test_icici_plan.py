@@ -10,6 +10,7 @@ import shutil
 import time
 import zipfile
 from datetime import date, datetime, time as dtime, timedelta
+from types import SimpleNamespace
 
 import pandas as pd
 import pyarrow as pa
@@ -154,6 +155,8 @@ def write_kite(folder, sid):
 # ---- the fake Breeze client ----
 
 def master_zip(extra=()):
+    """A fixed entry date (not now), so the same master always gives the same bytes: the saved-as-received check
+    never depends on the clock crossing a 2-second zip time step between two builds (P42)."""
     rows = [{"Token": str(100 + k), "ShortName": s["code"], "Series": "EQ", "CompanyName": f"{sym} LIMITED",
              "ISINCode": s.get("icici_isin", s["isin"]), "ExchangeCode": sym}
             for k, (sym, s) in enumerate(STOCKS.items()) if s["code"]]
@@ -164,8 +167,8 @@ def master_zip(extra=()):
         text += ",".join(f'"{r.get(c, "1")}"' for c in cols) + "\n"
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w") as z:
-        z.writestr("NSEScripMaster.txt", text)
-        z.writestr("BSEScripMaster.txt", "x\n")
+        z.writestr(zipfile.ZipInfo("NSEScripMaster.txt", date_time=(1980, 1, 1, 0, 0, 0)), text)
+        z.writestr(zipfile.ZipInfo("BSEScripMaster.txt", date_time=(1980, 1, 1, 0, 0, 0)), "x\n")
     return buf.getvalue()
 
 
@@ -373,9 +376,12 @@ def test_chunk_helpers():
     assert len(r) == 3 and r[0] == (big[0], big[899]) and r[1][0] == big[900] and r[-1][1] == big[-1]
 
 
-def test_master_saved_and_reused(world):
+def test_master_saved_and_reused(world, monkeypatch):
+    clock = [time.time()]                                 # zipfile's clock only: it moves 10 s after the first build
+    monkeypatch.setattr(zipfile, "time", SimpleNamespace(time=lambda: clock[0], localtime=time.localtime))
     fake = FakeBreeze()
     run_plan(world, client=fake)
+    clock[0] += 10
     ref = st.reference_dir(world)
     assert sorted(os.listdir(ref)) == [f"NSEScripMaster_{NOW.date()}.txt", f"SecurityMaster_{NOW.date()}.zip"]
     with open(os.path.join(ref, f"SecurityMaster_{NOW.date()}.zip"), "rb") as fh:
