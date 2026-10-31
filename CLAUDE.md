@@ -48,6 +48,7 @@ A local Flask app ("Kite Backfill", one machine) that:
 - `equity_minute.py fix-negative-volume [--apply]`: Kite's garbage minute volumes count as 0 (`NEGATIVE_VOLUME`, `neg_volume_bars`); fixes the days.parquet rows stored before (bars never changed). See docs/dev/equity_minute_negative_volume.md.
 - `equity_minute.py fix-zero-padding [--apply]`: re-aggregates `days.parquet` rows that still count Kite's all-zero padding bars (offline; conversion columns, volume and bars never written; drift held and listed). See docs/dev/equity_minute_zero_padding.md.
 - `equity_minute.py fix-rescale [--apply --expect N]`: held padded rows loaded more than 1% off the bhavcopy whose fresh derive is within 1% (minute_scale + labels, next row's labels; guard). See docs/dev/equity_minute_rescale.md.
+- `equity_minute.py fix-dayempty [--apply --expect-labels N --expect-borrow M]`: DAY_EMPTY rows checked against the bhavcopy, borrowing only from an OK same-factor day (`Calc.derive`; module `backfill/equity/minute_dayempty.py`). See docs/dev/equity_minute_dayempty.md.
 - `icici_minute.py plan / download / status / checks / coverage / show`: ICICI Breeze 1-minute data for the Kite gaps (own store `equity_1min_icici/`; `.env` BREEZE_API_KEY + daily BREEZE_SESSION_TOKEN; never orders). See docs/dev/equity_icici_source.md.
 - Never run a CLI against real Kite or Dhan unless the user asks.
 
@@ -127,4 +128,5 @@ Web
 | Kite 1-minute bars with a negative volume (evidence, NEGATIVE_VOLUME, `fix-negative-volume`) | docs/dev/equity_minute_negative_volume.md |
 | Kite 1-minute rows built with all-zero padding bars (evidence, PADDING / OTHER, hold rules, `fix-zero-padding`) | docs/dev/equity_minute_zero_padding.md |
 | held padded rows at the wrong minute_scale level (BALKRISIND / JMA evidence, selection rule, cells, guard, `fix-rescale`) | docs/dev/equity_minute_rescale.md |
+| DAY_EMPTY rows: bhavcopy check, safe borrowing, holds, `fix-dayempty` (TIL evidence, counts, guard) | docs/dev/equity_minute_dayempty.md |
 | ICICI Breeze 1-minute source (endpoints, limits, work list, conversion evidence, checks, loader) | docs/dev/equity_icici_source.md |

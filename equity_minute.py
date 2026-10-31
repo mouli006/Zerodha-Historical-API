@@ -31,14 +31,18 @@ Phase 2 (backfill/equity/minute_download.py), each with --folder:
     python equity_minute.py fix-rescale [--apply --expect N]   held padded days.parquet rows loaded at the wrong
                                                   minute_scale level, offline (dry run unless --apply; --apply needs
                                                   --expect = the dry run's count, backs up first)
+    python equity_minute.py fix-dayempty [--apply --expect-labels N --expect-borrow M]   stored DAY_EMPTY rows
+                                                  checked against the bhavcopy and borrowing only from an OK
+                                                  same-factor day, offline (dry run unless --apply; --apply needs
+                                                  the dry run's two counts, backs up first)
 --workers is 1 to 4 (default 2); all workers share one --speed limit.
 
 Every command takes --folder (absolute; default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data) and --include-etf.
 Output: <folder>/equity_1min/plan/. Only tokens (not --rematch) and probe use the network (Kite only; the token
 from .env is never printed). Exit codes: 0 done; 1 an input not built or stale, tokens not run yet (or no saved list
 for --rematch), some probes failed or the probe stopped, show found nothing, retoken left a stock to REVIEW,
-fix-negative-volume / fix-zero-padding / fix-rescale --apply failed (files restored), fix-rescale found another
-count than --expect; 2 bad
+fix-negative-volume / fix-zero-padding / fix-rescale / fix-dayempty --apply failed (files restored), fix-rescale /
+fix-dayempty found other counts than --expect*, fix-dayempty found a stale bhavcopy cache; 2 bad
 arguments, a lock busy, an input
 build or bhavcopy download running, a Kite F&O run busy, or Kite sign-in needed."""
 import argparse
@@ -50,6 +54,7 @@ import pandas as pd
 from backfill.equity import adjustments as adj
 from backfill.equity import exits as ex
 from backfill.equity import index_membership as im
+from backfill.equity import minute_dayempty as mde
 from backfill.equity import minute_download as md
 from backfill.equity import minute_negvol as mn
 from backfill.equity import minute_plan as mp
@@ -186,6 +191,13 @@ def main(argv=None):
     rs.add_argument("--apply", action="store_true", help="write the fixed days.parquet rows (backup first)")
     rs.add_argument("--expect", type=int, help="the count of rows the dry run found (needed with --apply)")
     rs.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
+    de = sub.add_parser("fix-dayempty",
+                        help="phase 2: check the stored DAY_EMPTY rows against the bhavcopy and borrow only from an OK "
+                             "same-factor day, offline (dry run)")
+    de.add_argument("--apply", action="store_true", help="write the changed days.parquet cells (backup first)")
+    de.add_argument("--expect-labels", type=int, help="the dry run's labels count (needed with --apply)")
+    de.add_argument("--expect-borrow", type=int, help="the dry run's borrow count (needed with --apply)")
+    de.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
     for sp in (dl, up, st):
         sp.add_argument("--speed", type=speed, default=md.SPEED, help="requests per second (default 2.5, at most 3)")
         sp.add_argument("--workers", type=int, choices=range(1, md.MAX_WORKERS + 1), default=md.WORKERS,
@@ -196,6 +208,8 @@ def main(argv=None):
         p.error("--folder must be an absolute path")
     if args.cmd == "fix-rescale" and args.apply and args.expect is None:
         p.error("fix-rescale --apply needs --expect N (the count of rows the dry run found)")
+    if args.cmd == "fix-dayempty" and args.apply and (args.expect_labels is None or args.expect_borrow is None):
+        p.error("fix-dayempty --apply needs --expect-labels N --expect-borrow M (the counts of the dry run)")
     folder = args.folder or equity_data_dir()
     try:
         if args.cmd == "tokens":
@@ -240,6 +254,9 @@ def main(argv=None):
             return 0
         if args.cmd == "fix-rescale":
             mrs.fix(folder, apply=args.apply, expect=args.expect)
+            return 0
+        if args.cmd == "fix-dayempty":
+            mde.fix(folder, apply=args.apply, expect_labels=args.expect_labels, expect_borrow=args.expect_borrow)
             return 0
         if args.cmd == "retoken":
             return 1 if md.retoken(folder, apply=args.apply, speed=args.speed)["review"] else 0

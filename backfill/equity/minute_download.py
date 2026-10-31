@@ -883,6 +883,47 @@ def inputs_from(rows, runs_of_day, day_frames):
     return out[INPUT_COLUMNS]
 
 
+NO_OK_SOURCE = "no OK source day"   # a DAY_EMPTY day without an OK same-factor day to borrow its conversion from
+
+
+def dayempty_source(i, good, src, scale, factor, dates):
+    """The row a DAY_EMPTY row i borrows its conversion from: the nearest OK day (good: minutes, a day candle and a
+    bhavcopy row, no HIGHLOW_DIFF / CLOSE_DIFF / SCALE_STEP) of the same factor, the same minute_scale first; without
+    one the nearest day of src of the same factor (any check, the same minute_scale first); never across a factor
+    change (None: no day of the same factor)."""
+    for pool in (good, src):
+        f = pool[factor[pool] == factor[i]]
+        s = f[scale[f] == scale[i]]
+        pick = s if len(s) else f
+        if len(pick):
+            return int(pick[np.argmin(np.abs(dates[pick] - dates[i]))])
+    return None
+
+
+def dayempty_checks(d, day_empty):
+    """(HIGHLOW_DIFF, CLOSE_DIFF) of the DAY_EMPTY rows of a derived frame: the day's minute high / low / close loaded
+    with its (borrowed) conversion (ms.convert, as load_minute) against the bhavcopy, with the normal days' tolerance
+    in rupees (PRICE_REL x price + HALF_TICK). Other rows False."""
+    n = len(d)
+    hl, cl = np.zeros(n, bool), np.zeros(n, bool)
+    idx = np.flatnonzero(day_empty)
+    if not len(idx):
+        return hl, cl
+    m = d.loc[idx, ["kind", "ratio", "kite_multiplier", "kite_difference", "vol_ratio", "minute_scale",
+                    "minute_volume_scale"]].reset_index(drop=True)
+    for k in ("high", "low", "close"):
+        m[k] = d.loc[idx, f"minute_{k}"].to_numpy(float)
+    m["open"], m["volume"] = m["close"], 0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        c = ms.convert(m)
+        lh, ll = c["high"], c["low"]
+        bh, bl, bc = (d.loc[idx, f"bhav_{k}"].to_numpy(float) for k in ("high", "low", "close"))
+        th, tl, tc = (mp.PRICE_REL * np.abs(x) + mp.HALF_TICK for x in (bh, bl, bc))
+        hl[idx] = (lh > bh + th) | (ll < bl - tl)
+        cl[idx] = (bc > lh + tc) | (bc < ll - tc)
+    return hl, cl
+
+
 class Calc:
     """What every stock's days need: the bhavcopy rows (read per stock from bhav_cache), factors and corporate
     actions (from minute_plan.Inputs). Building it refreshes the cache: the caller holds equity_1min/.lock."""
@@ -968,24 +1009,8 @@ class Calc:
             vr = np.where(has_min & has_day & (mv > 0) & (kv > 0), kv / mv, np.nan)
         d["minute_volume_scale"] = volume_levels(vr)
 
-        # days without their own conversion take the nearest day's (same minute_scale and factor first)
-        d["conversion_from"] = ""
-        src = np.flatnonzero(own & ~np.isnan(d["ratio"].to_numpy(float)))
-        dates = np.array([x.toordinal() for x in d["date"]])
-        for i in np.flatnonzero(~own | np.isnan(d["ratio"].to_numpy(float))):
-            if not len(src):
-                break
-            same = src[(scale[src] == scale[i]) & (d["our_factor"].to_numpy()[src] == d["our_factor"].iat[i])]
-            pool = same if len(same) else src
-            j = pool[np.argmin(np.abs(dates[pool] - dates[i]))]
-            for c in ("ratio", "kite_multiplier", "kite_difference", "vol_ratio", "kind"):
-                d.at[i, c] = d.at[j, c]
-            d.at[i, "conversion_from"] = iso(d.at[j, "date"])
-        d["kind"] = d["kind"].replace("", "MULTIPLICATIVE")
-        d["symbol"] = d["symbol"].ffill().bfill()
-        d["series"] = d["series"].ffill().bfill()
-
-        # checks (scaled minutes vs the same-run day candle)
+        # checks of the days with a day candle (scaled minutes vs the same-run day candle); first, because a DAY_EMPTY
+        # day may only borrow from a day whose own check is OK. They read no borrowed column.
         half = np.where(np.isnan(d["half"].to_numpy(float)), mp.HALF_TICK, d["half"].to_numpy(float))
         both = has_min & has_day
         with np.errstate(invalid="ignore"):
@@ -995,13 +1020,8 @@ class Calc:
             vs = mv * d["minute_volume_scale"].to_numpy(float)
             vol = both & ((vs > kv * VOLUME_HIGH + 1) | (vs < kv * VOLUME_LOW))
         last_bar = d["last_bar"].fillna("").astype(str).to_numpy(object)
-        auction = cl & (last_bar >= AUCTION_FROM) & (last_bar < AUCTION_TO)    # the close came from the auction
-        # CANDLE_UNCONFIRMED is never derived (2015-2018 final candles often equal the minute sum too): update sets
-        # it on the days it stores after the deferral cap (add_check), checks keeps it
-        flags = {"EXTRA_SESSION": ~has_bhav, "DAY_EMPTY": has_min & has_bhav & ~has_day,
-                 "MINUTE_EMPTY": has_day & has_bhav & ~has_min, "HIGHLOW_DIFF": hl, "CLOSE_DIFF": cl & ~auction,
-                 "CLOSING_AUCTION": auction, "VOLUME_DIFF": vol, NEGATIVE: d["neg_volume_bars"].to_numpy() > 0,
-                 "SCALE_STEP": np.zeros(n, bool), "CANDLE_UNCONFIRMED": np.zeros(n, bool)}
+        late = (last_bar >= AUCTION_FROM) & (last_bar < AUCTION_TO)
+        step = np.zeros(n, bool)
         notes = [[] for _ in range(n)]
         vscale = d["minute_volume_scale"].to_numpy(float)
         for i in range(1, n):
@@ -1011,7 +1031,47 @@ class Calc:
                     notes[i].append(f"{kind} {arr[i - 1]:g} -> {arr[i]:g}" +
                                     (f" (corporate action {act})" if act else " (no corporate action near)"))
                     if not act:
-                        flags["SCALE_STEP"][i] = True
+                        step[i] = True
+
+        # days without their own conversion take the nearest day's (same minute_scale and factor first); a DAY_EMPTY
+        # day only an OK day's of the same factor (dayempty_source)
+        d["conversion_from"] = ""
+        day_empty = has_min & has_bhav & ~has_day
+        ratio_ok = ~np.isnan(d["ratio"].to_numpy(float))
+        src = np.flatnonzero(own & ratio_ok)
+        good = np.flatnonzero(own & ratio_ok & has_min & ~hl & ~(cl & ~late) & ~step)
+        factor = d["our_factor"].to_numpy()
+        dates = np.array([x.toordinal() for x in d["date"]])
+        for i in np.flatnonzero(~own | ~ratio_ok):
+            if day_empty[i]:
+                j = dayempty_source(i, good, src, scale, factor, dates)
+                if j is None or j not in good:
+                    notes[i].append(NO_OK_SOURCE)
+                if j is None:
+                    continue
+            else:
+                if not len(src):
+                    continue
+                same = src[(scale[src] == scale[i]) & (factor[src] == factor[i])]
+                pool = same if len(same) else src
+                j = pool[np.argmin(np.abs(dates[pool] - dates[i]))]
+            for c in ("ratio", "kite_multiplier", "kite_difference", "vol_ratio", "kind"):
+                d.at[i, c] = d.at[j, c]
+            d.at[i, "conversion_from"] = iso(d.at[j, "date"])
+        d["kind"] = d["kind"].replace("", "MULTIPLICATIVE")
+        d["symbol"] = d["symbol"].ffill().bfill()
+        d["series"] = d["series"].ffill().bfill()
+
+        # a DAY_EMPTY day: its loaded minutes (borrowed conversion) vs the bhavcopy, the same rule and tolerance
+        de_hl, de_cl = dayempty_checks(d, day_empty)
+        hl, cl = hl | de_hl, cl | de_cl
+        auction = cl & late                                                    # the close came from the auction
+        # CANDLE_UNCONFIRMED is never derived (2015-2018 final candles often equal the minute sum too): update sets
+        # it on the days it stores after the deferral cap (add_check), checks keeps it
+        flags = {"EXTRA_SESSION": ~has_bhav, "DAY_EMPTY": day_empty,
+                 "MINUTE_EMPTY": has_day & has_bhav & ~has_min, "HIGHLOW_DIFF": hl, "CLOSE_DIFF": cl & ~auction,
+                 "CLOSING_AUCTION": auction, "VOLUME_DIFF": vol, NEGATIVE: d["neg_volume_bars"].to_numpy() > 0,
+                 "SCALE_STEP": step, "CANDLE_UNCONFIRMED": np.zeros(n, bool)}
         for i in np.flatnonzero(flags["DAY_EMPTY"] | flags["EXTRA_SESSION"]):
             if d.at[i, "conversion_from"]:
                 notes[i].append(f"converted as {d.at[i, 'conversion_from']}")

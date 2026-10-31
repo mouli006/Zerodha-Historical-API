@@ -676,6 +676,7 @@ python equity_minute.py retoken                     # stocks not done: match aga
 python equity_minute.py fix-negative-volume         # days with a garbage minute volume, offline (dry run; --apply)
 python equity_minute.py fix-zero-padding            # days whose aggregates count Kite's zero bars, offline (dry run; --apply)
 python equity_minute.py fix-rescale                 # held padded days loaded at the wrong scale, offline (dry run; --apply --expect N)
+python equity_minute.py fix-dayempty                # DAY_EMPTY days: bhavcopy check + safe borrowing, offline (dry run; --apply --expect-labels N --expect-borrow M)
 ```
 
 Every evening (or the next morning), once the history is complete:
@@ -711,6 +712,15 @@ python equity_minute.py update                      # then: minutes up to the pr
   `equity_1min/zeropad/rescale_dryrun_<time>/`. Then `--apply --expect N`, where N is the dry run's count (any other
   count is refused; backup in `equity_1min/archive/zeropad_rescale_<time>/`). It writes the row's day aggregates,
   `minute_scale` and labels, and the next row's labels; nothing else.
+- `DAY_EMPTY` days (Kite has minutes but no day candle: the Muhurat sessions of 2017 / 2018, gaps in Kite's day
+  history) borrow their conversion from another day. They now borrow only from an OK day of the same split / bonus
+  factor (never a day with a bad Kite candle: TIL 2018-11-07 loaded 29x too high), and their loaded high / low / close
+  are checked against the bhavcopy (`HIGHLOW_DIFF` / `CLOSE_DIFF` as on other days). Rows stored before this rule:
+  `python equity_minute.py fix-dayempty` (offline dry run, about 15 minutes; run it in your own PowerShell with a
+  `Tee-Object` log). Its report folder is `equity_1min/dayempty/dryrun_<time>/` and its last lines give `labels N` and
+  `borrow M`. Then `--apply --expect-labels N --expect-borrow M` (any other count is refused; backup with sha256 in
+  `equity_1min/archive/dayempty_<time>/`). It writes only the labels / note of DAY_EMPTY rows and, where the source day
+  changes, their conversion; rows with stale aggregates or values that already differ are held and listed.
 
 - Kite's prices are adjusted by Kite's own rules, so the files keep Kite's candles unchanged plus, per day, the conversion back to the bhavcopy's raw prices. Read them in Python with `from backfill.equity.minute_store import load_minute`: `load_minute("RELIANCE", "2024-01-01", "2024-01-31", prices="raw")`. `prices="ours"` gives our split / bonus adjusted prices (for indicators), `prices="kite"` Kite's own. By default
 (`clean=True`) Kite's all-zero padding bars are left out, a negative volume reads as 0 and high / low always contain
