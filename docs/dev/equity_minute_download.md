@@ -83,7 +83,10 @@ Not part of `equity_update.py` (it needs a Kite sign-in); no dashboard UI.
 - When all chunks are DONE, the build writes `data/<sid>.building/` and renames it to `data/<sid>/`:
   `<year>.parquet` (`ts` Asia/Kolkata, OHLC float64, volume int64, zstd, Kite's values unchanged) and
   `days.parquet` (`DAY_COLUMNS`). Then it marks the stock DONE and removes the staging. A DONE stock whose token
-  changed is moved to `archive/<sid>_<date>/` and fetched again.
+  changed (or a new listing) first gets a pre-check: the new token's day candles on its latest 5 bhavcopy days. On a
+  PASS it is fetched again while its old files stay in place, and the new build is compared bar by bar with them
+  (part C) before the old files go to `archive/<sid>_<date>/`. Otherwise nothing is touched and the stock becomes
+  TOKEN_REVIEW (`token-review`): docs/dev/equity_minute_tokencheck.md.
 - Stops: `AuthStop` stops both workers (`SignInNeeded`, exit 2, finished chunks kept). Ctrl+C / `StopJob` ends the
   in-flight chunk, then exit 0 "stopped, resume with the same command". `ChunkFailed` marks the chunk FAILED and the
   run goes on (exit 1; a re-run retries it).
@@ -106,7 +109,7 @@ invalid token`).
   kept; `read_plan` and `update` use them), marks NO_KITE_DATA stocks, clears the state of NO_KITE_DATA stocks found
   again, and writes `check/no_kite_data.csv` and `update/retoken_<date>.csv`. Phase 1's plan folder is not touched,
   except for PROBE_RECOVERED stocks (below).
-  DONE stocks are never candidates; a DONE stock whose token changes still goes to `archive/` (download / update).
+  DONE stocks are never candidates; a DONE stock whose token changes is checked by download / update (docs/dev/equity_minute_tokencheck.md).
 - **NO_KITE_DATA** (`stocks.status`, `reason` "not in Kite's NSE list of <date>", `reason_at`): `download` skips it
   (also with `--symbols`; the work list says so), `estimate` counts it apart, `status` shows it on its own line, and
   `update` does not wait for it (it still refuses for any other stock not DONE). `check/no_kite_data.csv`
