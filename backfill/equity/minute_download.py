@@ -48,6 +48,7 @@ from backfill.equity import exits as ex
 from backfill.equity import index_membership as im
 from backfill.equity import minute_plan as mp
 from backfill.equity import minute_store as ms
+from backfill.equity import minute_tokencheck as tc
 from backfill.equity import security_master as sm
 from backfill.fetch import AuthStop, ChunkFailed, RateLimiter, StopJob, fetch_chunk, make_chunks
 from backfill.job import STOP
@@ -105,6 +106,7 @@ NO_KITE = "NO_KITE_DATA"         # a plan stock Kite no longer lists: download s
 NO_KITE_COLUMNS = ["security_id", "symbol", "isin", "last_bhav_day", "reason"]
 RETOKEN_COLUMNS = ["security_id", "symbol", "old_token", "new_token", "kite_tradingsymbol", "result", "price_check",
                    "note", "action"]
+TOKEN_REVIEW, FROZEN, PARKED = "TOKEN_REVIEW", "FROZEN", "PARKED"   # token changes refused / held (minute_tokencheck)
 PROBE_RECOVERED = "PROBE_RECOVERED"   # retoken: the probe found no day candles, a new probe does (price checked)
 PLAN_TARGETS = ["plan.csv", "kite_vs_bhav.parquet", "kite_adjustment.csv", "eod_mismatch.csv", "probe_progress.sqlite"]
 PRICE_DAYS = 10                  # the price check: Kite's day candles over the 10 days to the last bhavcopy day
@@ -373,6 +375,12 @@ class Progress:
             if not self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='errors'").fetchone():
                 return []
         return self.rows("SELECT * FROM errors ORDER BY at")
+
+    def drop_other_token(self, sid, token):
+        """The chunks and day_fetches rows of a stock fetched with another token (a token change: the rows of the new
+        token stay for the resume; the stocks row is kept until the new build replaces the files)."""
+        for table in ("chunks", "day_fetches"):
+            self.write(f"DELETE FROM {table} WHERE security_id=? AND token<>?", (sid, str(token)))
 
     def reset_stock(self, sid):
         for table in ("chunks", "day_fetches", "stocks"):
@@ -1120,7 +1128,9 @@ class Runner:
         self.stats = {"stocks": 0, "built": 0, "updated": 0, "up_to_date": 0, "failed_stocks": 0, "chunks": 0,
                       "failed_chunks": 0, "rows": 0, "new_days": 0, "problem_days": 0, "stopped": False,
                       "auth": None, "started": time.monotonic(), "done": 0, "deferred_days": 0, "deferred_stocks": 0,
-                      "unconfirmed_days": 0, "negative_volume_days": 0}
+                      "unconfirmed_days": 0, "negative_volume_days": 0, "token_pass": 0, "token_refused": 0,
+                      "token_noref": 0, "token_frozen": 0, "token_accepted": 0}
+        self.token_lines = []                       # (symbol, line) of every full download and token decision
         self.deferred, self.unconfirmed = [], []     # (symbol, date, reason[, days held back])
         self.priority = None
 
@@ -1176,12 +1186,15 @@ class Runner:
     def history(self, item):
         sid, token = item["security_id"], item["token"]
         st = self.db.stocks().get(sid)
-        if st and st["status"] == "DONE" and st["token"] != str(token):
-            archive(self.folder, sid, f"token {st['token']} -> {token}")
-            self.db.reset_stock(sid)
-            shutil.rmtree(staging_dir(self.folder, sid), ignore_errors=True)
         if not item["chunks"]:                      # listed after the target day: the next run fetches it
             return "NOT_YET"
+        changed = bool(st and st["status"] == "DONE" and st["token"] != str(token))
+        if changed or (item.get("new") and not st):
+            refused = self.token_gate(item, st)     # docs/dev/equity_minute_tokencheck.md
+            if refused:
+                return refused
+            if changed:                             # the stored files stay until the new build passes the comparison
+                self.db.drop_other_token(sid, token)
         stage = staging_dir(self.folder, sid)
         os.makedirs(stage, exist_ok=True)
         have = self.db.chunks(sid)
@@ -1221,10 +1234,104 @@ class Runner:
         if failed:
             self.add(failed_stocks=1)
             return "FAILED"
-        if not self.build(item):
+        built = self.build(item)
+        if built == PARKED:
+            return TOKEN_REVIEW
+        if not built:
             return "DEFERRED"
         self.add(built=1)
         return "BUILT"
+
+    def token_line(self, item, text):
+        with self.lock:
+            self.token_lines.append((item["symbol"], text))
+        self.log(text)
+
+    def token_gate(self, item, st):
+        """The pre-check of a full download on a new token (a DONE stock whose token changed, or a new listing):
+        None to go on, else the run result (TOKEN_REVIEW / FROZEN) with the stored files untouched. The stock's
+        active review decides first: another token than the review's clears it; REJECTED is frozen; a parked
+        after-download refusal waits for token-review; ACCEPTED skips the pre-check."""
+        sid, token, sym = item["security_id"], str(item["token"]), item["symbol"]
+        old = st["token"] if st else ""
+        reason = tc.TOKEN_CHANGE if st else tc.NEW_LISTING
+        head = f"  FULL {sid} {sym}: {old or '-'} -> {token} ({reason})"
+        r = tc.active(self.folder, sid)
+        if r and r["new_token"] != token:
+            tc.resolve(self.folder, sid, tc.CLEARED, f"Kite's token is now {token}")
+            self.log(f"  {sym} ({sid}): token review of {r['new_token']} cleared, Kite's token is now {token}")
+            r = None
+        if r and r["state"] == tc.REJECTED:
+            self.add(token_frozen=1)
+            self.token_line(item, f"  {sym} ({sid}): REJECTED, frozen since {r['decided_at'][:10]} (Kite token "
+                                  f"{token}, stored token {old or '-'})")
+            return FROZEN
+        if r and r["state"] == tc.PENDING and r["result"] == tc.AFTER_DOWNLOAD:
+            self.add(token_frozen=1)
+            self.token_line(item, f"  {sym} ({sid}): TOKEN_REVIEW pending since {r['first_seen'][:10]} (after-download "
+                                  f"comparison; parked {r['parked']}), frozen: run equity_minute.py token-review")
+            return TOKEN_REVIEW
+        if r and r["state"] == tc.ACCEPTED:
+            self.add(token_accepted=1)
+            self.token_line(item, f"{head}: ACCEPTED by token-review (pre-check skipped)")
+            return None
+        refs = tc.reference_days(self.calc.bhav_of(sid), self.calc.days, item["last"])
+        v = tc.check_token(self.fetch_days, int(token), refs, tc.factor_fn(self.folder, sid), item["last"])
+        report = tc.write_evidence(self.folder, self.run_id, sid, "precheck", v["rows"], tc.EVIDENCE_COLUMNS) \
+            if v["rows"] or len(refs) else ""
+        tc.add_check(self.folder, {"at": stamp(), "run_id": self.run_id, "security_id": sid, "symbol": sym,
+                                   "kind": "PRECHECK", "reason": reason, "old_token": old, "new_token": token,
+                                   "result": v["result"], "days": str(v["days"]), "max_close_diff": v["max_close_diff"],
+                                   "max_hl_diff": v["max_hl_diff"], "basis": v["basis"], "report": report})
+        diff = (f", {v['days']} days, max diff close {tc.pct(v['max_close_diff'])} high/low "
+                f"{tc.pct(v['max_hl_diff'])} ({v['basis']})" if v["days"] else
+                f", {len(refs)} reference day(s)" + (f", {v['error']}" if v.get("error") else ""))
+        if v["result"] == tc.PASS:
+            self.add(token_pass=1)
+            if r:
+                tc.resolve(self.folder, sid, tc.PASSED, f"pre-check passed {stamp()[:10]}")
+            self.token_line(item, f"{head}: {tc.PASS}{diff}")
+            return None
+        self.add(**{"token_noref" if v["result"] == tc.NO_REFERENCE else "token_refused": 1})
+        tc.set_active(self.folder, {"security_id": sid, "symbol": sym, "reason": reason, "old_token": old,
+                                    "new_token": token, "result": v["result"], "max_close_diff": v["max_close_diff"],
+                                    "max_hl_diff": v["max_hl_diff"], "last_checked": stamp(), "report": report,
+                                    "state": tc.PENDING, "note": v.get("error", "")})
+        self.token_line(item, f"{head}: {v['result']}{diff}: refused, TOKEN_REVIEW (stored files untouched; "
+                              f"evidence {report or '-'})")
+        return TOKEN_REVIEW
+
+    def compare_replace(self, item, tmp, final):
+        """Part C: a token change's new build (tmp) against the stored files (final), before the replace. True: the
+        old files are archived (archive(), 'token A -> B') and the caller replaces them. False: the new build is
+        parked under tokencheck/<run>/, the old files stay, and the stock is listed for review (AFTER_DOWNLOAD)."""
+        sid, token, sym = item["security_id"], str(item["token"]), item["symbol"]
+        old = self.db.stocks()[sid]["token"]
+        c = tc.compare_builds(final, tmp)
+        report = tc.write_evidence(self.folder, self.run_id, sid, "compare", c["rows"], tc.COMPARE_COLUMNS)
+        tc.add_check(self.folder, {"at": stamp(), "run_id": self.run_id, "security_id": sid, "symbol": sym,
+                                   "kind": "AFTER_DOWNLOAD", "reason": tc.TOKEN_CHANGE, "old_token": old,
+                                   "new_token": token, "result": tc.PASS if c["ok"] else tc.FAIL,
+                                   "days": str(c["new_days"]), "max_close_diff": c["max_diff"], "report": report})
+        text = (f"  COMPARE {sid} {sym}: {c['common_bars']:,} common bars, max loaded close diff "
+                f"{tc.pct(c['max_diff'])}, {c['only_new']:,} bars only new, {c['only_old']:,} only old, days "
+                f"{c['old_days']:,} -> {c['new_days']:,}, exempt {len(c['exempt'])}"
+                + (f" ({', '.join(iso(d) for d in c['exempt'])})" if c["exempt"] else ""))
+        if c["ok"]:
+            self.token_line(item, text + ": replaced")
+            archive(self.folder, sid, f"token {old} -> {token}")
+            r = tc.active(self.folder, sid)
+            if r:
+                tc.resolve(self.folder, sid, tc.BUILT, f"rebuilt on {token}")
+            return True
+        parked = tc.park(self.folder, self.run_id, sid, tmp)
+        self.add(token_refused=1)
+        tc.set_active(self.folder, {"security_id": sid, "symbol": sym, "reason": tc.TOKEN_CHANGE, "old_token": old,
+                                    "new_token": token, "result": tc.AFTER_DOWNLOAD, "max_close_diff": c["max_diff"],
+                                    "last_checked": stamp(), "report": report, "parked": parked,
+                                    "state": tc.PENDING, "note": c["reason"]})
+        self.token_line(item, text + f": REFUSED ({c['reason']}), old files kept, new download parked in {parked}")
+        return False
 
     def build(self, item):
         """All chunks done: write data/<sid>/ (into a temporary folder, then renamed) and mark the stock DONE. The
@@ -1285,9 +1392,16 @@ class Runner:
             n -= cut_minutes(tmp, cut)
         days = self.calc.derive(sid, inputs, bhav=bhav)
         ms.write_days(days, os.path.join(tmp, ms.DAYS_FILE))
-        self.warn_negative(item, days)
-        if os.path.isdir(final):
+        st = self.db.stocks().get(sid)
+        if os.path.isdir(final) and st and st["status"] == "DONE" and st["token"] != str(item["token"]):
+            if not self.compare_replace(item, tmp, final):       # a token change: part C before the replace
+                shutil.rmtree(stage, ignore_errors=True)
+                del days, frames, aggs
+                gc.collect()
+                return PARKED
+        elif os.path.isdir(final):
             archive(self.folder, sid, "rebuilt")
+        self.warn_negative(item, days)
         os.replace(tmp, final)
         self.save_stock(item, days, n)
         shutil.rmtree(stage, ignore_errors=True)
@@ -1730,6 +1844,8 @@ def update(folder=None, kite=None, speed=SPEED, workers=WORKERS, now=None, log=p
         os.makedirs(out, exist_ok=True)
         sm.write_csv(pd.DataFrame(instruments), os.path.join(out, f"kite_instruments_NSE_{today.isoformat()}.csv"))
         toks = pd.DataFrame(mp.match_tokens(inp.universe, instruments), columns=mp.TOKEN_COLUMNS)
+        matched = toks.copy()                                   # match_tokens' notes, rewritten from these
+        toks["note"] = tc.notes(folder, matched)                # what was really checked (P93)
         sm.write_csv(toks, os.path.join(out, "tokens.csv"))
         phase1 = set(mp.read_tokens(folder)["security_id"])
         known = {i["security_id"] for i in items}
@@ -1749,6 +1865,7 @@ def update(folder=None, kite=None, speed=SPEED, workers=WORKERS, now=None, log=p
         if back:
             _, stocks, _ = read_progress(folder)
         items = work_list(folder, inp, target=target)
+        clear_back(folder, items, stocks, log)
         last_before = min((sm.as_date(s["last_day"]) for s in stocks.values() if s["status"] == "DONE"),
                           default=target)
         full, daily = [], []
@@ -1757,13 +1874,19 @@ def update(folder=None, kite=None, speed=SPEED, workers=WORKERS, now=None, log=p
             if st and st["status"] == NO_KITE:
                 continue
             if st and st["status"] == "DONE" and st["token"] == str(i["token"]):
-                daily.append(i)
+                daily.append(i)            # the days after its last stored day (Runner.append), however many
             else:
                 full.append(i)
         r = Runner(folder, inp, kite, speed, workers, "update", log)
         log(f"Update to {target} {target:%a} (target day: {why})")
+        changes = sum(1 for i in full if (stocks.get(i["security_id"]) or {}).get("status") == "DONE")
         log(f"Update to {target}: {len(daily):,} stocks, {len(full):,} full downloads "
-            f"({len(fresh):,} new listings, {sum(1 for i in full if not i['new']):,} token changes)")
+            f"({len(fresh):,} new listings, {changes:,} token changes)")
+        for i in full:
+            st = stocks.get(i["security_id"])
+            kind = "TOKEN_CHANGE" if st and st["status"] == "DONE" else "NEW_LISTING" if i["new"] else "RESUME"
+            log(f"  full download {i['security_id']} {i['symbol']}: {(st or {}).get('token') or '-'} -> "
+                f"{i['token']} ({kind})")
 
         def task(item):
             st = stocks.get(item["security_id"])
@@ -1787,7 +1910,17 @@ def update(folder=None, kite=None, speed=SPEED, workers=WORKERS, now=None, log=p
             f"{stats['problem_days']:,} with a problem check), {stats['deferred_days']:,} deferred days "
             f"({stats['deferred_stocks']:,} stocks), {stats['unconfirmed_days']:,} stored unconfirmed, "
             f"{stats['up_to_date']:,} already up to date, {stats['built']:,} full histories built, "
-            f"{stats['failed_stocks']:,} failed.")
+            f"{stats['failed_stocks']:,} failed, token checks: {stats['token_pass']:,} passed, "
+            f"{stats['token_refused']:,} refused, {stats['token_noref']:,} no reference.")
+        if r.token_lines:
+            log("Full downloads and token checks:")
+            for _, line in sorted(r.token_lines):
+                log(line)
+        pending = tc.active(folder)
+        if len(pending):
+            log(f"Token reviews open: {len(pending):,} (python equity_minute.py token-review)")
+        toks["note"] = tc.notes(folder, matched)                # with this run's checks
+        sm.write_csv(toks, os.path.join(out, "tokens.csv"))
         for line in held_text(stats):
             log(line)
         if stats["negative_volume_days"]:
@@ -1842,6 +1975,25 @@ def write_no_kite(folder, inp):
     path = os.path.join(check_dir(folder), "no_kite_data.csv")
     sm.write_csv(pd.DataFrame(rows, columns=NO_KITE_COLUMNS), path)
     return path
+
+
+def clear_back(folder, items, stocks, log=print):
+    """update: an open token review (PENDING / ACCEPTED / REJECTED) of a stock whose Kite token is its stored token
+    again is cleared: the stock is back on the daily path, and Runner.append fetches every day after its last stored
+    day (the days missed while it was frozen). Returns the cleared security_ids."""
+    reviews = tc.active(folder)
+    if not len(reviews):
+        return []
+    token = {i["security_id"]: str(i["token"]) for i in items}
+    out = []
+    for r in reviews.to_dict("records"):
+        sid, st = r["security_id"], stocks.get(r["security_id"])
+        if sid in token and st and st["status"] == "DONE" and st["token"] == token[sid]:
+            tc.resolve(folder, sid, tc.CLEARED, f"Kite's token is back to {token[sid]}")
+            log(f"  {r['symbol']} ({sid}): token review of {r['new_token']} ({r['state']}) cleared, Kite's token is "
+                f"back to {token[sid]}; the missed days are fetched")
+            out.append(sid)
+    return out
 
 
 def back_in_list(folder, inp, kite, toks, stocks, speed=SPEED, log=print):

@@ -35,6 +35,14 @@ Phase 2 (backfill/equity/minute_download.py), each with --folder:
                                                   checked against the bhavcopy and borrowing only from an OK
                                                   same-factor day, offline (dry run unless --apply; --apply needs
                                                   the dry run's two counts, backs up first)
+    python equity_minute.py token-review [--accept SID | --reject SID] [--apply]   the token changes refused by
+                                                  update / download (price check of the new token, or the comparison
+                                                  after the download): list them, accept (rebuild / install the parked
+                                                  download) or reject (frozen until Kite's token changes again); dry
+                                                  run unless --apply (takes the lock); no Kite request
+    python equity_minute.py token-replay [--dates 2026-10-30,2026-10-31]   the price check on the archived token
+                                                  changes of those days plus 2 negative controls (Kite day candles,
+                                                  one request per token), writes nothing
 --workers is 1 to 4 (default 2); all workers share one --speed limit.
 
 Every command takes --folder (absolute; default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data) and --include-etf.
@@ -42,7 +50,9 @@ Output: <folder>/equity_1min/plan/. Only tokens (not --rematch) and probe use th
 from .env is never printed). Exit codes: 0 done; 1 an input not built or stale, tokens not run yet (or no saved list
 for --rematch), some probes failed or the probe stopped, show found nothing, retoken left a stock to REVIEW,
 fix-negative-volume / fix-zero-padding / fix-rescale / fix-dayempty --apply failed (files restored), fix-rescale /
-fix-dayempty found other counts than --expect*, fix-dayempty found a stale bhavcopy cache; 2 bad
+fix-dayempty found other counts than --expect*, fix-dayempty found a stale bhavcopy cache, update / download
+refused a token change (TOKEN_REVIEW: equity_minute.py token-review), token-review could not install a parked
+download; 2 bad
 arguments, a lock busy, an input
 build or bhavcopy download running, a Kite F&O run busy, or Kite sign-in needed."""
 import argparse
@@ -60,6 +70,7 @@ from backfill.equity import minute_negvol as mn
 from backfill.equity import minute_plan as mp
 from backfill.equity import minute_repair as mr
 from backfill.equity import minute_rescale as mrs
+from backfill.equity import minute_tokencheck as tc
 from backfill.equity import minute_zeropad as mz
 from backfill.equity import security_master as sm
 from config import equity_data_dir
@@ -87,7 +98,8 @@ def positive(text):
 
 
 def run_result(stats, cmd):
-    """Exit code of a download / update run: 0 done or stopped by the user, 1 some chunks failed."""
+    """Exit code of a download / update run: 0 done or stopped by the user, 1 some chunks failed or a token change was
+    refused (both are printed)."""
     print(f"{cmd}: {stats['stocks']:,} stocks, {stats['built']:,} built, {stats['chunks']:,} chunks, "
           f"{stats['rows']:,} rows, {stats['requests']:,} requests, {stats['n429']:,} x 429, "
           f"{stats['failed_chunks']:,} failed, {stats.get('deferred_days', 0):,} deferred days, "
@@ -95,10 +107,16 @@ def run_result(stats, cmd):
     if stats["stopped"]:
         print("Stopped, resume with the same command.", file=sys.stderr)
         return 0
+    code = 0
     if stats["failed_chunks"]:
         print("Some chunks FAILED: run the same command again to retry them.", file=sys.stderr)
-        return 1
-    return 0
+        code = 1
+    refused = stats.get("token_refused", 0) + stats.get("token_noref", 0)
+    if refused:
+        print(f"{refused:,} token change(s) refused (TOKEN_REVIEW): see python equity_minute.py token-review",
+              file=sys.stderr)
+        code = 1
+    return code
 
 
 def show(key, folder):
@@ -198,6 +216,17 @@ def main(argv=None):
     de.add_argument("--expect-labels", type=int, help="the dry run's labels count (needed with --apply)")
     de.add_argument("--expect-borrow", type=int, help="the dry run's borrow count (needed with --apply)")
     de.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
+    tr = sub.add_parser("token-review", help="phase 2: the refused token changes; accept / reject one (dry run)")
+    g = tr.add_mutually_exclusive_group()
+    g.add_argument("--accept", metavar="SID", help="accept this stock's token change")
+    g.add_argument("--reject", metavar="SID", help="reject it: keep the old token and files, frozen")
+    tr.add_argument("--apply", action="store_true", help="write the decision (default: dry run)")
+    tr.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
+    rl = sub.add_parser("token-replay", help="phase 2: the price check on archived token changes, writes nothing")
+    rl.add_argument("--dates", default=",".join(tc.DEFAULT_DATES),
+                    help="switch dates of the archive folders (default 2026-10-30,2026-10-31)")
+    rl.add_argument("--speed", type=speed, default=md.SPEED, help="requests per second (default 2.5, at most 3)")
+    rl.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
     for sp in (dl, up, st):
         sp.add_argument("--speed", type=speed, default=md.SPEED, help="requests per second (default 2.5, at most 3)")
         sp.add_argument("--workers", type=int, choices=range(1, md.MAX_WORKERS + 1), default=md.WORKERS,
@@ -257,6 +286,15 @@ def main(argv=None):
             return 0
         if args.cmd == "fix-dayempty":
             mde.fix(folder, apply=args.apply, expect_labels=args.expect_labels, expect_borrow=args.expect_borrow)
+            return 0
+        if args.cmd == "token-review":
+            tc.review(folder, accept=args.accept, reject=args.reject, apply=args.apply)
+            return 0
+        if args.cmd == "token-replay":
+            inp = mp.Inputs(folder, bhav=False)
+            calc = md.Calc(folder, inp, write=False)
+            dates = tuple(d.strip() for d in args.dates.split(",") if d.strip())
+            tc.replay(folder, mp.kite_client(), calc, dates=dates, speed=args.speed)
             return 0
         if args.cmd == "retoken":
             return 1 if md.retoken(folder, apply=args.apply, speed=args.speed)["review"] else 0

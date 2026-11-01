@@ -49,6 +49,7 @@ A local Flask app ("Kite Backfill", one machine) that:
 - `equity_minute.py fix-zero-padding [--apply]`: re-aggregates `days.parquet` rows that still count Kite's all-zero padding bars (offline; conversion columns, volume and bars never written; drift held and listed). See docs/dev/equity_minute_zero_padding.md.
 - `equity_minute.py fix-rescale [--apply --expect N]`: held padded rows loaded more than 1% off the bhavcopy whose fresh derive is within 1% (minute_scale + labels, next row's labels; guard). See docs/dev/equity_minute_rescale.md.
 - `equity_minute.py fix-dayempty [--apply --expect-labels N --expect-borrow M]`: DAY_EMPTY rows checked against the bhavcopy, borrowing only from an OK same-factor day (`Calc.derive`; module `backfill/equity/minute_dayempty.py`). See docs/dev/equity_minute_dayempty.md.
+- Kite token changes: `update` / `download` price-check the new token on 5 bhavcopy days before a full rebuild and compare the new minute history with the stored one before replacing it; refused -> TOKEN_REVIEW (`equity_minute.py token-review [--accept|--reject SID] [--apply]`, `token-replay` read-only). See docs/dev/equity_minute_tokencheck.md.
 - `icici_minute.py plan / download / status / checks / coverage / show`: ICICI Breeze 1-minute data for the Kite gaps (own store `equity_1min_icici/`; `.env` BREEZE_API_KEY + daily BREEZE_SESSION_TOKEN; never orders). See docs/dev/equity_icici_source.md.
 - Never run a CLI against real Kite or Dhan unless the user asks.
 
@@ -85,6 +86,7 @@ Equity
 - `backfill/equity/minute_download.py` / `minute_store.py`: 1-minute download, checks, update, status; store layout and `load_minute`.
 - `backfill/equity/minute_zeropad.py` (+ `equity_minute.py fix-zero-padding`): rows built with Kite's zero padding bars, fixed.
 - `backfill/equity/minute_rescale.py` (+ `equity_minute.py fix-rescale`): held padded rows at the wrong minute_scale level, fixed.
+- `backfill/equity/minute_tokencheck.py` (+ `equity_minute.py token-review / token-replay`): token changes checked before / after the rebuild.
 - `backfill/equity/icici_client.py` / `icici_plan.py` / `icici_download.py` / `icici_store.py` (+ `icici_minute.py`): Breeze REST calls, work list, download + conversion + checks, `load_minute_icici`.
 - `backfill/instruments.py`, `storage.py`, `runner.py`: the Kite bulk candle download.
 
@@ -129,4 +131,5 @@ Web
 | Kite 1-minute rows built with all-zero padding bars (evidence, PADDING / OTHER, hold rules, `fix-zero-padding`) | docs/dev/equity_minute_zero_padding.md |
 | held padded rows at the wrong minute_scale level (BALKRISIND / JMA evidence, selection rule, cells, guard, `fix-rescale`) | docs/dev/equity_minute_rescale.md |
 | DAY_EMPTY rows: bhavcopy check, safe borrowing, holds, `fix-dayempty` (TIL evidence, counts, guard) | docs/dev/equity_minute_dayempty.md |
+| Kite token changes (pre-check, after-download comparison, TOKEN_REVIEW, token-review / token-replay, tokens.csv note) | docs/dev/equity_minute_tokencheck.md |
 | ICICI Breeze 1-minute source (endpoints, limits, work list, conversion evidence, checks, loader) | docs/dev/equity_icici_source.md |

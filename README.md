@@ -677,6 +677,8 @@ python equity_minute.py fix-negative-volume         # days with a garbage minute
 python equity_minute.py fix-zero-padding            # days whose aggregates count Kite's zero bars, offline (dry run; --apply)
 python equity_minute.py fix-rescale                 # held padded days loaded at the wrong scale, offline (dry run; --apply --expect N)
 python equity_minute.py fix-dayempty                # DAY_EMPTY days: bhavcopy check + safe borrowing, offline (dry run; --apply --expect-labels N --expect-borrow M)
+python equity_minute.py token-review                # token changes refused by update / download (--accept SID / --reject SID, dry run; --apply)
+python equity_minute.py token-replay                # the price check on the archived token changes of 30-31 Oct 2026, writes nothing
 ```
 
 Every evening (or the next morning), once the history is complete:
@@ -732,10 +734,26 @@ open / close (`df.attrs["clean"]` counts the fixes); `clean=False` returns the b
   `download` again. Stocks Kite no longer lists become `NO_KITE_DATA`: they are skipped, listed in
   `check/no_kite_data.csv` and in `kite_gaps.csv` (after `gaps`), and `update` no longer waits for them. `status`
   shows each failure with Kite's error text.
+### When Kite gives a stock a new token
+Kite sometimes moves a stock to a new instrument token (for example `NSIL` -> `NSIL-BE` when it moves to trade-to-trade). `update` (and `download`) then download the stock's whole history again on the new token, but only after two checks:
+
+- **Before downloading:** the new token's day candles on the stock's latest 5 bhavcopy days must match the bhavcopy (close, high and low within 2%, or 2 ticks on a cheap stock). A stock that had a split or bonus in between is compared both ways.
+- **Before replacing the old files:** every minute bar both histories have must give the same price (within 0.5%), except at most 5 days where the new history matches the bhavcopy better. Extra bars Kite has added since (for example after the 2021-02-24 outage) are fine.
+
+If both pass, the old files go to `equity_1min/archive/<security_id>_<date>/` and the new history replaces them, as before. If a check fails, nothing is changed: the old files and old token stay, the stock is marked `TOKEN_REVIEW`, the evidence is saved under `equity_1min/tokencheck/`, and `update` ends with exit code 1. A stock with no bhavcopy day in the last 60 trading days (`NO_REFERENCE`) is held the same way. New listings get the same first check. The `update` log names every full download with its old and new token and the check result.
+
+```
+python equity_minute.py token-review                     # what is waiting and why (evidence files)
+python equity_minute.py token-review --accept S000530    # dry run; add --apply to accept (rebuild, or install the parked download)
+python equity_minute.py token-review --reject S000530    # dry run; add --apply: keep the old token and files, frozen
+```
+
+A waiting stock is checked again by every `update` (a stock whose new token later passes is rebuilt then). A rejected stock gets no new days until Kite gives it a token again; when Kite goes back to the old token, the next `update` fetches every missed day. `update/tokens.csv`'s note now says what was really checked for each token (`probe: price checked ...`, `price check new token PASS ...`, `probe: old token ...`, or `unchecked`). `python equity_minute.py token-replay` runs the first check on the 18 token changes of 30-31 Oct 2026 plus two deliberate mismatches, writing nothing (expected: 18 PASS, 2 FAIL).
+
 - `retoken` also probes again the stocks phase 1's probe found no day candles for: `PROBE_RECOVERED` (Kite has them now, price checked) is added to `plan.csv` by `--apply` (backup in `equity_1min/archive/`), so `download` fetches it.
 - Problem days are in `equity_1min/check/` (`minute_check.csv`, `minute_empty_days.csv`, `scale_steps.csv`, `summary.json`). Run `python equity_minute.py gaps` afterwards to add the days Kite has no minutes for to `kite_gaps.csv`.
 - Memory stays under about 1.5 GB with two workers (the bhavcopy is read one stock at a time); the progress lines and `status` show the memory used. A run whose process was killed (for example by Windows for low memory) shows in `status` as `ABORTED` after the next `download` or `update` starts; nothing is lost, the same command resumes it.
-- During the history weeks, `download` rebuilds `plan.csv` itself (offline) after an `equity_update.py`. It refuses while a Kite F&O download runs. If the Kite session expires it stops: sign in (`python app.py`) and run the same command again. Exit codes: 0 done or stopped by you, 1 some chunks failed (run it again) or not ready, 2 bad arguments, busy, Kite sign-in needed or not enough disk.
+- During the history weeks, `download` rebuilds `plan.csv` itself (offline) after an `equity_update.py`. It refuses while a Kite F&O download runs. If the Kite session expires it stops: sign in (`python app.py`) and run the same command again. Exit codes: 0 done or stopped by you, 1 some chunks failed (run it again), a token change was refused (`token-review`) or not ready, 2 bad arguments, busy, Kite sign-in needed or not enough disk.
 
 ## ICICI 1-minute data for the Kite gaps
 Kite has no 1-minute data for delisted and merged stocks, for January 2015, 2016-01-01 and the two Muhurat sessions,
