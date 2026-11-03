@@ -793,6 +793,26 @@ python icici_minute.py checks --rederive        # the stored days' checks derive
 - Exit codes: 0 done, stopped, or the daily cap reached; 1 not ready, some calls failed (run it again), or ICICI kept
   answering "rate limit"; 2 bad arguments, busy, or ICICI log-in needed.
 
+## Kite + ICICI minutes together
+`load_minute_best` gives one stock's 1-minute bars from Kite and ICICI together, each day from exactly one source:
+- Kite whenever Kite has minutes for the day, even when Kite's day candle is missing (DAY_EMPTY) or the day is short;
+- otherwise ICICI;
+- otherwise nothing, with a reason.
+
+```python
+from backfill.equity.minute_combined import day_sources, load_minute_best
+bars = load_minute_best("RELIANCE", "2016-01-01", "2016-01-31")   # columns ... source (KITE / ICICI), day_flags
+days = day_sources("RELIANCE", "2016-01-01", "2016-01-31")        # per day: source, reason, both sides' labels
+```
+
+- Only days with a bhavcopy trade are returned (`include_no_trade=True` for the rest).
+- Bars outside 09:15-15:29 are dropped except on special-session days (`regular_hours=False` keeps them).
+- `prices="raw"` / `"ours"` work as in the two loaders.
+- Do not load while a Kite update / fix or an ICICI download is writing.
+
+`python -m backfill.equity.minute_combined report` counts every stock-day by source and reason, read only, into a
+new folder `analysis\combined_<date>\` (it refuses while a store is busy).
+
 ## Credentials
 Your API keys, secrets and access tokens (Kite and Dhan) are stored only in a local `.env` file, which the app creates when you sign in. It is gitignored and never committed. `.env.example` shows the format.
 

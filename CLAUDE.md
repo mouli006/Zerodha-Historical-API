@@ -51,6 +51,7 @@ A local Flask app ("Kite Backfill", one machine) that:
 - `equity_minute.py fix-dayempty [--apply --expect-labels N --expect-borrow M]`: DAY_EMPTY rows checked against the bhavcopy, borrowing only from an OK same-factor day (`Calc.derive`; module `backfill/equity/minute_dayempty.py`). See docs/dev/equity_minute_dayempty.md.
 - Kite token changes: `update` / `download` price-check the new token on 5 bhavcopy days before a full rebuild and compare the new minute history with the stored one before replacing it; refused -> TOKEN_REVIEW (`equity_minute.py token-review [--accept|--reject SID] [--apply]`, `token-replay` read-only). See docs/dev/equity_minute_tokencheck.md.
 - `icici_minute.py plan / download / status / checks / coverage / show`: ICICI Breeze 1-minute data for the Kite gaps (own store `equity_1min_icici/`; `.env` BREEZE_API_KEY + daily BREEZE_SESSION_TOKEN; never orders). See docs/dev/equity_icici_source.md.
+- `python -m backfill.equity.minute_combined report`: Kite + ICICI per stock-day (Kite when it has minutes, DAY_EMPTY only a flag; else ICICI; else NONE + reason), read only, new `analysis/combined_<date>/`; `load_minute_best` / `day_sources`. See docs/dev/equity_minute_combined.md.
 - Never run a CLI against real Kite or Dhan unless the user asks.
 
 ## Code map
@@ -88,6 +89,7 @@ Equity
 - `backfill/equity/minute_rescale.py` (+ `equity_minute.py fix-rescale`): held padded rows at the wrong minute_scale level, fixed.
 - `backfill/equity/minute_tokencheck.py` (+ `equity_minute.py token-review / token-replay`): token changes checked before / after the rebuild.
 - `backfill/equity/icici_client.py` / `icici_plan.py` / `icici_download.py` / `icici_store.py` (+ `icici_minute.py`): Breeze REST calls, work list, download + conversion + checks, `load_minute_icici`.
+- `backfill/equity/minute_combined.py`: Kite + ICICI combined loader (`decide`, `day_sources`, `load_minute_best`, `report`), read only.
 - `backfill/instruments.py`, `storage.py`, `runner.py`: the Kite bulk candle download.
 
 Web
@@ -133,3 +135,4 @@ Web
 | DAY_EMPTY rows: bhavcopy check, safe borrowing, holds, `fix-dayempty` (TIL evidence, counts, guard) | docs/dev/equity_minute_dayempty.md |
 | Kite token changes (pre-check, after-download comparison, TOKEN_REVIEW, token-review / token-replay, tokens.csv note) | docs/dev/equity_minute_tokencheck.md |
 | ICICI Breeze 1-minute source (endpoints, limits, work list, conversion evidence, checks, loader) | docs/dev/equity_icici_source.md |
+| combined Kite + ICICI loader (rule D-a..D-g, reasons, `load_minute_best`, report, known limits) | docs/dev/equity_minute_combined.md |

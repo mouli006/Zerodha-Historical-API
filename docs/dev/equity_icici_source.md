@@ -279,11 +279,19 @@ bar after 17:00, so the bhav close from the late session lies outside the 09:15-
 
 `minute_store.load_minute` (Kite) is unchanged.
 
-**Proposed combined loader (not built):** per stock-day, take Kite when Kite's `days.parquet` row has `minute_rows >
-0` and no MINUTE_EMPTY / DAY_EMPTY. Otherwise take ICICI when its row has minutes and no HIGHLOW_DIFF / CLOSE_DIFF
-(or the caller accepts them). Otherwise nothing. Both sources are converted to raw (or ours) first, then concatenated
-with a `source` column. For a day both sources have, Kite wins (its conversion is measured against a same-run day
-candle).
+**Combined loader (built, 3 Nov; P74 / D40):** `backfill/equity/minute_combined.py`, see
+docs/dev/equity_minute_combined.md. The rule proposed here before was wrong:
+> per stock-day, take Kite when Kite's `days.parquet` row has `minute_rows > 0` and no MINUTE_EMPTY / DAY_EMPTY.
+> Otherwise take ICICI when its row has minutes and no HIGHLOW_DIFF / CLOSE_DIFF (or the caller accepts them).
+
+ICICI never fetches a day Kite has minutes for (plan rule 3), so the 6,388 Kite DAY_EMPTY days (Kite minutes, no Kite
+day candle) would have loaded empty. The rule now:
+- Kite whenever its row has `minute_rows > 0` on a bhavcopy-traded day. Every label (DAY_EMPTY, SHORT_DAY, ...) is
+  only a flag.
+- Otherwise ICICI when its row has minutes, its labels kept as flags too.
+- Otherwise nothing, with a reason.
+
+One source per day, never mixed; Kite wins when both have the day.
 
 ## CLI and exit codes
 `plan [--market-wide 1|2|3] [--offline] [--dry-run]`, `download [--priority N] [--symbols A,B] [--limit N] [--max-calls 4800]
