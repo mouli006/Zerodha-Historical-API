@@ -52,6 +52,7 @@ A local Flask app ("Kite Backfill", one machine) that:
 - Kite token changes: `update` / `download` price-check the new token on 5 bhavcopy days before a full rebuild and compare the new minute history with the stored one before replacing it; refused -> TOKEN_REVIEW (`equity_minute.py token-review [--accept|--reject SID] [--apply]`, `token-replay` read-only). See docs/dev/equity_minute_tokencheck.md.
 - `icici_minute.py plan / download / status / checks / coverage / show`: ICICI Breeze 1-minute data for the Kite gaps (own store `equity_1min_icici/`; `.env` BREEZE_API_KEY + daily BREEZE_SESSION_TOKEN; never orders). See docs/dev/equity_icici_source.md.
 - `python -m backfill.equity.minute_combined report`: Kite + ICICI per stock-day (Kite when it has minutes, DAY_EMPTY only a flag; else ICICI; else NONE + reason), read only, new `analysis/combined_<date>/`; `load_minute_best` / `day_sources`. See docs/dev/equity_minute_combined.md.
+- ICICI answer guard (`backfill/equity/icici_guard.py`): two series / another code / >400 bars / bad day candles -> chunk FAILED; stored mixed days MIXED_SERIES (never loaded, NONE `ICICI_MIXED_SERIES`), revised copies DUPLICATE_MINUTE (last copy). See docs/dev/equity_icici_source.md.
 - Never run a CLI against real Kite or Dhan unless the user asks.
 
 ## Code map
@@ -134,5 +135,5 @@ Web
 | held padded rows at the wrong minute_scale level (BALKRISIND / JMA evidence, selection rule, cells, guard, `fix-rescale`) | docs/dev/equity_minute_rescale.md |
 | DAY_EMPTY rows: bhavcopy check, safe borrowing, holds, `fix-dayempty` (TIL evidence, counts, guard) | docs/dev/equity_minute_dayempty.md |
 | Kite token changes (pre-check, after-download comparison, TOKEN_REVIEW, token-review / token-replay, tokens.csv note) | docs/dev/equity_minute_tokencheck.md |
-| ICICI Breeze 1-minute source (endpoints, limits, work list, conversion evidence, checks, loader) | docs/dev/equity_icici_source.md |
+| ICICI Breeze 1-minute source (endpoints, limits, work list, conversion evidence, checks, answer guard, loader) | docs/dev/equity_icici_source.md |
 | combined Kite + ICICI loader (rule D-a..D-g, reasons, `load_minute_best`, report, known limits) | docs/dev/equity_minute_combined.md |

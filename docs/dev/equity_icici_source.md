@@ -159,6 +159,55 @@ not used. `requests` calls only these three endpoints (a test checks that no oth
   - `errors`.
 - **Memory:** one stock at a time. A build reads one stock's minutes (at most about 1 million rows).
 
+## Answer guard (P162 / P163 / P164, 5 Nov)
+`backfill/equity/icici_guard.py` (pure). Evidence (read-only scan of 529 stocks, 34.2 M bars, 5 Nov):
+- **JUBLFOOD (S001217, JUBFOO)**, 22 days of Jan 2015 and 2016-01-01: every answer held two series on the same
+  timestamps: JUBLFOOD on ICICI's x2 scale and JUBILANT (JUBLIF) raw, 636-752 bars a day, 7,390 duplicated
+  timestamps, copies' closes 1.8-5.7x apart. Its day candles were mixed too: 123 of 249 off the bhavcopy.
+- **June 2023, 6 stocks** (S000283, S000711, S000508, S000412, S001869, S000085): 63 days, 425 timestamps in
+  15:00-15:29 sent twice **in the same answer** (every such day lies in exactly one chunk), mostly another open,
+  closes equal in 96.7% (p99 difference 0.15%). Loading both counted their volume twice.
+- No other stock: no duplicated timestamps, no day above 388 bars, no duplicate day-candle dates; outside JUBLFOOD
+  at most 2.4% of a stock's day candles are off the bhavcopy (single-day blips).
+
+| check (before staging) | constant | result |
+|---|---|---|
+| an answer `stock_code` other than the requested code (only when the field is present; not provable that real answers carry it) | | chunk FAILED `MIXED_SERIES: answer code X != JUBFOO` |
+| a day with duplicated timestamps whose copies' closes differ (median) by more than 10% | `MIXED_CLOSE_DIFF = 0.10` | FAILED `MIXED_SERIES: n duplicated timestamps on D ...` |
+| more than 400 bars of one day inside 09:00-15:35 (a day of `manual_special_sessions.csv` is exempt) | `MAX_DAY_BARS = 400`, `WINDOW_FROM / TO` | FAILED `TOO_MANY_BARS: n bars on D ...` |
+| day candles: a date twice | | FAILED `DUPLICATE_DATES: n ...` |
+| day candles: more than 10% (and at least 5) off the bhavcopy, high and low both more than 2% from the answer's own level (`minute_download.levels`, as `derive`) | `DAY_OFF_TOL = 0.02`, `DAY_OFF_SHARE = 0.10`, `DAY_OFF_MIN = 5` | FAILED `DAY_MISMATCH: ...` |
+
+- A FAILED chunk is never staged or built; `errors` gets the text; the next run retries it as any FAILED chunk
+  (unchanged). A refused day-candle answer also holds the stock's minute calls for that run (no minutes stored at
+  the "no day candle: scale 1.0" fallback). `DAY_MISMATCH` on **2 runs** (`REVIEW_RUNS`, distinct run ids in
+  `errors`) puts the stock on REVIEW (staging moved to `archive/`), so it is not retried every run.
+- The 400-bar count is limited to 09:00-15:35 because an instrument has at most 396 minutes there; an extended day
+  (2021-02-24 to 17:00) or a synthetic long day can never be refused by it.
+- **Revised copies** (`DUPLICATE_MINUTE`: duplicated timestamps at the same level, inside one answer) are stored as
+  received (rule A2). Rule (decided 5 Nov on the 63 June days: FIRST vs LAST nearly tie; LAST better on the low,
+  0.036% vs 0.103%, VWAP 15:00-15:29 closer on 30 vs 24 days, volume equal): **the last copy of the answer** is used by
+  `aggregates` (minute_rows, minute_volume) and by `load_minute_icici`.
+- **One day in two answers** (two staged chunks holding the same day): the build keeps the later-fetched answer's
+  whole day (`stats["overlap_days"]`), never both.
+
+**Labels** (added to the checks; `checks --rederive` derives them for days stored before):
+
+| label | meaning |
+|---|---|
+| `MIXED_SERIES` | the stored bars of the day hold two series; note "n duplicated timestamps from two series (not loaded)"; `load_minute_icici` drops the day (`attrs["mixed_days"]`), the combined loader gives NONE `ICICI_MIXED_SERIES` |
+| `DUPLICATE_MINUTE` | revised copies; note "n duplicated timestamps (revised copies; the last copy used)" |
+
+- **JUBLFOOD's scales** are held, never rewritten (D2): its stored `icici_scale` 2.0 and volume level 0.5005 are
+  right for its own series; the JUBILANT day candles only added spurious volume levels (notes, SCALE_STEP on
+  2016-01-01). `derive` notes on the stock's first row "day candles: n of m off the bhavcopy ... (mixed series ...)"
+  when the day-candle share is above `DAY_OFF_SHARE`. Re-fetching its 22 days is a later, separate data step.
+- **`status`** adds "Answer guard: FAILED chunks MIXED_SERIES n, TOO_MANY_BARS n, DAY_MISMATCH n, DUPLICATE_DATES n;
+  stored days MIXED_SERIES n (not loaded), DUPLICATE_MINUTE n (last copy used)".
+- Not handled here (P165): scale blips on stored minute days (S001446 2015-01-01/02/05 minutes x5 at scale 1.0,
+  S000714 2016-01-01 x1 at scale 2.0, S000934 2017-07-10) and ICICI's unadjusted day candles on 2015-10-01 / 10-05 /
+  11-11.
+
 ## Store layout
 `<folder>/equity_1min_icici/data/<security_id>/` holds:
 - **`<year>.parquet`:** ICICI's 1-minute candles **unchanged**: `ts` (Asia/Kolkata), open, high, low, close
@@ -229,6 +278,7 @@ ICICI's day candle is built from its own minutes, so the scaled minutes are chec
 | `CLOSING_AUCTION` | the same, with the last bar in 15:00..15:28 (Kite's rule; the official close is the bhavcopy close) |
 | `VOLUME_DIFF` | minute volume x level above bhav x 1.01 + 1 or below bhav x 0.5 |
 | `SCALE_STEP` | a level step with no corporate action within 5 trading days (`minute_download.corporate_actions`) |
+| `MIXED_SERIES` / `DUPLICATE_MINUTE` | see "Answer guard" |
 
 `REVIEW` is per stock (SYMBOL_ONLY price check failed, or several ICICI codes).
 
@@ -354,6 +404,7 @@ One source per day, never mixed; Kite wins when both have the day.
       finds no change;
     - an error part-way restores every file;
     - refusals on the lock and `equity_update.lock`, and `--apply` without `--rederive`;
+  - the answer guard: in `tests/test_icici_answer_guard.py`;
   - `plan --dry-run`:
     - plan, data, reference and the progress db are byte-identical afterwards;
     - LIVE2 is added at priority 2;

@@ -27,12 +27,14 @@ import pyarrow.parquet as pq
 import config
 from backfill import fetch
 from backfill.equity import icici_client as ic
+from backfill.equity import icici_guard as guard
 from backfill.equity import icici_plan as ip
 from backfill.equity import icici_store as st
 from backfill.equity import minute_download as md
 from backfill.equity import minute_plan as mp
 from backfill.equity import minute_store as ms
 from backfill.equity import security_master as sm
+from backfill.equity import special_sessions as ss
 from backfill.fetch import RateLimiter, StopJob
 from backfill.locks import RunLock
 
@@ -52,7 +54,8 @@ FAILED_LINES = 30
 BEFORE_START = "ICICI_BEFORE_START"
 EMPTY = "ICICI_EMPTY"
 CHECKS = [BEFORE_START, EMPTY, "EXTRA_SESSION", "DAY_EMPTY", "SCALE_UNSURE", "SHORT_DAY", "HIGHLOW_DIFF",
-          "CLOSE_DIFF", "CLOSING_AUCTION", "VOLUME_DIFF", "SCALE_STEP"]
+          "CLOSE_DIFF", "CLOSING_AUCTION", "VOLUME_DIFF", "SCALE_STEP", guard.MIXED, guard.DUPLICATE]
+REVIEW_RUNS = 2                  # a stock whose day candles are DAY_MISMATCH on 2 runs goes to REVIEW
 FIELDS = mp.FIELDS
 DAY_COLUMNS = ["date", "symbol", "series"] + [f"icici_{f}" for f in FIELDS] + [f"bhav_{f}" for f in FIELDS] + \
     ["our_factor", "ratio", "icici_scale", "icici_scale_measured", "icici_volume_scale", "vol_ratio", "kind",
@@ -208,6 +211,8 @@ def aggregates(minutes):
     if not len(minutes):
         return out
     m = minutes.sort_values("ts", kind="stable")
+    dups = guard.dup_days(m)                   # repeated timestamps: revised copies use the last copy (P163)
+    m = guard.keep_last(m, [x for x, v in dups.items() if v[2] == guard.DUPLICATE])
     d = m["ts"].dt.date
     outside = pd.Series(st.outside_session(m["ts"]), index=m.index).groupby(d).sum()
     c = ms.clean_bars(m)[0]
@@ -224,6 +229,8 @@ def aggregates(minutes):
     for day in sorted(set(d)):
         row = agg.loc[day].to_dict() if day in agg.index else {"minute_rows": 0, "first_bar": "", "last_bar": ""}
         row["bars_outside"] = int(outside.get(day, 0))
+        if day in dups:
+            row["dup_ts"], row["dup_kind"] = dups[day][0], dups[day][2]
         out[day] = row
     return out
 
@@ -331,7 +338,19 @@ def derive(rows, day_candles, bhav, factors, sid, near_action=lambda d: "", code
              "EXTRA_SESSION": has_min & ~has_bhav, "DAY_EMPTY": has_min & ~has_day, "SCALE_UNSURE": unsure & has_min,
              "SHORT_DAY": short, "HIGHLOW_DIFF": hl, "CLOSE_DIFF": cl & ~auction, "CLOSING_AUCTION": auction,
              "VOLUME_DIFF": vol, "SCALE_STEP": np.zeros(n, bool)}
+    kinds = d["dup_kind"].fillna("").astype(str).to_numpy() if "dup_kind" in d else np.full(n, "", object)
+    n_dup = d["dup_ts"].fillna(0).astype(int).to_numpy() if "dup_ts" in d else np.zeros(n, int)
+    flags[guard.MIXED] = has_min & (kinds == guard.MIXED)
+    flags[guard.DUPLICATE] = has_min & (kinds == guard.DUPLICATE)
     notes = [[] for _ in range(n)]
+    for i in np.flatnonzero(flags[guard.MIXED]):
+        notes[i].append(f"{n_dup[i]} duplicated timestamps from two series (not loaded)")
+    for i in np.flatnonzero(flags[guard.DUPLICATE]):
+        notes[i].append(f"{n_dup[i]} duplicated timestamps (revised copies; the last copy used)")
+    off, compared, off_lv = guard.day_candles_off(day_candles, bhav)
+    if n and guard.day_mismatch(off, compared):        # held, never rewritten (D2): a note on the first row
+        notes[0].append(f"day candles: {off} of {compared} off the bhavcopy by more than {guard.DAY_OFF_TOL:.0%} at "
+                        f"level {', '.join(f'{x:g}' for x in off_lv)} (mixed series; scales measured on them)")
     start_note = d["start_note"].fillna("").astype(str).to_numpy() if "start_note" in d else [""] * n
     for i in np.flatnonzero(before):
         notes[i].append("inferred by the first-minute-day search (not fetched)")
@@ -451,6 +470,17 @@ class Runner:
                       "before_start_days": 0, "deferred_days": 0, "peak_mb": 0}
         self.cache = None
         self.actions = None
+        self.held = set()                # stocks whose day candles the guard refused in this run: no minute calls
+        self._special = None
+
+    def special_days(self):
+        """The dates of manual_special_sessions.csv (not counted for TOO_MANY_BARS); none when it cannot be read."""
+        if self._special is None:
+            try:
+                self._special = set(ss.load_special_sessions(self.folder)["date"])
+            except ss.SpecialSessionsError:
+                self._special = set()
+        return self._special
 
     # -- calls --
 
@@ -535,6 +565,22 @@ class Runner:
                     continue
                 df = st.day_frame(candles)
                 df = df[(df["date"] >= a) & (df["date"] <= b)]
+                problems = guard.day_answer_problems(df, self.bhav(sid))
+                if problems:                   # the answer guard: FAILED, nothing staged, minutes held this run
+                    msg = "; ".join(problems)
+                    self.save_chunk(sid, code, "day", a, b, len(df), {}, "FAILED", stamp(self.clock()),
+                                    round(time.monotonic() - t0, 3), msg)
+                    self.error(sid, "DAY_CANDLES", a, msg)
+                    self.stats["failed_chunks"] += 1
+                    self.stats["guard_failed"] = self.stats.get("guard_failed", 0) + 1
+                    self.held.add(sid)
+                    runs = self.db.rows("SELECT COUNT(DISTINCT run_id) AS n FROM errors WHERE security_id = ? AND "
+                                        "kind = 'DAY_CANDLES' AND error LIKE ?", (sid, f"%{guard.DAY_MISMATCH}%"))
+                    if guard.DAY_MISMATCH in msg and runs and runs[0]["n"] >= REVIEW_RUNS:
+                        self.review(sid, f"{guard.DAY_MISMATCH} on {runs[0]['n']} runs: {msg}",
+                                    reason=f"{guard.DAY_MISMATCH} on {runs[0]['n']} runs: {msg}")
+                        return
+                    continue
                 fetched = stamp(self.clock())
                 df = df.assign(fetched_at=fetched, run_id=self.run_id)
                 path = os.path.join(st.staging_dir(self.folder, sid), f"day_{iso(a)}.parquet")
@@ -569,6 +615,17 @@ class Runner:
             return {}
         df = st.minute_frame(candles)
         df = df[(df["ts"].dt.date >= a) & (df["ts"].dt.date <= b)]
+        codes = [c.get("stock_code") if isinstance(c, dict) else None for c in candles]
+        problems = guard.minute_answer_problems(df, codes, code, self.special_days())
+        if problems:                           # the answer guard: FAILED, nothing staged (retried next run)
+            msg = "; ".join(problems)
+            self.save_chunk(sid, code, "minute", a, b, len(df), {}, "FAILED", stamp(self.clock()),
+                            round(time.monotonic() - t0, 3), msg)
+            self.error(sid, "MINUTES", a, msg)
+            self.stats["failed_chunks"] += 1
+            self.stats["guard_failed"] = self.stats.get("guard_failed", 0) + 1
+            self.log(f"FAILED {sid} minute {iso(a)}..{iso(b)}: {msg}")
+            return {}
         fetched = stamp(self.clock())
         day_bars = {iso(x): 0 for x in self.cal[bisect_left(self.cal, a):bisect_right(self.cal, b)]}
         for x, k in df.groupby(df["ts"].dt.date).size().items():
@@ -735,6 +792,8 @@ class Runner:
         try:
             if todo:
                 self.fetch_days(item, days)
+            if sid in self.held:                       # day candles refused by the guard: no minute call this run
+                return
             first = state.get("first_minute_day") or ""
             if not first:
                 found = self.first_minute_day(item, days, have)
@@ -772,15 +831,21 @@ class Runner:
         finally:
             self.build(item, days)
 
-    def review(self, sid, text):
+    def review(self, sid, text, reason=None):
+        """REVIEW: the staging moves to archive/ (never deleted). reason None: the SYMBOL_ONLY price check failed;
+        else the guard's reason (DAY_MISMATCH on REVIEW_RUNS runs), and the price check is left as it was."""
         stage = st.staging_dir(self.folder, sid)
         if os.path.isdir(stage):
             dst = os.path.join(st.archive_dir(self.folder), f"{sid}_{self.clock():%Y-%m-%d_%H%M%S}")
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             shutil.move(stage, dst)
-        self.db.save_stock(sid, status="REVIEW", price_check=text, reason=f"SYMBOL_ONLY price check: {text}")
+        if reason is None:
+            self.db.save_stock(sid, status="REVIEW", price_check=text, reason=f"SYMBOL_ONLY price check: {text}")
+            self.log(f"REVIEW {sid}: SYMBOL_ONLY price check failed, nothing stored ({text})")
+        else:
+            self.db.save_stock(sid, status="REVIEW", reason=reason)
+            self.log(f"REVIEW {sid}: {reason}")
         self.stats["review"].append(sid)
-        self.log(f"REVIEW {sid}: SYMBOL_ONLY price check failed, nothing stored ({text})")
 
     # -- build --
 
@@ -824,7 +889,17 @@ class Runner:
             dcs = pd.concat([old, nd[st.DAY_CANDLE_COLUMNS]], ignore_index=True).sort_values("date")
             ms.write_days(dcs.reset_index(drop=True), os.path.join(path, st.DAY_FILE))
         if new_min:
-            nm = pd.concat(new_min, ignore_index=True)
+            nm = pd.concat([x.assign(_k=k) for k, x in enumerate(new_min)], ignore_index=True)
+            # a day in two staged answers: the later-fetched answer's whole day is kept, never both (P163)
+            day = nm["ts"].dt.date
+            key = nm["fetched_at"].astype(str) + "|" + nm["_k"].map("{:06d}".format) if "fetched_at" in nm \
+                else nm["_k"].map("{:06d}".format)
+            best = key.groupby(day).transform("max")
+            twice = int((nm.assign(_d=day).groupby("_d")["_k"].nunique() > 1).sum())
+            if twice:
+                self.stats["overlap_days"] = self.stats.get("overlap_days", 0) + twice
+                self.log(f"{sid}: {twice} day(s) in two answers; the later answer kept")
+            nm = nm[key == best].drop(columns="_k")
             nm_days = set(nm["ts"].dt.date)
             for year, g in nm.groupby(nm["ts"].dt.year):
                 yp = os.path.join(path, f"{year}.parquet")
@@ -1543,6 +1618,7 @@ def status(folder=None, max_calls=ip.MAX_CALLS, now=None, log=print):
     lines = [f"ICICI plan: {len(plan):,} stocks, {int(plan['trading_days'].sum()):,} stock-days, "
              f"{int(plan['est_calls'].sum()):,} calls estimated"]
     left_calls = 0
+    guarded = {guard.MIXED: 0, guard.DUPLICATE: 0}
     for p, g in plan.groupby("priority", sort=True):
         fetch_ = g[g["match_kind"].isin(ip.FETCHABLE)]
         state = {"DONE": 0, "PARTIAL": 0, "REVIEW": 0, "NOT_STARTED": 0}
@@ -1557,6 +1633,8 @@ def status(folder=None, max_calls=ip.MAX_CALLS, now=None, log=print):
                 stored += int((d["minute_rows"] > 0).sum())
                 empty += int(d["check"].str.contains(EMPTY).sum())
                 before += int(d["check"].str.contains(BEFORE_START).sum())
+                for lab in (guard.MIXED, guard.DUPLICATE):
+                    guarded[lab] += int(d["check"].str.contains(lab).sum())
                 done_days = len(d)
             if s not in ("DONE", "REVIEW"):
                 n = by_sid.get(r.security_id, 0)
@@ -1573,6 +1651,14 @@ def status(folder=None, max_calls=ip.MAX_CALLS, now=None, log=print):
                  f"{sum(1 for c in chunks if c['status'] == 'EMPTY'):,} empty, {len(failed):,} FAILED")
     for c in failed[:FAILED_LINES]:
         lines.append(f"  FAILED {c['security_id']} {c['interval']} {c['chunk_from']}..{c['chunk_to']}: {c['error']}")
+    by_reason = {}
+    for c in failed:
+        for r in guard.GUARD_REASONS:
+            if r in (c["error"] or ""):
+                by_reason[r] = by_reason.get(r, 0) + 1
+    lines.append("Answer guard: FAILED chunks " + (", ".join(f"{r} {by_reason.get(r, 0):,}" for r in guard.GUARD_REASONS))
+                 + f"; stored days {guard.MIXED} {guarded[guard.MIXED]:,} (not loaded), {guard.DUPLICATE} "
+                 f"{guarded[guard.DUPLICATE]:,} (last copy used)")
     first_day = {sid: min(g["date"]) for sid, g in days.groupby("security_id")}
     pending = [sid for sid, s in stocks.items() if s.get("code") and
                check_pending(s.get("first_minute_day") or "", [first_day[sid]] if sid in first_day else [],

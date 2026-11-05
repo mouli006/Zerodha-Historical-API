@@ -11,7 +11,8 @@
 load_minute_icici() rebuilds raw prices from each day's stored conversion (docs/dev/equity_icici_source.md):
     raw price = ICICI minute x icici_scale;  raw volume = ICICI minute volume x icici_volume_scale
 "ours" divides raw prices by our cumulative factor of the day (adjustments), volume times it; "icici" returns the
-stored values unchanged."""
+stored values unchanged. A day whose stored bars hold two series (MIXED_SERIES, icici_guard) is not returned
+(attrs["mixed_days"]); on a day with revised copies of a minute (DUPLICATE_MINUTE) the last copy is returned."""
 import os
 from datetime import date
 
@@ -21,6 +22,7 @@ import pyarrow.parquet as pq
 
 import config
 from backfill.equity import adjustments as adj
+from backfill.equity import icici_guard as guard
 from backfill.equity import minute_plan as mp
 from backfill.equity import minute_store as ms
 from backfill.equity import security_master as sm
@@ -158,6 +160,15 @@ def load_minute_icici(key, start=None, end=None, prices="raw", folder=None, clea
         m = m[m["date"] >= a]
     if b:
         m = m[m["date"] <= b]
+    # the answer guard (P162 / P163): a day of two series is not loaded, revised copies give the last copy
+    dups = guard.dup_days(m)
+    labelled = set()
+    if "check" in days:
+        labelled = set(days.loc[days["check"].astype(str).str.contains(guard.MIXED), "date"])
+    mixed = sorted({x for x, v in dups.items() if v[2] == guard.MIXED} | (labelled & set(m["date"])))
+    if mixed:
+        m = m[~m["date"].isin(set(mixed))]
+    m = guard.keep_last(m, [x for x, v in dups.items() if v[2] == guard.DUPLICATE])
     counts = None
     if clean:
         m, counts = ms.clean_bars(m)
@@ -180,4 +191,5 @@ def load_minute_icici(key, start=None, end=None, prices="raw", folder=None, clea
     out["source"] = "ICICI"
     if clean:
         out.attrs["clean"] = counts
+    out.attrs["mixed_days"] = mixed
     return out

@@ -37,6 +37,11 @@ whose bhavcopy came later.
   - `ICICI_EMPTY`;
   - `ICICI_BEFORE_START`;
   - `ICICI_NO_MINUTES`: another label without bars.
+  - `ICICI_MIXED_SERIES` (P162, 5 Nov): ICICI has minutes, but the day holds two series (label `MIXED_SERIES`, or its
+    stored bars checked by `icici_guard.dup_days`, so the day is refused before the label is written). Never loaded.
+- **The net in `load_minute_best`:** a loaded day that still holds a timestamp twice is dropped and becomes NONE
+  (`ICICI_MIXED_SERIES` for an ICICI day, `DUPLICATE_TIMESTAMPS` otherwise). The loader never returns a timestamp
+  twice. Revised ICICI copies (`DUPLICATE_MINUTE`) load the last copy (`load_minute_icici`).
 - **ICICI part without an ICICI row, from the plan (`icici_plan.read_plan`, read only):**
   - `NOT_IN_ICICI` (the plan's match kind);
   - `ICICI_REVIEW` (match REVIEW);
@@ -65,7 +70,8 @@ whose bhavcopy came later.
 - **`decide(traded, kite, icici, ctx)`** is the rule as a pure function on plain frames (the tests use it).
   `traded_days(rows)` is the trading-day rule.
 - **What is read:** only the `days.parquet` columns `date, minute_rows, check, minute_volume` and Kite's conversion
-  columns. The stored `our_factor` is never read.
+  columns, and `ts, close` of the ICICI bars of the days ICICI would serve (`icici_mixed_days`). The stored
+  `our_factor` is never read.
 - **Examples:**
   - `day_sources("TIL", "2018-11-07", "2018-11-07")`: KITE, flag DAY_EMPTY;
   - `load_minute_best("RELIANCE", "2016-01-01", "2016-01-01")`: ICICI (Kite MINUTE_EMPTY).
@@ -83,8 +89,9 @@ take no lock and check none, the same as the two existing loaders.
   - `minute_plan.check_inputs` fails (an input build running, not built or stale).
 - **Never takes a lock,** so it never blocks the 01:00 update. If a lock is held at the end, or a lock file's mtime
   changed during the run, `summary.csv` starts with `# stores changed during the run: re-run` and the exit code is 1.
-- **How it reads:** every STOCK security (or `--stocks`), one at a time, `days.parquet` only (no minute bars). The
-  bhavcopy year files are read once (date, isin, series, volume).
+- **How it reads:** every STOCK security (or `--stocks`), one at a time, `days.parquet`, plus `ts, close` of the
+  ICICI year files holding days Kite has no minutes for (the mixed-series check). The bhavcopy year files are read
+  once (date, isin, series, volume).
 - **Files** (each atomic, only in the new folder):
 
   | file | content |

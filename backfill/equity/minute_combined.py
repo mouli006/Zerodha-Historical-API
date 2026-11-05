@@ -26,6 +26,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 import config
+from backfill.equity import icici_guard as guard
 from backfill.equity import icici_plan as ip
 from backfill.equity import icici_store as st
 from backfill.equity import minute_download as md
@@ -49,6 +50,8 @@ DAY_COLUMNS = ["date", "traded", "source", "reason", "day_flags", "kite_label", 
 BAR_COLUMNS = ["ts", "open", "high", "low", "close", "volume", "security_id", "symbol", "source", "day_flags"]
 PRICES = ("raw", "ours")
 NO_BHAV_ROW = "NO_BHAV_ROW"
+ICICI_MIXED = "ICICI_MIXED_SERIES"                   # an ICICI day of two series (label or stored bars): never loaded
+DUPLICATE_TS = "DUPLICATE_TIMESTAMPS"                # a loaded day still holding a timestamp twice: dropped (net)
 
 
 class CombinedError(mp.MinutePlanError):
@@ -108,7 +111,8 @@ def decide(traded, kite, icici, ctx=None):
     kite    Kite's days rows (date, minute_rows, check, minute_volume and the conversion columns), None = no folder
     icici   ICICI's days rows (date, minute_rows, check, minute_volume), None = no folder
     ctx     match_kind (the ICICI plan's, "" = not in the plan), plan_days (dates the plan asks for), special
-            ({date: kind} of the special-sessions calendar), frozen (bool)"""
+            ({date: kind} of the special-sessions calendar), frozen (bool), icici_mixed (dates whose stored ICICI
+            bars hold two series; a MIXED_SERIES label counts too): such an ICICI day is NONE / ICICI_MIXED_SERIES"""
     ctx = ctx or {}
     traded = set(traded)
     k, i = _side(kite, True), _side(icici, False)
@@ -124,7 +128,9 @@ def decide(traded, kite, icici, ctx=None):
     k_min = k_bars > 0
     use_kite = k_min & k_conv
     no_conv = k_min & ~k_conv
-    use_icici = ~k_min & (i_bars > 0)
+    mixed_days = set(ctx.get("icici_mixed") or ())
+    i_mixed = _has(i_label, guard.MIXED) | np.array([d in mixed_days for d in dates], bool)
+    use_icici = ~k_min & (i_bars > 0) & ~i_mixed
     source = np.where(use_kite, KITE, np.where(use_icici, ICICI, NONE)).astype(object)
 
     if kite is None:
@@ -139,7 +145,8 @@ def decide(traded, kite, icici, ctx=None):
     for d, row, lab in zip(dates, i_row, i_label):
         if row:
             parts = str(lab).split("|")
-            i_part.append("ICICI_BEFORE_START" if "ICICI_BEFORE_START" in parts else
+            i_part.append(ICICI_MIXED if guard.MIXED in parts or d in mixed_days else
+                          "ICICI_BEFORE_START" if "ICICI_BEFORE_START" in parts else
                           "ICICI_EMPTY" if "ICICI_EMPTY" in parts else "ICICI_NO_MINUTES")
         else:
             i_part.append(no_row or ("ICICI_NOT_YET_FETCHED" if d in plan_days else "NOT_IN_ICICI_PLAN"))
@@ -207,12 +214,36 @@ def _in_range(df, a, b):
     return df[keep]
 
 
+def icici_mixed_days(folder, sid, dates):
+    """The dates (of the given ones) whose stored ICICI bars hold two series (icici_guard.dup_days MIXED). Reads only
+    ts and close of the year files of those dates."""
+    dates = set(dates)
+    if not dates:
+        return set()
+    path = st.stock_dir(folder, sid)
+    out = set()
+    for year in sorted({d.year for d in dates}):
+        p = os.path.join(path, f"{year}.parquet")
+        if not os.path.isfile(p):
+            continue
+        m = pq.read_table(p, columns=["ts", "close"]).to_pandas()
+        m = m[m["ts"].dt.date.isin(dates)]
+        out |= {d for d, v in guard.dup_days(m).items() if v[2] == guard.MIXED}
+    return out
+
+
 def stock_sources(folder, sid, traded, ctx, a=None, b=None):
-    """decide() on the stock's two days.parquet files, rows limited to a..b."""
+    """decide() on the stock's two days.parquet files, rows limited to a..b. The ICICI days Kite has no minutes for
+    are checked on their stored bars too (icici_mixed_days), so a mixed day is refused before its label is written."""
     traded = {d for d in traded if (a is None or d >= a) and (b is None or d <= b)}
     kite = _in_range(read_side(ms.stock_dir(folder, sid), KITE_COLUMNS), a, b)
     icici = _in_range(read_side(st.stock_dir(folder, sid), ICICI_COLUMNS), a, b)
-    return decide(traded, kite, icici, ctx.of(sid))
+    c = dict(ctx.of(sid))
+    if icici is not None and len(icici):
+        k_has = set() if kite is None else {d for d, n in zip(kite["date"], kite["minute_rows"]) if (n or 0) > 0}
+        want = {d for d, n in zip(icici["date"], icici["minute_rows"]) if (n or 0) > 0 and d not in k_has}
+        c["icici_mixed"] = icici_mixed_days(folder, sid, want)
+    return decide(traded, kite, icici, c)
 
 
 def day_sources(key, start=None, end=None, folder=None, context=None):
@@ -262,6 +293,14 @@ def load_minute_best(key, start=None, end=None, prices="raw", clean=True, regula
         raise ms.NoMinuteData(f"{sid}: no minute bars from Kite or ICICI between {start or 'start'} and "
                               f"{end or 'end'} (see day_sources for the reasons).")
     out = pd.concat(parts, ignore_index=True)
+    dup = set(out.loc[out["ts"].duplicated(keep=False), "ts"].dt.date)
+    if dup:                              # the net: never a timestamp twice (the day becomes NONE)
+        out = out[~out["ts"].dt.date.isin(dup)]
+        days = days.copy()
+        hit = days["date"].isin(dup)
+        days.loc[hit, "reason"] = np.where(days.loc[hit, "source"] == ICICI, ICICI_MIXED, DUPLICATE_TS)
+        days.loc[hit, "source"] = NONE
+        days.loc[hit, "day_flags"] = ""
     d = out["ts"].dt.date
     if regular_hours:
         special = set(days.loc[days["session_kind"] != "", "date"])

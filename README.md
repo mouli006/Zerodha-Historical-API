@@ -790,6 +790,7 @@ python icici_minute.py checks --rederive        # the stored days' checks derive
   official close is the bhavcopy close.
 - Stocks matched by symbol only are price-checked first. A failed check is listed as REVIEW in `status`, and nothing
   is stored for it.
+- Every ICICI answer is checked before it is stored: another company's bars or more than 400 bars on a day make the call FAILED (retried next run; day candles refused twice put the stock on REVIEW), and a day already stored with two series (JUBLFOOD, Jan 2015) is never loaded; `status` shows the counts.
 - Exit codes: 0 done, stopped, or the daily cap reached; 1 not ready, some calls failed (run it again), or ICICI kept
   answering "rate limit"; 2 bad arguments, busy, or ICICI log-in needed.
 
