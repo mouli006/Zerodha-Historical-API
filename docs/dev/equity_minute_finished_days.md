@@ -101,10 +101,14 @@ fetches again the day candles stored before this rule (the 1-minute bars are nev
      same effect as the pre-existing differences. The stock is repaired (only the repaired rows are written, the
      earlier rows stay as stored) and listed: `Fresh-derive drift on earlier rows (not written): N stocks; columns:
      ...`, with its own checks before -> after and ratio buckets for comparison with the rest.
+   **Guard (b) (P173, docs/dev/equity_minute_splitblip.md):** before that, a repaired date whose stored check is OK
+   (CANDLE_UNCONFIRMED aside) and whose new row gets HIGHLOW_DIFF or CLOSE_DIFF is **HELD**: not repaired, the old
+   row kept, listed ("Held (stored OK, the new candle gives ...)") and `HELD` in `repair.csv` with old / new check;
+   the guard and `splice` then run on the other dates. Other new labels (CLOSING_AUCTION, VOLUME_DIFF) are repaired.
    **Pre-existing differences** (`base` != the stored file: an older rule, a newer bhavcopy, ...) never block a stock
    and are not fixed; the report gives one line: `Pre-existing re-derive differences (not fixed; those rows stay as
    stored): N stocks; columns: <column> (<stocks>), ...`.
-7. **Dry run** (default) writes nothing but makes the Kite requests (the counts after need the new candles). It prints
+7. **Dry run** (default) writes nothing but its log file (below) and makes the Kite requests (the counts after need the new candles). It prints
    the rows found (provisional with both rule counts / DAY_EMPTY), stocks, requests and minutes needed, the checks of
    the repaired rows before -> after, the ratio changes (new / old - 1: <=0.1%, 0.1-0.5%, 0.5-2%, >2%), and every
    skipped stock, skipped date and refused stock with its reason. A bhavcopy cache older than the store is built in a
@@ -116,6 +120,8 @@ fetches again the day candles stored before this rule (the 1-minute bars are nev
    `days.parquet.tmp`; at the end replaces them all. Any error removes the `.tmp` files, restores every repaired file
    from the backup and raises `ApplyFailed` (exit 1; the run is `failed`). Then `repair.csv` (every row: REPAIRED /
    SKIPPED / REFUSED, old / new check and ratio, old `fetched_at`) goes into the backup folder and `check/` is rebuilt.
+    **Log file:** every printed line also goes to `<data folder>/repair_logs/repair_<YYYY-MM-DD_HHMMSS>.log`
+    (`..._dryrun.log` for a dry run), written at the end, also after an error.
 10. **Re-runnable:** repaired rows have a `fetched_at` after their date and a run that is not `update`, so a second
    run finds only what it skipped or refused. A killed run leaves at most `.tmp` files (overwritten next time).
 11. Exit codes: 0 done / dry run (skips listed), 1 a stock refused or `ApplyFailed`, 2 a lock, a Kite F&O run, an input
@@ -135,5 +141,6 @@ provisional skipped, a borrowed conversion refused for an older and for a later 
 later row changing without borrowing refused, drift on earlier rows only repaired with those rows exactly as stored
 (a wrapped `derive`), the refusal counts, the stored token of a stock not matched, apply
 writes only the repaired rows (the others exactly as stored) and backs up, a pre-existing difference repaired with
-its rows kept and reported, the repaired rows equal a day-by-day update's, an error on the third replace restores every file, a second run finds nothing,
+its rows kept and reported, the repaired rows equal a day-by-day update's, guard (b) HELD rows and the log file
+(`tests/test_minute_splitblip_guards.py`), an error on the third replace restores every file, a second run finds nothing,
 `--limit`, refusals by lock / F&O / input build for the dry run and apply, CLI exit codes).

@@ -35,9 +35,12 @@ Not part of `equity_update.py` (it needs a Kite sign-in); no dashboard UI.
 - **minute_scale** per day = Kite day / minute from high and low, measured where both agree (within 0.1% plus two
   half ticks). Levels come from `levels()`: a centred median of 11 measured days. A new level starts where it moves
   by more than 0.1% and lasts 5 measured days (a shorter move is a blip). A level within 0.05% of 1 is 1.0.
+  Exception (guard (a), P173): the day before a stored split / bonus ex-date whose minutes Kite left unadjusted
+  (measured ~ 1/F, ratio ~ C or F, `md.split_blip_rows`) keeps its measured value as a one-day level; see
+  docs/dev/equity_minute_splitblip.md.
 - **minute_volume_scale** is 1.0 by default. It changes only where day volume / minute volume steps by more than 20%
   for 5+ days; that period gets its median ratio / the normal ratio of the nearest unadjusted period
-  (`volume_levels()`).
+  (`volume_levels()`; the guard (a) day gets its own ratio / that normal ratio).
 - A scale step of either kind with no corporate action within ±5 trading days is `SCALE_STEP`. Actions are the applied
   events in `adjustments/events.csv` plus every row of the corporate-actions CSVs (rights, dividends, demergers, ...).
 - `--workers 1..4` (default 2; `MAX_WORKERS`): workers take whole stocks from one queue, so never the same stock.

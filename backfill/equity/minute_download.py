@@ -70,6 +70,7 @@ SCALE_WINDOW = 11                # centred median of 11 measured days: steps exa
 SCALE_STEP = 0.001               # a new minute_scale level: the median moves by more than 0.1% ...
 STEP_MIN_DAYS = 5                # ... (or volume: 20%) and the new level lasts 5 measured days (shorter: a blip)
 SCALE_ONE = 0.0005               # a level within 0.05% of 1 is 1.0
+SPLIT_BLIP_TOL = 0.01            # guard (a): measured within 1% of 1/F, ratio within 1% of C or F (split_blip_rows)
 VOLUME_STEP = 0.2                # minute_volume_scale changes only where day / minute volume moves by more than 20%
 VOLUME_HIGH = 1.01               # VOLUME_DIFF: scaled minute volume above day x 1.01 + 1 ...
 VOLUME_LOW = 0.5                 # ... or below day x 0.5 (pre-open and closing-session trades are not in minutes)
@@ -787,11 +788,51 @@ def corporate_actions(folder, inp):
     return {sid: sorted(d) for sid, d in out.items()}
 
 
-def levels(values, rel_tol, min_days=STEP_MIN_DAYS, window=SCALE_WINDOW):
+def split_blip_rows(sid, dates, measured, ratio, fetched_at, periods, days):
+    """Guard (a) (docs/dev/equity_minute_splitblip.md): (keep, F, C) per row. keep marks the day before a stored split /
+    bonus ex-date whose minute bars Kite left unadjusted while its day candle is adjusted:
+        F = factor(day) / factor(next day), where a factor period of the stock starts on the next day (the next row;
+            for the last row the next market day of `days`), F != 1;
+        C = factor(day) / factor(fetch date): the adjustments with an ex-date after the day and on or before the fetch
+            date (1 when fetched on or before the day; NaN without a fetch time);
+        measured within 1% of 1/F, and Kite's ratio within 1% of C or of F.
+    Factors from the factors table (`periods` = adj.periods_of), never the stored our_factor column."""
+    n = len(dates)
+    keep, F, C = np.zeros(n, bool), np.full(n, np.nan), np.full(n, np.nan)
+    p = periods.get(sid)
+    if not p or not n:
+        return keep, F, C
+    starts = set(p[0][1:])
+    k = bisect_right(days, dates[-1])
+    nxt = list(dates[1:]) + [days[k] if k < len(days) else None]
+    for i in range(n):
+        if nxt[i] not in starts:
+            continue
+        f = adj.lookup_factor(periods, sid, dates[i]) / adj.lookup_factor(periods, sid, nxt[i])
+        if abs(f - 1) <= 1e-9:
+            continue
+        F[i] = f
+        when = str(fetched_at[i])[:10] if fetched_at[i] is not None and not pd.isna(fetched_at[i]) else ""
+        try:
+            fd = date.fromisoformat(when)
+            C[i] = adj.lookup_factor(periods, sid, dates[i]) / adj.lookup_factor(periods, sid, fd) \
+                if fd > dates[i] else 1.0
+        except ValueError:
+            pass
+        m, r = measured[i], ratio[i]
+        if np.isnan(m) or np.isnan(r) or abs(m * f - 1) > SPLIT_BLIP_TOL:
+            continue
+        keep[i] = abs(r / f - 1) <= SPLIT_BLIP_TOL or (not np.isnan(C[i]) and abs(r / C[i] - 1) <= SPLIT_BLIP_TOL)
+    return keep, F, C
+
+
+def levels(values, rel_tol, min_days=STEP_MIN_DAYS, window=SCALE_WINDOW, keep=None):
     """Per position: the level of the step-wise series behind noisy measured values (NaN = not measured). A centred
     median of `window` measured values; a new level starts where it moves by more than rel_tol and lasts min_days
     measured days (shorter: a blip, kept in the level before). Each level is the median of its measured values;
-    positions before the first measurement take the first level. None when nothing was measured."""
+    positions before the first measurement take the first level. None when nothing was measured.
+    keep (guard (a), split_blip_rows): positions whose measured value is a one-day level of its own when it is more
+    than rel_tol off the level found; every other position as without keep."""
     values = np.asarray(values, float)
     idx = np.flatnonzero(~np.isnan(values))
     if not len(idx):
@@ -819,13 +860,18 @@ def levels(values, rel_tol, min_days=STEP_MIN_DAYS, window=SCALE_WINDOW):
         a = 0 if j == 0 else starts[j]
         b = starts[j + 1] if j + 1 < len(merged) else len(values)
         out[a:b] = float(np.median(values[idx[g]]))
+    if keep is not None:                          # guard (a): the day before a split / bonus keeps its own level
+        for p in np.flatnonzero(keep):
+            if not np.isnan(values[p]) and abs(values[p] / out[p] - 1) > rel_tol:
+                out[p] = values[p]
     return out
 
 
-def volume_levels(ratio):
+def volume_levels(ratio, keep=None):
     """minute_volume_scale per day: 1.0 unless day volume / minute volume steps by more than VOLUME_STEP for
-    STEP_MIN_DAYS days; such a period gets its median ratio / the normal ratio of the nearest unadjusted period."""
-    lv = levels(ratio, VOLUME_STEP)
+    STEP_MIN_DAYS days; such a period gets its median ratio / the normal ratio of the nearest unadjusted period.
+    keep: as levels() (guard (a))."""
+    lv = levels(ratio, VOLUME_STEP, keep=keep)
     if lv is None:
         return np.ones(len(ratio))
     normal = np.abs(lv - 1) <= VOLUME_STEP
@@ -945,6 +991,12 @@ class Calc:
     def bhav_of(self, sid):
         return read_cached_bhav(self.cache, sid)
 
+    def periods(self):
+        """adj.periods_of the factors (guard (a)), built once."""
+        if getattr(self, "_periods", None) is None:
+            self._periods = adj.periods_of(self.inp.factors)
+        return self._periods
+
     def near_action(self, sid, d):
         acts = self.actions.get(sid, [])
         if not acts:
@@ -1008,14 +1060,16 @@ class Calc:
             sh, sl = kh / mh, kl / ml
             agree = np.abs(sh - sl) <= SCALE_AGREE + 2 * mp.HALF_TICK / kc
         measured = np.where(has_min & has_day & agree & (mh > 0) & (ml > 0), (sh + sl) / 2, np.nan)
-        lv = levels(measured, SCALE_STEP)
+        keep = split_blip_rows(sid, list(d["date"]), measured, d["ratio"].to_numpy(float),
+                               d["fetched_at"].to_numpy(object), self.periods(), self.days)[0]
+        lv = levels(measured, SCALE_STEP, keep=keep)
         scale = np.ones(n) if lv is None else np.where(np.abs(lv - 1) <= SCALE_ONE, 1.0, np.round(lv, 6))
         d["minute_scale"] = scale
         d["minute_scale_measured"] = np.round(measured, 6)
         mv, kv = d["minute_volume"].to_numpy(float), d["kite_volume"].to_numpy(float)
         with np.errstate(divide="ignore", invalid="ignore"):
             vr = np.where(has_min & has_day & (mv > 0) & (kv > 0), kv / mv, np.nan)
-        d["minute_volume_scale"] = volume_levels(vr)
+        d["minute_volume_scale"] = volume_levels(vr, keep=keep)
 
         # checks of the days with a day candle (scaled minutes vs the same-run day candle); first, because a DAY_EMPTY
         # day may only borrow from a day whose own check is OK. They read no borrowed column.

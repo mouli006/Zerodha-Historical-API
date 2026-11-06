@@ -677,6 +677,7 @@ python equity_minute.py fix-negative-volume         # days with a garbage minute
 python equity_minute.py fix-zero-padding            # days whose aggregates count Kite's zero bars, offline (dry run; --apply)
 python equity_minute.py fix-rescale                 # held padded days loaded at the wrong scale, offline (dry run; --apply --expect N)
 python equity_minute.py fix-dayempty                # DAY_EMPTY days: bhavcopy check + safe borrowing, offline (dry run; --apply --expect-labels N --expect-borrow M)
+python equity_minute.py fix-split-blip              # the day before a split loaded F x too high, offline (dry run; --apply --expect N)
 python equity_minute.py token-review                # token changes refused by update / download (--accept SID / --reject SID, dry run; --apply)
 python equity_minute.py token-replay                # the price check on the archived token changes of 30-31 Oct 2026, writes nothing
 ```
@@ -694,7 +695,9 @@ python equity_minute.py update                      # then: minutes up to the pr
   `update` would store up to now. A day whose candle still does not look final is deferred (listed in the summary)
   and tried again by the next `update`; after 3 trading days it is stored anyway, labelled `CANDLE_UNCONFIRMED`.
 - Rows stored before this rule: `python equity_minute.py repair` (a dry run that fetches the day candles again and
-  shows what would change, about 25 minutes), then `--apply` (backup in `equity_1min/archive/repair_<time>/`).
+  shows what would change, about 25 minutes), then `--apply` (backup in `equity_1min/archive/repair_<time>/`). A row
+  that was OK and would get `HIGHLOW_DIFF` / `CLOSE_DIFF` from its new candle is held (the old row kept, listed as
+  HELD). Every run also writes its log to `<data folder>/repair_logs/`.
 - Kite sends a few minute bars with a garbage volume (stored as a negative number, e.g. -9,223,372,036,854,775,808).
   They count as 0 in the day's checks: the day is labelled `NEGATIVE_VOLUME` (column `neg_volume_bars` = how many
   bars' volume is missing) and `download` / `update` print a `WARNING` line. Rows stored before this rule (the full
@@ -723,6 +726,13 @@ python equity_minute.py update                      # then: minutes up to the pr
   `borrow M`. Then `--apply --expect-labels N --expect-borrow M` (any other count is refused; backup with sha256 in
   `equity_1min/archive/dayempty_<time>/`). It writes only the labels / note of DAY_EMPTY rows and, where the source day
   changes, their conversion; rows with stale aggregates or values that already differ are held and listed.
+- **The day before a split / bonus** can have Kite's day candle already adjusted but its minute bars not. Such a day used
+  to be stored at `minute_scale` 1.0 and loaded F x too high in price and F x too low in volume (JSWDULUX 2026-10-21:
+  10x). New derives keep that day's own level. Rows stored before: `python equity_minute.py fix-split-blip` (offline
+  dry run; report in `equity_1min/splitblip/dryrun_<time>/`, expected 30 rows on 6 Nov 2026), then `--apply --expect
+  N` (backup in `equity_1min/archive/fix_split_blip_<time>/`). It writes only the row's two scales, check and note and
+  the next row's note. A day stored before its split is in the adjustments is not caught automatically: after an
+  `equity_update.py` that adds adjustments, run `fix-split-blip` (dry run) after the next morning's `update`.
 
 - Kite's prices are adjusted by Kite's own rules, so the files keep Kite's candles unchanged plus, per day, the conversion back to the bhavcopy's raw prices. Read them in Python with `from backfill.equity.minute_store import load_minute`: `load_minute("RELIANCE", "2024-01-01", "2024-01-31", prices="raw")`. `prices="ours"` gives our split / bonus adjusted prices (for indicators), `prices="kite"` Kite's own. By default
 (`clean=True`) Kite's all-zero padding bars are left out, a negative volume reads as 0 and high / low always contain

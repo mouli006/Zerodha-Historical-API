@@ -35,6 +35,10 @@ Phase 2 (backfill/equity/minute_download.py), each with --folder:
                                                   checked against the bhavcopy and borrowing only from an OK
                                                   same-factor day, offline (dry run unless --apply; --apply needs
                                                   the dry run's two counts, backs up first)
+    python equity_minute.py fix-split-blip [--apply --expect N]   days.parquet rows of the day before a split / bonus
+                                                  stored at minute_scale 1.0 (minute bars unadjusted, day candle
+                                                  adjusted), offline (dry run unless --apply; --apply needs --expect =
+                                                  the dry run's count, backs up first)
     python equity_minute.py token-review [--accept SID | --reject SID] [--apply]   the token changes refused by
                                                   update / download (price check of the new token, or the comparison
                                                   after the download): list them, accept (rebuild / install the parked
@@ -49,8 +53,8 @@ Every command takes --folder (absolute; default EQUITY_DATA_DIR, else KITE_DATA_
 Output: <folder>/equity_1min/plan/. Only tokens (not --rematch) and probe use the network (Kite only; the token
 from .env is never printed). Exit codes: 0 done; 1 an input not built or stale, tokens not run yet (or no saved list
 for --rematch), some probes failed or the probe stopped, show found nothing, retoken left a stock to REVIEW,
-fix-negative-volume / fix-zero-padding / fix-rescale / fix-dayempty --apply failed (files restored), fix-rescale /
-fix-dayempty found other counts than --expect*, fix-dayempty found a stale bhavcopy cache, update / download
+fix-negative-volume / fix-zero-padding / fix-rescale / fix-dayempty / fix-split-blip --apply failed (files restored),
+fix-rescale / fix-dayempty / fix-split-blip found other counts than --expect*, fix-dayempty found a stale bhavcopy cache, update / download
 refused a token change (TOKEN_REVIEW: equity_minute.py token-review), token-review could not install a parked
 download; 2 bad
 arguments, a lock busy, an input
@@ -70,6 +74,7 @@ from backfill.equity import minute_negvol as mn
 from backfill.equity import minute_plan as mp
 from backfill.equity import minute_repair as mr
 from backfill.equity import minute_rescale as mrs
+from backfill.equity import minute_splitblip as msb
 from backfill.equity import minute_tokencheck as tc
 from backfill.equity import minute_zeropad as mz
 from backfill.equity import security_master as sm
@@ -216,6 +221,11 @@ def main(argv=None):
     de.add_argument("--expect-labels", type=int, help="the dry run's labels count (needed with --apply)")
     de.add_argument("--expect-borrow", type=int, help="the dry run's borrow count (needed with --apply)")
     de.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
+    sb = sub.add_parser("fix-split-blip",
+                        help="phase 2: fix the days before a split / bonus stored at minute_scale 1.0, offline (dry run)")
+    sb.add_argument("--apply", action="store_true", help="write the fixed days.parquet cells (backup first)")
+    sb.add_argument("--expect", type=int, help="the count of rows the dry run found (needed with --apply)")
+    sb.add_argument("--folder", help="data folder, default EQUITY_DATA_DIR, else KITE_DATA_DIR or ./data")
     tr = sub.add_parser("token-review", help="phase 2: the refused token changes; accept / reject one (dry run)")
     g = tr.add_mutually_exclusive_group()
     g.add_argument("--accept", metavar="SID", help="accept this stock's token change")
@@ -239,6 +249,8 @@ def main(argv=None):
         p.error("fix-rescale --apply needs --expect N (the count of rows the dry run found)")
     if args.cmd == "fix-dayempty" and args.apply and (args.expect_labels is None or args.expect_borrow is None):
         p.error("fix-dayempty --apply needs --expect-labels N --expect-borrow M (the counts of the dry run)")
+    if args.cmd == "fix-split-blip" and args.apply and args.expect is None:
+        p.error("fix-split-blip --apply needs --expect N (the count of rows the dry run found)")
     folder = args.folder or equity_data_dir()
     try:
         if args.cmd == "tokens":
@@ -286,6 +298,9 @@ def main(argv=None):
             return 0
         if args.cmd == "fix-dayempty":
             mde.fix(folder, apply=args.apply, expect_labels=args.expect_labels, expect_borrow=args.expect_borrow)
+            return 0
+        if args.cmd == "fix-split-blip":
+            msb.fix(folder, apply=args.apply, expect=args.expect)
             return 0
         if args.cmd == "token-review":
             tc.review(folder, accept=args.accept, reject=args.reject, apply=args.apply)

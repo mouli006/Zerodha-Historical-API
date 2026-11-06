@@ -8,7 +8,10 @@ replaces only the day inputs (kite_*, fetched_at, run_id) of those dates and der
 a new day (repaired_rows); only those rows are spliced into the stored file (splice). A stock where the repair would
 change a row after a repaired date, or where any row borrows a repaired date's conversion, is listed, never
 written; a difference only on earlier rows (hindsight drift of a whole-history derive) is listed and not written.
-Dry run (default) writes nothing; --apply backs up every changed days.parquet to
+Guard (b): a repaired row stored OK whose new candle gives HIGHLOW_DIFF or CLOSE_DIFF is HELD (not repaired, the old
+row kept, listed and in repair.csv); other new labels (CLOSING_AUCTION, VOLUME_DIFF, ...) are repaired as before.
+Every line printed also goes to <folder>/repair_logs/repair_<time>[_dryrun].log (the only file a dry run writes).
+Dry run (default) writes nothing else; --apply backs up every changed days.parquet to
 equity_1min/archive/repair_<time>/<security_id>/ and replaces them all at the end (any error restores them). Both
 take equity_1min/.lock and refuse while a Kite F&O run or an input build runs (they make Kite requests)."""
 import os
@@ -34,6 +37,8 @@ RATIO_BUCKETS = [(0.001, "<=0.1%"), (0.005, "0.1-0.5%"), (0.02, "0.5-2%"), (np.i
 DERIVE_SECONDS = 0.25            # estimate: reading, deriving and comparing one stock (besides its request)
 PROGRESS_EVERY = 100
 LIST_LINES = 200                 # at most 200 skipped dates are printed (every skipped stock is)
+PRICE_FLAGS = ("HIGHLOW_DIFF", "CLOSE_DIFF")   # guard (b): a repaired row stored OK that would get one of these is HELD
+LOG_DIR = "repair_logs"          # <data folder>/repair_logs/repair_<time>[_dryrun].log: every line repair prints
 REPAIR_COLUMNS = ["security_id", "symbol", "date", "kind", "result", "note", "old_check", "new_check", "old_ratio",
                   "new_ratio", "old_fetched_at"]
 
@@ -93,6 +98,15 @@ def find_affected(folder):
                 counts["day_empty"] += 1
     counts["stocks"] = len(affected)
     return affected, counts
+
+
+def is_ok(check):
+    """A stored check that is OK (CANDLE_UNCONFIRMED aside: update sets it, the candle may be provisional)."""
+    return not [x for x in str(check).split("|") if x not in ("OK", md.UNCONFIRMED, "")]
+
+
+def held_note(old, new):
+    return f"{'OK' if is_ok(old) else old} -> {new}: the new day candle gives a price flag; the old row kept"
 
 
 def bucket(old, new):
@@ -165,9 +179,14 @@ def repair(folder=None, kite=None, apply=False, limit=None, speed=md.SPEED, now=
     mp.check_fno(config.load_env())
     lock = RunLock(mp.lock_path(folder)).acquire("equity_minute.py repair" + (" --apply" if apply else ""))
     work, db, run_id = None, None, None
-    tmps, backup = [], None
+    tmps, backup, log_file, lines, screen = [], None, None, [], log
+
+    def log(*a, **k):                                      # the screen and the log file (written at the end)
+        screen(*a, **k)
+        lines.append(" ".join(str(x) for x in a) + k.get("end", "\n"))
     try:
         now = md.as_ist(now)
+        log_file = os.path.join(folder, LOG_DIR, f"repair_{now:%Y-%m-%d_%H%M%S}{'' if apply else '_dryrun'}.log")
         affected, counts = find_affected(folder)
         mode = "apply" if apply else "dry run, nothing written"
         log(f"Rows found ({mode}): {counts['provisional']:,} provisional (day candle fetched before the next day "
@@ -178,9 +197,9 @@ def repair(folder=None, kite=None, apply=False, limit=None, speed=md.SPEED, now=
         if limit:
             sids = sids[:limit]
         result = {"applied": apply, "counts": counts, "stocks": len(sids), "repaired": [], "skipped": [],
-                  "skipped_dates": [], "refused": [], "borrowing": [], "preexisting": [], "drift": [],
+                  "skipped_dates": [], "refused": [], "borrowing": [], "preexisting": [], "drift": [], "held": [],
                   "before": {}, "after": {}, "ratio": {}, "drift_before": {}, "drift_after": {}, "drift_ratio": {},
-                  "backup": None, "requests": 0}
+                  "backup": None, "requests": 0, "log_file": log_file}
         if not sids:
             log("Nothing to repair.")
             result["report"] = "Nothing to repair."
@@ -267,13 +286,28 @@ def repair(folder=None, kite=None, apply=False, limit=None, speed=md.SPEED, now=
             good = [d for d in dates if d not in bad]
             if not good:
                 continue
-            new_in = inputs.copy()
-            for d in good:
-                i = pos[d]
-                for f in md.FIELDS:
-                    new_in.at[i, f"kite_{f}"] = trial.at[i, f"kite_{f}"]
-                new_in.at[i, "fetched_at"] = fetched
-                new_in.at[i, "run_id"] = run_id
+
+            def with_candles(ds):
+                x = inputs.copy()
+                for d in ds:
+                    i = pos[d]
+                    for f in md.FIELDS:
+                        x.at[i, f"kite_{f}"] = trial.at[i, f"kite_{f}"]
+                    x.at[i, "fetched_at"] = fetched
+                    x.at[i, "run_id"] = run_id
+                return x
+            new_in = with_candles(good)
+            # guard (b): a row stored OK that the new candle would give a price flag is held (the old row kept)
+            first_new = repaired_rows(calc, sid, new_in, good, bhav)
+            held = [(d, c) for d, c in zip(first_new["date"], first_new["check"])
+                    if is_ok(stored.at[pos[d], "check"]) and any(x in str(c).split("|") for x in PRICE_FLAGS)]
+            for d, c in held:
+                result["held"].append((symbol, sid, d, stored.at[pos[d], "check"], c))
+            if held:
+                good = [d for d in good if d not in {d for d, _ in held}]
+                if not good:
+                    continue
+                new_in = with_candles(good)
             keep = ~stored["date"].isin(good).to_numpy()
             # the guard: the repair may change no other row (older or later), compared on two fresh derives
             base = calc.derive(sid, inputs, bhav=bhav)
@@ -342,6 +376,9 @@ def repair(folder=None, kite=None, apply=False, limit=None, speed=md.SPEED, now=
             for symbol, sid, why in result["refused"]:
                 rows += [{"security_id": sid, "symbol": symbol, "date": md.iso(d), "kind": affected[sid][d],
                           "result": "REFUSED", "note": why} for d in sorted(affected[sid])]
+            for symbol, sid, d, old, new in result["held"]:
+                rows.append({"security_id": sid, "symbol": symbol, "date": md.iso(d), "kind": affected[sid][d],
+                             "result": "HELD", "note": held_note(old, new), "old_check": old, "new_check": new})
             os.makedirs(backup, exist_ok=True)
             sm.write_csv(pd.DataFrame(rows, columns=REPAIR_COLUMNS), os.path.join(backup, "repair.csv"))
             result["backup"] = backup
@@ -372,6 +409,12 @@ def repair(folder=None, kite=None, apply=False, limit=None, speed=md.SPEED, now=
             db.close()
         if work:
             shutil.rmtree(work, ignore_errors=True)
+        if log_file:
+            try:
+                os.makedirs(os.path.dirname(log_file), exist_ok=True)
+                sm.write_text(log_file, "".join(lines))
+            except OSError as e:
+                screen(f"The log file {log_file} was not written: {e}")
         lock.release()
 
 
@@ -386,6 +429,10 @@ def report(r, apply):
     names = [n for _, n in RATIO_BUCKETS] + [n for n in ("no ratio before", "no ratio after") if r["ratio"].get(n)]
     lines.append("Ratio change (bhavcopy close / Kite close, new vs old): " +
                  ", ".join(f"{n} {r['ratio'].get(n, 0):,}" for n in names))
+    if r["held"]:
+        lines.append(f"Held (stored OK, the new candle gives HIGHLOW_DIFF / CLOSE_DIFF; the old row kept, not "
+                     f"repaired): {len(r['held']):,}")
+        lines += [f"  {s} ({sid}) {md.iso(d)}: {held_note(old, new)}" for s, sid, d, old, new in r["held"]]
     if r["skipped"]:
         lines.append(f"Skipped stocks: {len(r['skipped']):,}")
         lines += [f"  {s} ({sid}): {why}" for s, sid, why in r["skipped"]]
@@ -422,4 +469,6 @@ def report(r, apply):
                      ", ".join(f"{c} ({n:,})" for c, n in sorted(cols.items(), key=lambda x: -x[1])))
     if apply and r["backup"]:
         lines.append(f"Backup of every changed days.parquet and repair.csv: {r['backup']}")
+    if r.get("log_file"):
+        lines.append(f"Log: {r['log_file']}")
     return "\n".join(lines) + "\n"
