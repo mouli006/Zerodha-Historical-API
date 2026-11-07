@@ -18,4 +18,4 @@ date,weekday,kind,start,end,in_bhavcopy,evidence,note
 2025-02-01,Sat,BUDGET_WEEKEND,09:15,15:30,no,Kite 2035 stocks 09:15-15:29 (median 371 bars); no bhavcopy row; all EXTRA_SESSION,Union Budget Saturday
 2025-10-21,Tue,MUHURAT,13:45,14:45,yes,bhav EQ trades 8.93 M vs 20-day median 31.84 M (0.28); Kite 2165 stocks 13:45-14:44 (median 60 bars),afternoon session; ICICI labels it SHORT_DAY
 2026-02-01,Sun,BUDGET_WEEKEND,09:15,15:30,no,Kite 2222 stocks 09:15-15:29 (median 358 bars); no bhavcopy row; all EXTRA_SESSION,Union Budget Sunday
-2026-11-08,Sun,MUHURAT,,,no,announced session; no data yet,timings to be announced by NSE
+2026-11-08,Sun,MUHURAT,14:20,15:30,no,NSE circular NSE/CMTR/76941 (19 Oct 2026): normal market 14:20; non-CAS close 15:30; CAS (F&O) stocks close 15:15 then closing auction 15:20-15:35; no data yet,times from the NSE circular; CAS stocks end 15:15 (backtest point 87)

@@ -151,7 +151,7 @@ def test_repo_copy_is_used_without_a_data_copy_and_holds_the_19_dates_plus_the_n
     weekend = ss.weekend_dates(str(tmp_path))
     assert len(weekend) == 12 and SUN_NEXT in weekend   # the 11 sessions found, plus 2026-11-08
     assert set(df.loc[df["in_bhavcopy"] == "no", "date"]) == set(weekend)
-    assert df.loc[df["date"] == SUN_NEXT, ["start", "end"]].values.tolist() == [["", ""]]
+    assert df.loc[df["date"] == SUN_NEXT, ["start", "end"]].values.tolist() == [["14:20", "15:30"]]
 
 
 @pytest.mark.parametrize("day, kind", [(date(2015, 11, 11), "MUHURAT"), (date(2020, 2, 1), "BUDGET_WEEKEND"),
