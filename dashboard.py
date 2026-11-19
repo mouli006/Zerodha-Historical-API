@@ -3,7 +3,6 @@ import io
 import os
 import subprocess
 import sys
-import threading
 from datetime import date, timedelta
 
 from flask import Blueprint, jsonify, redirect, render_template, request, send_file, session, url_for
@@ -15,7 +14,9 @@ from backfill import bhav, bhav_export, bhav_review, fno, fno_days
 from backfill.dhan_api import DhanClient, data_plan_error, token_ok
 from backfill.fetch import INTERVALS, MAX_INDEX_RANGE_DAYS, MAX_RANGE_DAYS
 from backfill.instruments import INDEX_CHOICES
-from backfill.job import DEFAULT_SPEED, JOB, JOB_LOCK, STOP, job_begin
+from backfill.job import BROKER as BROKER_NAME
+from backfill.job import (DEFAULT_SPEED, JOB_LOCK, SLOTS, job_begin, last_refusal, refusal_text, running_text, slot,
+                          start_worker, stop_event, use_slot)
 from backfill.runner import bulk_download
 from backfill.storage import FILE_FORMATS, check_folder, job_run_key
 from config import (DEFAULT_DATA_DIR, FNO_RAW_KEYS, VARIANTS, credentials, data_dir, derive_without, fno_target,
@@ -35,18 +36,19 @@ def success():
     if "access_token" not in session:
         return redirect(url_for("auth.index"))
     today = date.today()
+    job = slot("kite")   # the planner's last values (the planner uses the Kite slot)
     with JOB_LOCK:
         form = {
-            "from": JOB["from"] or (today - timedelta(days=364)).isoformat(),
-            "to": JOB["to"] or today.isoformat(),
-            "interval": JOB["interval"] or "minute",
-            "speed": JOB["speed"],
-            "equity": JOB["equity"],
-            "indices": JOB["indices"],
-            "etfs": JOB["etfs"],
-            "t2t": JOB["t2t"],
-            "folder": JOB["folder"] or data_dir(),
-            "format": JOB["format"] or "csv",
+            "from": job["from"] or (today - timedelta(days=364)).isoformat(),
+            "to": job["to"] or today.isoformat(),
+            "interval": job["interval"] or "minute",
+            "speed": job["speed"],
+            "equity": job["equity"],
+            "indices": job["indices"],
+            "etfs": job["etfs"],
+            "t2t": job["t2t"],
+            "folder": job["folder"] or data_dir(),
+            "format": job["format"] or "csv",
         }
     # the F&O and bhavcopy cards switch between these (exchange: Kite's; bhav: whose bhavcopy checks it)
     underlyings = [{"name": u, "exchange": exch, "bhav": fno.exchange_name(u)} for u, (exch, _) in fno.UNDERLYINGS.items()]
@@ -147,11 +149,12 @@ def download_start():
                      interval=interval, format=fmt, equity=equity, indices=indices, equity_total=0,
                      **{"from": start.isoformat()}, to=end.isoformat(), speed=speed, etfs=etfs, t2t=t2t,
                      folder=folder):
+        if last_refusal("kite").startswith("same_folder"):   # refused for the save folder (D205), not as busy
+            return fail(refusal_text("kite"))
         return redirect(url_for("dashboard.success"))
-    STOP.clear()
-    threading.Thread(target=bulk_download, daemon=True,
-                     args=(api_key, access_token, interval, start, end, speed, etfs, t2t,
-                           indices, equity, folder, fmt)).start()
+    stop_event("kite").clear()
+    start_worker("kite", bulk_download, api_key, access_token, interval, start, end, speed, etfs, t2t,
+                 indices, equity, folder, fmt)
     return redirect(url_for("dashboard.success"))
 
 
@@ -270,10 +273,10 @@ def download_fno_start():
     if not job_begin(**fno.job_fields(underlying, run_date, folder, speed, keep_zero, label=label, trim_to_bhav=trim,
                                       derive=bool(derive_to))):
         lock.release()
-        return fail("A download is already running. Stop it or wait for it to finish.")
+        return fail(refusal_text("kite"))
     if not load_env().get(FNO_RAW_KEYS["kite"]):   # with FNO_RAW_KITE set, KITE_DATA_DIR stays the planner's
         save_env({"KITE_DATA_DIR": folder})
-    STOP.clear()
+    stop_event("kite").clear()
 
     weekday = weekly_expiry_weekday(underlying)
 
@@ -294,7 +297,7 @@ def download_fno_start():
         finally:
             lock.release()
 
-    threading.Thread(target=work, daemon=True).start()
+    start_worker("kite", work)
     return redirect(url_for("dashboard.success"))
 
 
@@ -332,10 +335,11 @@ def signed_in(source):
 
 
 def locked_fno(folder, underlying, owner, source="kite"):
-    """(lock, error): the F&O lock, refused while a download job is running (it owns the rate limit)."""
+    """(lock, error): the F&O lock, refused while this source's download job is running (it owns the rate limit and
+    writes this source's files); the other broker's job does not block it."""
     with JOB_LOCK:
-        if JOB["state"] == "running":
-            return None, "A download is running. Try again when it has finished."
+        if slot(source)["state"] == "running":
+            return None, f"A {BROKER_NAME[source]} download is running. Try again when it has finished."
     try:
         return fno.acquire_lock(folder, underlying, owner, source), ""
     except fno.LockBusy as e:
@@ -345,10 +349,11 @@ def locked_fno(folder, underlying, owner, source="kite"):
 def refresh_live_summary(folder, run_date, rows, source="kite"):
     """Show new summary rows on the live card when it is showing this day."""
     if rows is not None:
+        job = slot(source)
         with JOB_LOCK:
-            if (JOB["kind"] == "fno" and JOB["fno_date"] == run_date.isoformat() and JOB["folder"] == folder
-                    and (JOB["source"] or "kite") == source):
-                JOB["fno_summary"] = rows
+            if (job["kind"] == "fno" and job["fno_date"] == run_date.isoformat() and job["folder"] == folder
+                    and (job["source"] or "kite") == source):
+                job["fno_summary"] = rows
 
 
 @bp.route("/fno/bhav-status")
@@ -425,9 +430,8 @@ def fno_bhav_no_bhav():
         err = "action must be mark or undo."
     if err:
         return jsonify({"error": err})
-    with JOB_LOCK:
-        if JOB["state"] == "running":
-            return jsonify({"error": "A download is running. Try again when it has finished."})
+    if running_text():   # it writes in every Kite and Dhan store of the underlying (D204)
+        return jsonify({"error": running_text()})
     lines = []
     roots = bhav_review.store_roots(underlying, load_env(), also=[(source, folder)])
     done = bhav_review.no_bhav(underlying, run_date, roots, fno.today_ist(), request.values.get("note", "").strip(),
@@ -445,9 +449,8 @@ def fno_bhav_check_all():
     download job runs or any of them is busy. Runs in the request, like Check all pending."""
     if "access_token" not in session and not dhan.status(load_env())["connected"]:
         return jsonify({"error": "Not logged in."}), 403
-    with JOB_LOCK:
-        if JOB["state"] == "running":
-            return jsonify({"error": "A download is running. Try again when it has finished."})
+    if running_text():   # it checks the Kite and the Dhan stores (D204)
+        return jsonify({"error": running_text()})
     keep = read_flag("keep_zero")
     sets, locks, rows = [], {}, []
     try:
@@ -595,10 +598,11 @@ def fno_redownload():
     if err:
         return jsonify({"error": err})
     try:
-        saved, message = fno.redownload_contract(credentials()[0] if source == "kite" else "", access_token, run_date,
-                                                 folder, contract, underlying, read_speed() or DEFAULT_SPEED,
-                                                 keep_zero=keep_zero, kite=client, source=source,
-                                                 derive_to=derive_to)
+        with use_slot(None):   # not a job: no job's counters move, an old Stop is never seen (D206, P210)
+            saved, message = fno.redownload_contract(credentials()[0] if source == "kite" else "", access_token,
+                                                     run_date, folder, contract, underlying,
+                                                     read_speed() or DEFAULT_SPEED, keep_zero=keep_zero, kite=client,
+                                                     source=source, derive_to=derive_to)
         day_dir = fno.day_dir(folder, underlying, run_date, source)
         status, line, rows = bhav.check_saved(day_dir, run_date, underlying) if saved else ("", "", None)
         refresh_live_summary(folder, run_date, rows, source)
@@ -636,18 +640,36 @@ def browse_folder():
     return jsonify({"path": os.path.normpath(out.stdout) if out.stdout else ""})
 
 
-@bp.route("/download/stop", methods=["POST"])
-def download_stop():
-    STOP.set()
+def job_source(source):
+    """(slot name, error) for /download/status and /download/stop: the path's <source>, else ?source=kite|dhan,
+    else kite. The pages use the path form (/download/status/dhan) because they append ?since= to the URL."""
+    source = source or request.values.get("source", "kite") or "kite"
+    return (source, "") if source in SLOTS else (None, f"Unknown data source {source}.")
+
+
+@bp.route("/download/stop", methods=["POST"], defaults={"source": ""})
+@bp.route("/download/stop/<source>", methods=["POST"])
+def download_stop(source):
+    """Stop only the job of this page's source (kite | dhan; absent = kite)."""
+    source, err = job_source(source)
+    if err:
+        return jsonify({"error": err}), 400
+    stop_event(source).set()
     return redirect(url_for("dashboard.success"))
 
 
-@bp.route("/download/status")
-def download_status():
-    """Job state; completed stocks are sent incrementally from ?since=<count already shown>."""
+@bp.route("/download/status", defaults={"source": ""})
+@bp.route("/download/status/<source>")
+def download_status(source):
+    """The job of this page's source (kite | dhan; absent = kite); completed stocks are sent incrementally
+    from ?since=<count already shown>."""
+    source, err = job_source(source)
+    if err:
+        return jsonify({"error": err}), 400
     since = request.args.get("since", 0, type=int)
+    job = slot(source)
     with JOB_LOCK:
-        out = {k: v for k, v in JOB.items() if k != "completed"}
-        out["completed_count"] = len(JOB["completed"])
-        out["completed_new"] = JOB["completed"][max(since, 0):]
+        out = {k: v for k, v in job.items() if k != "completed"}
+        out["completed_count"] = len(job["completed"])
+        out["completed_new"] = job["completed"][max(since, 0):]
     return jsonify(out)

@@ -20,10 +20,21 @@ import dashboard  # after ENV_PATH is set (imports app)
 import dhan
 import nifty_daily
 from backfill import fno
+from backfill import job as job_state
 
 
 def pytest_sessionfinish(session, exitstatus):
     shutil.rmtree(ENV_DIR, ignore_errors=True)
+
+
+@pytest.fixture(autouse=True)
+def fresh_job_slots():
+    """Before and after every test: both job slots (kite, dhan) idle and fresh, both stop events cleared, pytest's
+    thread bound to no slot. A test that starts a Dhan job binds this thread to the dhan slot (job_begin), and a slot
+    left "running" would refuse later starts; neither may leak into the next test."""
+    job_state.reset_slots()
+    yield
+    job_state.reset_slots()
 
 
 @pytest.fixture(autouse=True)

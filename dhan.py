@@ -6,7 +6,6 @@ daily job as the Kite dashboard (backfill/fno.py) through backfill.dhan_api.Dhan
 <save folder>/<UNDERLYING>_FnO_1min_Dhan/ (NIFTY from NSE_FNO, SENSEX from BSE_FNO).
 """
 import os
-import threading
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
@@ -15,7 +14,7 @@ from kiteconnect import exceptions as kex
 
 from backfill import fno, fno_days
 from backfill.dhan_api import MAX_SPEED, DhanClient, DhanError, data_plan_error, fetch_profile, token_connected
-from backfill.job import JOB, JOB_LOCK, STOP, job_begin
+from backfill.job import JOB_LOCK, job_begin, refusal_text, slot, start_worker, stop_event
 from backfill.storage import check_folder
 from config import (DEFAULT_DATA_DIR, FNO_RAW_KEYS, VARIANTS, data_dir, derive_without, dhan_credentials, fno_target,
                     keep_zero_volume, load_env, save_env, store_base, trim_to_bhav, weekly_expiry_weekday)
@@ -117,10 +116,11 @@ def dashboard():
     if not dhan_token():
         return redirect(url_for("dhan.index", error="Connect Dhan first: paste a valid access token."))
     st = status()
+    job = slot(SOURCE)   # the Dhan slot; the Kite slot's folder is only the last fallback, as before
     with JOB_LOCK:
-        mine = JOB["kind"] == "fno" and JOB["source"] == SOURCE
-        speed = JOB["speed"] if mine else DEFAULT_SPEED
-        last = JOB["folder"]
+        mine = job["kind"] == "fno" and job["source"] == SOURCE
+        speed = job["speed"] if mine else DEFAULT_SPEED
+        last = job["folder"] if mine and job["folder"] else slot("kite")["folder"]
     # the last Dhan F&O job's folder, else .env FNO_RAW_DHAN, else the last folder used / KITE_DATA_DIR
     env = load_env()
     raw = env.get(FNO_RAW_KEYS[SOURCE])
@@ -265,13 +265,13 @@ def fno_start():
     except fno.LockBusy as e:
         return fail(str(e))
     label = f"{dates[0]}_to_{dates[-1]}" if dates else "missing"
-    if not job_begin(**fno.job_fields(underlying, run_date, folder, speed, keep_zero, SOURCE, label, trim,
-                                      derive=bool(derive_to))):
+    if not job_begin(slot=SOURCE, **fno.job_fields(underlying, run_date, folder, speed, keep_zero, SOURCE, label, trim,
+                                                   derive=bool(derive_to))):
         lock.release()
-        return fail("A download is already running. Stop it or wait for it to finish.")
+        return fail(refusal_text(SOURCE))
     if not load_env().get(FNO_RAW_KEYS[SOURCE]):   # with FNO_RAW_DHAN set, KITE_DATA_DIR stays the planner's
         save_env({"KITE_DATA_DIR": folder})
-    STOP.clear()
+    stop_event(SOURCE).clear()
     user = profile.get("user_id", "")
 
     def work():
@@ -290,5 +290,5 @@ def fno_start():
         finally:
             lock.release()
 
-    threading.Thread(target=work, daemon=True).start()
+    start_worker(SOURCE, work)
     return redirect(url_for("dhan.dashboard"))

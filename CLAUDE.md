@@ -59,7 +59,7 @@ A local Flask app ("Kite Backfill", one machine) that:
 ## Code map
 Shared
 - `config.py`: paths, `.env` helpers (`load_env`, `save_env`, `credentials`, ...) and the setting defaults.
-- `backfill/job.py`: in-memory job state (`JOB`, `job_begin`, `STOP`).
+- `backfill/job.py`: in-memory job state, one slot per broker (`JOBS["kite"|"dhan"]`; `JOB` / `STOP` = the current thread's slot, `job_begin`, `start_worker`, `use_slot`). See docs/dev/dashboard.md.
 - `backfill/fetch.py`: request chunks, `RateLimiter`, `fetch_chunk` with retries.
 - `backfill/locks.py`: `RunLock` / `LockBusy` for all non-F&O code (re-exported from `fno.py`).
 

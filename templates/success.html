@@ -262,7 +262,7 @@
            "bhavCheck": url_for("dashboard.fno_bhav_check"), "redownload": url_for("dashboard.fno_redownload"),
            "bhavMarks": url_for("dashboard.fno_bhav_marks"), "bhavReview": url_for("dashboard.fno_bhav_review"),
            "bhavNoBhav": url_for("dashboard.fno_bhav_no_bhav"), "bhavCheckAll": url_for("dashboard.fno_bhav_check_all"),
-           "stop": url_for("dashboard.download_stop"), "status": url_for("dashboard.download_status"),
+           "stop": url_for("dashboard.download_stop", source=mode), "status": url_for("dashboard.download_status", source=mode),
            "browse": url_for("dashboard.browse_folder"), "logout": url_for("auth.logout"), "dhan": url_for("dhan.index"),
            "dhanLogout": url_for("dhan.logout", next="dashboard"), "dhanPageLogout": url_for("dhan.logout"),
            "dhanDashboard": url_for("dhan.dashboard"), "success": url_for("dashboard.success")}
