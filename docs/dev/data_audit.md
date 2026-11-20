@@ -32,14 +32,14 @@ python -m backfill.equity.audit run --folder F [--fno-folder B] [--fno-raw-kite 
   ended without a clean finish; never delete the -wal file; the next normal ICICI run merges it). Any other error
   also ends with exit 2. The Kite `download_progress.sqlite` is never opened, only snapshotted.
 - Stores changed: a snapshot before and after the run of every lock (held + mtime) and of the 4 F&O `days.csv`, both
-  `download_progress.sqlite` and their `-wal` files, the master `build_info.json`, `NSE_CM_bhav\days.csv` and the newest bhavcopy year file
+  `download_progress.sqlite` and their `-wal` files, the master `build_info.json`, `NSE_CM_bhav\days.csv`, the ICICI plan's `icici_plan_days.parquet` and the newest bhavcopy year file
   (mtime + size). Any difference or a lock held at the end: the folder is still written, `report.txt` and
   `summary.csv` start with "RESULT NOT VALID: stores changed during the run, run again", exit 2.
 
 ## Reasons (first match wins)
 | Store | Expected days | Order |
 |---|---|---|
-| equity 1-minute | every NONE traded day of every STOCK (`minute_combined.stock_sources`: traded = bhavcopy row EQ / BE / BZ with volume) | manual LOST / P65_RETRY (a P65 row past `clear_by` -> UNEXPLAINED) -> NOT_FINISHED / UPDATE_PENDING -> ICICI_EMPTY / ICICI_BEFORE_START -> VENDOR (NOT_IN_ICICI, ICICI_MIXED_SERIES) -> WAITING_ICICI (ICICI_NOT_YET_FETCHED) -> UNEXPLAINED (evidence = the combined reason, e.g. NOT_IN_ICICI_PLAN = P178) |
+| equity 1-minute | every NONE traded day of every STOCK (`minute_combined.stock_sources`: traded = bhavcopy row EQ / BE / BZ with volume) | manual LOST / P65_RETRY (a P65 row past `clear_by` -> UNEXPLAINED) -> NOT_FINISHED / UPDATE_PENDING -> ICICI_EMPTY / ICICI_BEFORE_START -> VENDOR (NOT_IN_ICICI on a day of the ICICI plan's day list `equity_1min_icici/plan/icici_plan_days.parquet`, ICICI_MIXED_SERIES; NOT_IN_ICICI on any other day -> UNEXPLAINED `<kite>+NOT_IN_ICICI_AFTER_PLAN`; the list's path and rows are in the Paths block and run_info.json, an unreadable list is reported and leaves every NOT_IN_ICICI day UNEXPLAINED) -> WAITING_ICICI (ICICI_NOT_YET_FETCHED) -> UNEXPLAINED (evidence = the combined reason, e.g. NOT_IN_ICICI_PLAN = P178) |
 | EOD | every weekday 2015-01-01 -> today (IST) plus the special-session weekend days, minus `days.csv` holiday rows | holiday row -> HOLIDAY (listed); `ok` row with its raw file = present; else manual LOST -> NOT_FINISHED / UPDATE_PENDING -> UNEXPLAINED |
 | master | `build_info.json` last_date vs the newest `ok` bhavcopy day | older -> UNEXPLAINED; kinds counted, ETF / RIGHTS = NOT_DOWNLOADED_KIND (one count line) |
 | F&O | each `days.csv` x kite / dhan, the EOD expected days from the set's first row -> today | `<src>_available` True: present, but an empty / `unchecked` `<src>_check` -> UNEXPLAINED; missing row / not available: manual LOST -> NOT_FINISHED / UPDATE_PENDING -> UNEXPLAINED |

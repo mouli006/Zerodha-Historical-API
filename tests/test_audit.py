@@ -49,7 +49,7 @@ FNO_COLS = ["date", "kite_available", "dhan_available", "kite_check", "dhan_chec
 
 class World:
     def __init__(self, root, monkeypatch, tables=None, eod_days=WEEK, holidays=(), special=(), master_last=d(20),
-                 fno_rows=None, manual=True, failed=0):
+                 fno_rows=None, manual=True, failed=0, plan_days=None):
         self.root = root
         self.folder = str(root / "eq")
         self.fno = str(root / "fno" / "backtest")
@@ -90,6 +90,7 @@ class World:
                         ("S9", f"2026-11-1{i}"))
         con.commit()
         con.close()
+        self.plan_days(plan_days if plan_days is not None else {"S1": [d(19)]})
         self.tables = tables if tables is not None else {"S9": kite_table(WEEK)}
         secs = pd.DataFrame({"security_id": ["S1", "S2", "S3", "S9", "E1", "R1"],
                              "last_symbol": ["ONE", "TWO", "THREE", "NINE", "ETFX", "RTS"],
@@ -102,6 +103,14 @@ class World:
                             lambda folder, ids, log=print: ((s, self.tables[s]) for s in ids if s in self.tables))
         monkeypatch.setattr(audit, "EOD_FROM", WEEK[0])
         monkeypatch.setattr(audit, "git_commit", lambda: "test")
+
+    def plan_days(self, by_sid):
+        """The ICICI plan's day list (icici_plan_days.parquet), {security_id: [dates]}."""
+        rows = [{"security_id": s, "date": x, "row": 0, "reason": "test", "priority": 1}
+                for s, ds in by_sid.items() for x in ds]
+        p = audit.plan_days_path(self.folder)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        pd.DataFrame(rows, columns=["security_id", "date", "row", "reason", "priority"]).to_parquet(p, index=False)
 
     def manual(self, rows):
         write_csv(audit.manual_path(self.folder), rows, audit.MANUAL_COLUMNS)
@@ -423,3 +432,35 @@ def test_any_other_error_ends_with_exit_2(tmp_path, monkeypatch, capsys):       
     monkeypatch.setattr(audit.sm, "load_master", no_master)
     assert audit.main(["run", "--folder", w.folder, "--stores", "eod"]) == 2
     assert "NotBuilt" in capsys.readouterr().out
+
+
+# ---- NOT_IN_ICICI only on the ICICI plan's day list (COMPINFO 2026-11-19) ----
+
+def test_not_in_icici_is_vendor_only_on_a_plan_day():                                             # 28
+    m = audit.Manual(None)
+    assert audit.classify_equity("NO_KITE_ROW+NOT_IN_ICICI", d(16), "S1", m, d(20), SAT, {d(16)}) ==         ("VENDOR", "NO_KITE_ROW+NOT_IN_ICICI", "")
+    assert audit.classify_equity("NO_KITE_ROW+NOT_IN_ICICI", d(19), "S1", m, d(20), SAT, {d(16)}) ==         ("UNEXPLAINED", "NO_KITE_ROW+NOT_IN_ICICI_AFTER_PLAN", "")
+    assert audit.classify_equity("NO_KITE_FOLDER+ICICI_MIXED_SERIES", d(19), "S1", m, d(20), SAT, set())[0] == "VENDOR"
+
+
+def test_day_after_the_plan_is_unexplained_and_the_day_list_is_reported(tmp_path, monkeypatch):  # 29
+    tables = {"S9": kite_table(WEEK),
+              "S1": kite_table([], {d(16): "NO_KITE_ROW+NOT_IN_ICICI", d(19): "NO_KITE_ROW+NOT_IN_ICICI"})}
+    w = World(tmp_path, monkeypatch, tables, plan_days={"S1": [d(16)], "S2": [d(17), d(18)]})
+    assert w.run(stores=["equity"]) == 1
+    got = {r["date"]: (r["reason"], r["evidence"]) for r in w.gaps().to_dict("records")}
+    assert got == {"2026-11-16": ("VENDOR", "NO_KITE_ROW+NOT_IN_ICICI"),
+                   "2026-11-19": ("UNEXPLAINED", "NO_KITE_ROW+NOT_IN_ICICI_AFTER_PLAN")}
+    rep = w.report()
+    assert audit.plan_days_path(w.folder) in rep and "ICICI plan day list rows" in rep and audit.PLAN_NOT_READ not in rep
+    info = json.load(open(os.path.join(w.out(), "run_info.json"), encoding="utf-8"))
+    assert info["icici_plan_days"] == {"path": audit.plan_days_path(w.folder), "rows": 3, "read": True, "error": None}
+    assert audit.plan_days_path(w.folder) in info["inputs"]
+    with open(audit.plan_days_path(w.folder), "wb") as f:      # unreadable list: both days UNEXPLAINED, said so
+        f.write(b"not a parquet file")
+    assert w.run(stores=["equity"]) == 1
+    g = w.gaps(f"audit_{SAT:%Y-%m-%d}_b")
+    assert set(g["reason"]) == {"UNEXPLAINED"} and len(g) == 2
+    assert audit.PLAN_NOT_READ in w.report(f"audit_{SAT:%Y-%m-%d}_b")
+    info = json.load(open(os.path.join(w.out(f"audit_{SAT:%Y-%m-%d}_b"), "run_info.json"), encoding="utf-8"))
+    assert info["icici_plan_days"]["read"] is False and info["icici_plan_days"]["rows"] is None

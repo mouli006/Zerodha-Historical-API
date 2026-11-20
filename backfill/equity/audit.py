@@ -18,6 +18,7 @@ import time
 from datetime import date, datetime, timedelta
 
 import pandas as pd
+import pyarrow.parquet as pq
 
 import config
 from backfill.equity import icici_store as st
@@ -44,6 +45,8 @@ SOURCES = ("kite", "dhan")
 RAW_FOLDER = {"kite": "{u}_FnO_1min", "dhan": "{u}_FnO_1min_Dhan"}
 EOD_FROM = date(2015, 1, 1)
 NOT_VALID = "RESULT NOT VALID: stores changed during the run, run again"
+AFTER_PLAN = "NOT_IN_ICICI_AFTER_PLAN"          # a NOT_IN_ICICI day not on the ICICI plan's day list
+PLAN_NOT_READ = "ICICI plan day list NOT read: all NOT_IN_ICICI days counted UNEXPLAINED"
 CLEARS = {"NOT_FINISHED": "after D+1 01:00 IST",
           "UPDATE_PENDING": {"equity": "after the next equity_minute.py update",
                              "eod": "after the next equity_update.py",
@@ -84,6 +87,26 @@ def icici_db(folder):
 
 def kite_db(folder):
     return os.path.join(mp.out_dir(folder), "download_progress.sqlite")
+
+
+def plan_days_path(folder):
+    return os.path.join(st.plan_dir(folder), "icici_plan_days.parquet")
+
+
+def icici_plan_days(folder):
+    """(days, rows, error): {security_id: set of dates} of the ICICI plan's day list (icici_plan_days.parquet, written
+    by icici_minute.py plan), its row count and None; ({}, None, why) when it cannot be read (read only)."""
+    p = plan_days_path(folder)
+    if not os.path.isfile(p):
+        return {}, None, f"no file {p}"
+    try:
+        df = pq.read_table(p, columns=["security_id", "date"]).to_pandas()
+        out = {}
+        for sid, day in zip(df["security_id"], df["date"]):
+            out.setdefault(sid, set()).add(sm.as_date(day))
+        return out, len(df), None
+    except Exception as e:                       # unreadable list: every NOT_IN_ICICI day stays UNEXPLAINED
+        return {}, None, f"{type(e).__name__}: {e}"
 
 
 def fno_days_paths(fno_folder):
@@ -169,7 +192,7 @@ def snapshot(folder, fno):
     files = list(mc.lock_paths(folder).values()) + fno_locks(fno)
     files += [icici_db(folder), icici_db(folder) + "-wal", kite_db(folder), kite_db(folder) + "-wal",
               os.path.join(mp.store_dir(folder), "days.csv"),
-              os.path.join(sm.out_dir(folder), "build_info.json")]
+              os.path.join(sm.out_dir(folder), "build_info.json"), plan_days_path(folder)]
     years = sm.year_files(mp.store_dir(folder)) if os.path.isdir(mp.store_dir(folder)) else []
     if years:
         files.append(max(years, key=os.path.getmtime))
@@ -259,22 +282,26 @@ def equity_tables(folder, ids, log=print):
             log(f"  {n}/{len(ids)} stocks, memory {cur / 2**20:.0f} MB (peak {peak / 2**20:.0f})")
 
 
-def classify_equity(reason, day, sid, manual, newest_kite, now):
-    """(reason, evidence, clears_when) of one NONE traded day; reason = the combined '<kite>+<icici>' reason."""
+def classify_equity(reason, day, sid, manual, newest_kite, now, plan_days=None):
+    """(reason, evidence, clears_when) of one NONE traded day; reason = the combined '<kite>+<icici>' reason.
+    plan_days: the stock's dates on the ICICI plan's day list; NOT_IN_ICICI is VENDOR only on those days, any other
+    day is UNEXPLAINED '<kite>+NOT_IN_ICICI_AFTER_PLAN' (a Kite miss after the plan was built)."""
     hit = manual.hit("equity", sid, day, now.date())
     if hit:
         return hit
     t = time_reason("equity", day, newest_kite, now)
     if t:
         return t[0], reason, t[1]
-    icici = reason.split("+", 1)[1] if "+" in reason else ""
+    kite_part, icici = reason.split("+", 1) if "+" in reason else (reason, "")
+    if icici == "NOT_IN_ICICI" and day not in (plan_days or ()):
+        return UNEXPLAINED, f"{kite_part}+{AFTER_PLAN}", ""
     r = ICICI_PART.get(icici)
     if r:
         return r, reason, CLEARS.get(r, "")
     return UNEXPLAINED, reason, ""
 
 
-def audit_equity(folder, ids, symbols, manual, now, log=print):
+def audit_equity(folder, ids, symbols, manual, now, log=print, plan_days=None):
     none_rows, flags = [], {"day_empty": 0, "no_bhav_row": 0, "frozen": 0, "stocks": 0, "traded": 0}
     newest = None
     for sid, t in equity_tables(folder, ids, log):
@@ -294,7 +321,7 @@ def audit_equity(folder, ids, symbols, manual, now, log=print):
             none_rows.append((sid, d, r))
     gaps = []
     for sid, d, r in none_rows:
-        reason, ev, clears = classify_equity(r, d, sid, manual, newest, now)
+        reason, ev, clears = classify_equity(r, d, sid, manual, newest, now, (plan_days or {}).get(sid, set()))
         gaps.append(gap("equity", d, reason, ev, sid, symbols.get(sid, ""), clears=clears))
     flags["newest_kite"] = newest
     return gaps, flags
@@ -508,6 +535,9 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
     manual_df = read_manual(paths["manual file"])
     manual = Manual(manual_df)
     special = set(ss.load_special_sessions(folder)["date"])
+    plan = icici_plan_days(folder) if "equity" in stores else None
+    if plan:
+        paths["ICICI plan day list"] = plan_days_path(folder)
     lines = []
 
     def say(x=""):
@@ -522,6 +552,10 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
     if fno:
         lf = fno_locks(fno)
         say(f"  F&O lock check: {len(lf)} folders, {sum(os.path.isfile(p) for p in lf)} lock files found")
+    if plan:
+        say(f"  {'ICICI plan day list rows':<28} " + (f"{plan[1]:,}" if plan[2] is None else "-"))
+        if plan[2] is not None:
+            say(f"  {PLAN_NOT_READ} ({plan[2]})")
     if manual_df is None:
         say(f"  MANUAL FILE MISSING: {paths['manual file']}: its LOST / P65_RETRY days stay UNEXPLAINED")
     say("")
@@ -538,7 +572,7 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
     if "equity" in stores:
         ids = sorted({ms.resolve(k, folder) for k in stocks}) if stocks else \
             sorted(secs.loc[secs["instrument_kind"] == "STOCK", "security_id"])
-        g, notes["equity"] = audit_equity(folder, ids, symbols, manual, now, log)
+        g, notes["equity"] = audit_equity(folder, ids, symbols, manual, now, log, plan[0])
         gaps += g
     if "master" in stores:
         g, notes["master"] = audit_master(folder, eod_info["newest_ok"] if eod_info else None)
@@ -623,6 +657,8 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
             "commit": git_commit(), "stores": list(stores), "paths": paths,
             "inputs": {p: {"mtime": s[0][0] if s[0] else None, "size": s[0][1] if s[0] else None, "held": s[1]}
                        for p, s in before.items()},
+            "icici_plan_days": ({"path": plan_days_path(folder), "rows": plan[1], "read": plan[2] is None,
+                                 "error": plan[2]} if plan else None),
             "stores_changed": moved, "verdict": verdict, "unexplained": n_unexp, "waiting": n_wait,
             "peak_memory_mb": round(peak / 2**20), "exit_code": code}
     sm.write_text(os.path.join(out, "run_info.json"), json.dumps(info, indent=2, default=str) + "\n")
