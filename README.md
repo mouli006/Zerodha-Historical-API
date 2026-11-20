@@ -826,6 +826,24 @@ days = day_sources("RELIANCE", "2016-01-01", "2016-01-31")        # per day: sou
 `python -m backfill.equity.minute_combined report` counts every stock-day by source and reason, read only, into a
 new folder `analysis\combined_<date>\` (it refuses while a store is busy).
 
+## Data audit (every missing day has a reason)
+Before the backtest, every store must have **UNEXPLAINED = 0 and WAITING = 0**. The audit reads the equity 1-minute
+stores, the bhavcopy (EOD), the security master, the F&O backtest store and the ICICI progress, and gives each missing
+day one reason: PERMANENT (LOST, VENDOR, HOLIDAY, ICICI_EMPTY, ICICI_BEFORE_START), WAITING (WAITING_ICICI, P65_RETRY,
+NOT_FINISHED, UPDATE_PENDING) or UNEXPLAINED. It writes only a new folder `analysis\audit_<date>\` (`_b` for a second
+run the same day) and never changes a store. Run it when no download or update is running:
+
+```
+python -u -m backfill.equity.audit run --folder D:\Data\NSE_equity --fno-folder D:\Data\fno\backtest --fno-raw-kite D:\Data\fno\raw\kite --fno-raw-dhan D:\Data\fno\raw\dhan
+```
+
+- Exit 0 = clean, 1 = gaps, 2 = refused (a store busy, a path missing) or the stores changed during the run (run it
+  again).
+- Known gaps (a lost day with its problem number, a Monday-only stock waiting for the weekend retry) are listed by
+  hand in `NSE_CM_bhav\reference\manual_known_gaps.csv` (copy of `reference/manual_known_gaps.csv` in the repo).
+- Read `report.txt` first: counts per store and reason, the full UNEXPLAINED list, WAITING with when it clears, and
+  `changes.csv` (gaps filled / new since the last audit).
+
 ## Credentials
 Your API keys, secrets and access tokens (Kite and Dhan) are stored only in a local `.env` file, which the app creates when you sign in. It is gitignored and never committed. `.env.example` shows the format.
 

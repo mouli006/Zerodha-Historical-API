@@ -1,0 +1,15 @@
+store,security_id,symbol,underlying,from_date,to_date,reason,problem_id,clear_by,note
+equity,S003376,ELPROINTL,,2026-11-17,2026-11-17,LOST,P204,,withdrawn; no trading after (Kite update failure expected)
+equity,S003402,DRAGARWQ,,2026-11-17,2026-11-17,LOST,P204,,merged; no trading after (Kite update failure expected)
+equity,S000403,EDUCOMP,,2026-11-16,2026-11-16,P65_RETRY,P65,2026-11-22,Monday-only stock; weekend retry (D156)
+equity,S000620,CEREBRAINT,,2026-11-16,2026-11-16,P65_RETRY,P65,2026-11-22,Monday-only stock; weekend retry (D156)
+equity,S001694,NAGAFERT,,2026-11-16,2026-11-16,P65_RETRY,P65,2026-11-22,Monday-only stock; weekend retry (D156)
+equity,S001751,CMICABLES,,2026-11-16,2026-11-16,P65_RETRY,P65,2026-11-22,Monday-only stock; weekend retry (D156)
+equity,S001817,LASA,,2026-11-16,2026-11-16,P65_RETRY,P65,2026-11-22,Monday-only stock; weekend retry (D156)
+equity,S000730,SKIL,,2026-11-16,2026-11-16,P65_RETRY,P65,2026-11-22,Monday-only stock; weekend retry (D156)
+equity,S002254,SELMC,,2026-11-16,2026-11-16,P65_RETRY,P65,2026-11-22,Monday-only stock; weekend retry (D156)
+equity,S000420,BGLOBAL,,2026-11-16,2026-11-16,P65_RETRY,P65,2026-11-22,Monday-only stock; weekend retry (D156)
+equity,S001079,IMPEXFERRO,,2026-11-16,2026-11-16,P65_RETRY,P65,2026-11-22,Monday-only stock; weekend retry (D156)
+equity,S003262,CLCIND,,2026-11-16,2026-11-16,P65_RETRY,P65,2026-11-22,Monday-only stock; weekend retry (D156)
+equity,S000511,UNIVAFOODS,,2026-11-16,2026-11-16,P65_RETRY,P65,2026-11-22,Monday-only stock; weekend retry (D156)
+fno,,,NIFTY,2026-11-08,2026-11-09,LOST,P188,,"both sources (Kite + Dhan); Dhan rolling holds only the 9-Nov-expiry ATM +-10 strikes (#219), outside the backtest store"
