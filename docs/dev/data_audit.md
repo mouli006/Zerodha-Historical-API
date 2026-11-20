@@ -27,9 +27,12 @@ python -m backfill.equity.audit run --folder F [--fno-folder B] [--fno-raw-kite 
   `equity_update.lock`, bhavcopy store; with `fno` the 8 F&O run locks `<raw store>\.lock`); `minute_plan.check_inputs`
   (an input build running, not built or stale: master vs newest bhavcopy year, adjustments vs master, exits vs
   adjustments, index vs master; it does **not** look at the ICICI `bhav_cache`, which only `icici_minute.py plan` /
-  `checks` need, handover 4.E E4); a path missing or not absolute; `--out` exists.
+  `checks` need, handover 4.E E4); a path missing or not absolute; `--out` exists; with `icici`, a non-empty
+  `equity_1min_icici\download_progress.sqlite-wal` (the db is read with `immutable=1`, which skips the WAL: a run
+  ended without a clean finish; never delete the -wal file; the next normal ICICI run merges it). Any other error
+  also ends with exit 2. The Kite `download_progress.sqlite` is never opened, only snapshotted.
 - Stores changed: a snapshot before and after the run of every lock (held + mtime) and of the 4 F&O `days.csv`, both
-  `download_progress.sqlite`, the master `build_info.json`, `NSE_CM_bhav\days.csv` and the newest bhavcopy year file
+  `download_progress.sqlite` and their `-wal` files, the master `build_info.json`, `NSE_CM_bhav\days.csv` and the newest bhavcopy year file
   (mtime + size). Any difference or a lock held at the end: the folder is still written, `report.txt` and
   `summary.csv` start with "RESULT NOT VALID: stores changed during the run, run again", exit 2.
 

@@ -399,3 +399,27 @@ def test_exit_codes_and_every_path_in_the_report(tmp_path, monkeypatch):        
     w.tables["S1"] = kite_table([], {d(19): "A+ICICI_NOT_YET_FETCHED"})
     assert w.run() == 1
     assert "VERDICT: GAPS" in w.report(f"audit_{SAT:%Y-%m-%d}_b")
+
+
+def test_a_non_empty_icici_wal_is_refused(tmp_path, monkeypatch):                                 # 26
+    w = World(tmp_path, monkeypatch)
+    wal = audit.icici_db(w.folder) + "-wal"
+    with open(wal, "wb") as f:
+        f.write(b"x" * 4120)                     # rows a run left uncheckpointed (immutable=1 would not see them)
+    msgs = []
+    assert w.run(log=msgs.append) == 2
+    m = " ".join(msgs)
+    assert wal in m and "4,120 bytes" in m and "never delete the -wal file" in m
+    assert not os.path.exists(os.path.join(w.folder, "analysis"))
+    assert os.path.getsize(wal) == 4120          # left alone
+    assert w.run(stores=["eod"]) == 0            # without icici the WAL does not matter
+
+
+def test_any_other_error_ends_with_exit_2(tmp_path, monkeypatch, capsys):                         # 27
+    w = World(tmp_path, monkeypatch)
+
+    def no_master(folder=None):
+        raise sm.NotBuilt("No security master")
+    monkeypatch.setattr(audit.sm, "load_master", no_master)
+    assert audit.main(["run", "--folder", w.folder, "--stores", "eod"]) == 2
+    assert "NotBuilt" in capsys.readouterr().out

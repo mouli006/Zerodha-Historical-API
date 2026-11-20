@@ -142,6 +142,13 @@ def check_locks(folder, stores, fno):
     lines += [f"F&O run lock held: {p}" for p in fno_locks(fno) if held(p)]
     if lines:
         raise Refused("; ".join(lines) + "; run after it ends.")
+    if "icici" in stores:
+        wal = icici_db(folder) + "-wal"          # the db is read with immutable=1, which never reads the -wal file
+        size = os.path.getsize(wal) if os.path.isfile(wal) else 0
+        if size > 0:
+            raise Refused(f"ICICI progress db has an uncheckpointed WAL: {wal} ({size:,} bytes): a run ended without "
+                          "a clean finish; never delete the -wal file; the next normal ICICI run merges it; then run "
+                          "the audit again.")
     if "equity" in stores or "master" in stores:
         try:
             mp.check_inputs(folder)
@@ -160,7 +167,8 @@ def _stat(p):
 def snapshot(folder, fno):
     """{path: (mtime, size) or None, held} of every lock and the key files the audit reads (stores-changed check)."""
     files = list(mc.lock_paths(folder).values()) + fno_locks(fno)
-    files += [icici_db(folder), kite_db(folder), os.path.join(mp.store_dir(folder), "days.csv"),
+    files += [icici_db(folder), icici_db(folder) + "-wal", kite_db(folder), kite_db(folder) + "-wal",
+              os.path.join(mp.store_dir(folder), "days.csv"),
               os.path.join(sm.out_dir(folder), "build_info.json")]
     years = sm.year_files(mp.store_dir(folder)) if os.path.isdir(mp.store_dir(folder)) else []
     if years:
@@ -644,6 +652,9 @@ def main(argv=None):
         return run(a.folder, stores, a.fno_folder, a.fno_raw_kite, a.fno_raw_dhan, a.out, stocks)
     except (Refused, mp.MinutePlanError) as e:
         print(f"Refused: {e}")
+        return 2
+    except Exception as e:                       # any other error: the result is not valid (never exit 1 = GAPS)
+        print(f"Refused / error: {type(e).__name__}: {e}")
         return 2
 
 
