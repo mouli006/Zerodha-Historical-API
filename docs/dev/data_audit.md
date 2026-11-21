@@ -32,7 +32,7 @@ python -m backfill.equity.audit run --folder F [--fno-folder B] [--fno-raw-kite 
   ended without a clean finish; never delete the -wal file; the next normal ICICI run merges it). Any other error
   also ends with exit 2. The Kite `download_progress.sqlite` is never opened, only snapshotted.
 - Stores changed: a snapshot before and after the run of every lock (held + mtime) and of the 4 F&O `days.csv`, both
-  `download_progress.sqlite` and their `-wal` files, the master `build_info.json`, `NSE_CM_bhav\days.csv`, the ICICI plan's `icici_plan_days.parquet` and the newest bhavcopy year file
+  `download_progress.sqlite` and their `-wal` files, every F&O `bhav_compare.csv` the contract check reads (#253), the master `build_info.json`, `NSE_CM_bhav\days.csv`, the ICICI plan's `icici_plan_days.parquet` and the newest bhavcopy year file
   (mtime + size). Any difference or a lock held at the end: the folder is still written, `report.txt` and
   `summary.csv` start with "RESULT NOT VALID: stores changed during the run, run again", exit 2.
 
@@ -43,6 +43,7 @@ python -m backfill.equity.audit run --folder F [--fno-folder B] [--fno-raw-kite 
 | EOD | every weekday 2015-01-01 -> today (IST) plus the special-session weekend days, minus `days.csv` holiday rows | holiday row -> HOLIDAY (listed); `ok` row with its raw file = present; else manual LOST -> NOT_FINISHED / UPDATE_PENDING -> UNEXPLAINED |
 | master | `build_info.json` last_date vs the newest `ok` bhavcopy day | older -> UNEXPLAINED; kinds counted, ETF / RIGHTS = NOT_DOWNLOADED_KIND (one count line) |
 | F&O | each `days.csv` x kite / dhan, the EOD expected days from the set's first row -> today | `<src>_available` True: present, but an empty / `unchecked` `<src>_check` -> UNEXPLAINED; missing row / not available: manual LOST -> NOT_FINISHED / UPDATE_PENDING -> UNEXPLAINED |
+| F&O contracts (#253, store `fno_contract`) | every raw day folder of the 8 raw stores, its `bhavcopy\bhav_compare.csv` (written by the bhavcopy check / "Check all"; the audit never compares again: `backfill/equity/` may not import `backfill.bhav`) | no compare file, or one listing another number of files than the folder holds (stale) -> UNEXPLAINED; a contract `MISSING_IN_KITE` in the day's `best_source` store (backtest `days.csv`, per variant): manual `fno_contract` row (key underlying, date) -> else UNEXPLAINED, one row per date / underlying / variant / source (decision: option A, Mouli 22 Nov); missing in the other source = listed only |
 | ICICI | progress db (`mode=ro&immutable=1`, own connection: `icici_download.Progress` opens without `immutable=1`) | FAILED chunk / REVIEW stock -> UNEXPLAINED |
 
 Why this order (approved option A): the equity base is traded days, so HOLIDAY / NO_TRADE / listing reasons cannot
@@ -60,7 +61,7 @@ NOT_FINISHED; a weekend run after the Friday routine is the clean check.
 `reference/manual_known_gaps.csv` (repo copy) and `NSE_CM_bhav\reference\manual_known_gaps.csv` (data copy, the one
 the audit reads; copy it there after review, like the other manual files). Columns: `store, security_id, symbol,
 underlying, from_date, to_date, reason (LOST | P65_RETRY), problem_id, clear_by, note`. `store` = equity (key
-security_id), fno (key underlying, both sources and both variants) or eod (underlying NSE_CM). Missing data copy:
+security_id), fno (key underlying, both sources and both variants), fno_contract (key underlying: the day's best-source missing contracts, #253) or eod (underlying NSE_CM). Missing data copy:
 `report.txt` says so and those days stay UNEXPLAINED. Rows that match no gap are listed as "unused manual row" (info).
 Start rows (20 Nov): ELPROINTL / DRAGARWQ 2026-11-17 LOST P204; 11 P65 stocks 2026-11-16 P65_RETRY clear_by
 2026-11-22 (each checked: a 16 Nov bhavcopy row; RAJVIR left out, last traded 2026-10-26); NIFTY 2026-11-08..09 LOST
@@ -71,9 +72,11 @@ P188 both sources. COMPINFO (P215) is not added.
 |---|---|
 | `report.txt` | paths, F&O lock-file count, counts per store / reason / kind, flags (DAY_EMPTY, NO_BHAV_ROW, frozen, vendor cross-check, EOD / master / F&O / ICICI counts, unused manual rows), WAITING per reason with when it clears, the full UNEXPLAINED list, verdict, run time, peak memory |
 | `summary.csv` | store, reason, kind, days |
-| `gaps.csv` | store, security_id, symbol, underlying, source, date, reason, kind, evidence, clears_when |
+| `gaps.csv` | store, security_id, symbol, underlying, source, variant (with / without for F&O, else empty; #253), date, reason, kind, evidence, clears_when |
+| `fno_missing_contracts.csv` | (with `fno`) every contract a raw store lacks: date, underlying, variant, source, contract, expiry, bucket, type, strike, bhav_volume, bhav_oi, status, cause (ZERO_VOLUME_DROPPED = a without store lacks it and the same source's with store has it at volume 0; NOT_DOWNLOADED; BAD_NAME = a bhavcopy row that could not be named, never a gap), other_source_has (yes / no / empty = no compare file that day), best_source, day_folder |
+| `fno_contracts_summary.csv` | per store-day: bhav_traded, traded_files, extra_files, files, missing, zero_volume_dropped, not_downloaded, bad_names, other_source_has, best_source, adds_up (traded_files + missing = bhav_traded) |
 | `unexplained.csv` / `waiting.csv` | the rows of those kinds |
-| `changes.csv` | FILLED / NEW / REASON vs the newest older `audit_*` **folder** (a `audit_*.log` file is ignored) |
+| `changes.csv` | FILLED / NEW / REASON vs the newest older `audit_*` **folder** (a `audit_*.log` file is ignored), keyed by store, security_id, underlying, source, variant, date (an older gaps.csv without `variant` reads it as empty). A test run written with `--out` to a name not starting `audit_` is never the baseline |
 | `run_info.json` | start / end, git commit, stores, every path, input mtimes / sizes / held, verdict, counts, peak memory, exit code |
 
 **May run together:** with nothing that writes what it reads (6.3): not with a Kite update / fix, an ICICI download,

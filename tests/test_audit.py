@@ -370,7 +370,8 @@ def test_writes_nothing_outside_its_new_folder(tmp_path, monkeypatch):          
     assert {k: v for k, v in after.items() if k not in added} == before
     assert added and all(p.startswith(w.out() + os.sep) for p in added)
     assert sorted(os.listdir(w.out())) == sorted(["report.txt", "summary.csv", "gaps.csv", "unexplained.csv",
-                                                  "waiting.csv", "changes.csv", "run_info.json"])
+                                                  "waiting.csv", "changes.csv", "run_info.json",
+                                                  "fno_missing_contracts.csv", "fno_contracts_summary.csv"])
 
 
 def test_second_run_same_day_gets_a_b_folder(tmp_path, monkeypatch):                              # 23

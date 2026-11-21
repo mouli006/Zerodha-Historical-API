@@ -21,6 +21,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 import config
+from backfill.equity import audit_fno_contracts as fc
 from backfill.equity import icici_store as st
 from backfill.equity import minute_combined as mc
 from backfill.equity import minute_download as md
@@ -37,8 +38,9 @@ WAITING = ("WAITING_ICICI", "P65_RETRY", "NOT_FINISHED", "UPDATE_PENDING")
 MANUAL_NAME = "manual_known_gaps.csv"
 MANUAL_COLUMNS = ["store", "security_id", "symbol", "underlying", "from_date", "to_date", "reason", "problem_id",
                   "clear_by", "note"]
-GAP_COLUMNS = ["store", "security_id", "symbol", "underlying", "source", "date", "reason", "kind", "evidence",
-               "clears_when"]
+GAP_COLUMNS = ["store", "security_id", "symbol", "underlying", "source", "variant", "date", "reason", "kind",
+               "evidence", "clears_when"]
+FNO_CONTRACT = "fno_contract"                   # #253: contracts missing in a day's best source (per store variant)
 UNDERLYINGS = ("NIFTY", "SENSEX")
 VARIANTS = ("with", "without")
 SOURCES = ("kite", "dhan")
@@ -70,9 +72,10 @@ def kind_of(reason):
     return UNEXPLAINED
 
 
-def gap(store, day, reason, evidence="", security_id="", symbol="", underlying="", source="", clears=""):
+def gap(store, day, reason, evidence="", security_id="", symbol="", underlying="", source="", clears="", variant=""):
     return {"store": store, "security_id": security_id, "symbol": symbol, "underlying": underlying, "source": source,
-            "date": day, "reason": reason, "kind": kind_of(reason), "evidence": evidence, "clears_when": clears}
+            "variant": variant, "date": day, "reason": reason, "kind": kind_of(reason), "evidence": evidence,
+            "clears_when": clears}
 
 
 # ---- paths ----
@@ -187,9 +190,20 @@ def _stat(p):
         return None
 
 
-def snapshot(folder, fno):
-    """{path: (mtime, size) or None, held} of every lock and the key files the audit reads (stores-changed check)."""
-    files = list(mc.lock_paths(folder).values()) + fno_locks(fno)
+def fno_store_days(fno):
+    """{(source, variant, underlying, day): raw day folder} of the 8 raw stores; Refused when a day has two folders."""
+    if not fno:
+        return {}
+    try:
+        return fc.store_days(raw_folders(fno["raw"]))
+    except fc.DayFolderError as e:
+        raise Refused(f"F&O raw store: {e}") from None
+
+
+def snapshot(folder, fno, compare_files=()):
+    """{path: (mtime, size) or None, held} of every lock and the key files the audit reads (stores-changed check);
+    compare_files: the F&O bhav_compare.csv files the contract check reads (#253)."""
+    files = list(mc.lock_paths(folder).values()) + fno_locks(fno) + list(compare_files)
     files += [icici_db(folder), icici_db(folder) + "-wal", kite_db(folder), kite_db(folder) + "-wal",
               os.path.join(mp.store_dir(folder), "days.csv"),
               os.path.join(sm.out_dir(folder), "build_info.json"), plan_days_path(folder)]
@@ -411,19 +425,66 @@ def audit_fno(fno, manual, now, holidays, special):
                     chk = str(r.get(f"{s}_check", "")).strip()
                     if not chk or chk.lower() == "unchecked":
                         gaps.append(gap("fno", d, UNEXPLAINED, f"{v} zero volume: {s} day not checked",
-                                        underlying=u, source=s))
+                                        underlying=u, source=s, variant=v))
                     continue
                 ev = f"{v} zero volume: " + ("no days.csv row" if r is None else f"{s}_available False")
                 hit = manual.hit("fno", u, d, now.date())
                 if hit:
-                    gaps.append(gap("fno", d, hit[0], hit[1] or ev, underlying=u, source=s, clears=hit[2]))
+                    gaps.append(gap("fno", d, hit[0], hit[1] or ev, underlying=u, source=s, clears=hit[2], variant=v))
                     continue
                 t = time_reason("fno", d, newest, now)
                 if t:
-                    gaps.append(gap("fno", d, t[0], ev, underlying=u, source=s, clears=t[1]))
+                    gaps.append(gap("fno", d, t[0], ev, underlying=u, source=s, clears=t[1], variant=v))
                 else:
-                    gaps.append(gap("fno", d, UNEXPLAINED, ev, underlying=u, source=s))
+                    gaps.append(gap("fno", d, UNEXPLAINED, ev, underlying=u, source=s, variant=v))
     return gaps, info
+
+
+def best_sources(fno):
+    """{(variant, underlying, 'YYYY-MM-DD'): best_source} from the 4 backtest days.csv."""
+    out = {}
+    for (v, u), p in fno_days_paths(fno["backtest"]).items():
+        df = pd.read_csv(p, dtype=str, keep_default_na=False)
+        if "best_source" not in df.columns:
+            continue
+        for d, b in zip(df["date"], df["best_source"]):
+            if b.strip():
+                out[(v, u, str(sm.as_date(d)))] = b.strip()
+    return out
+
+
+def audit_fno_contracts(fno, days, manual, now):
+    """#253: (gaps, info, missing list frame, summary frame). Only contracts missing in the day's best source are a
+    gap (one row per date, underlying, variant, source; manual store 'fno_contract' by underlying and date); a raw day
+    folder without bhav_compare.csv or with a stale one is UNEXPLAINED; every other missing contract is listed only."""
+    rows, summary, problems, best_missing = fc.check(days, best_sources(fno))
+    gaps = []
+    for s, v, u, day, ev in problems:
+        gaps.append(gap(FNO_CONTRACT, sm.as_date(day), UNEXPLAINED, f"{v} zero volume: {ev}", underlying=u, source=s,
+                        variant=v))
+    for (v, u, day, s), names in sorted(best_missing.items()):
+        d = sm.as_date(day)
+        ev = (f"{v} zero volume: {len(names)} contract{'s' if len(names) != 1 else ''} missing in the best source "
+              f"({', '.join(names[:3])}{' ...' if len(names) > 3 else ''}); list in fno_missing_contracts.csv")
+        hit = manual.hit(FNO_CONTRACT, u, d, now.date())
+        if hit:
+            gaps.append(gap(FNO_CONTRACT, d, hit[0], hit[1] or ev, underlying=u, source=s, clears=hit[2], variant=v))
+        else:
+            gaps.append(gap(FNO_CONTRACT, d, UNEXPLAINED, ev, underlying=u, source=s, variant=v))
+    lst = pd.DataFrame(rows, columns=fc.LIST_COLUMNS)
+    summ = pd.DataFrame(summary, columns=fc.SUMMARY_COLUMNS)
+    per = {}
+    for r in rows:
+        k = (r["underlying"], r["variant"], r["source"])
+        c = per.setdefault(k, {"missing": 0, fc.ZERO_DROPPED: 0, fc.NOT_DOWNLOADED: 0, fc.BAD: 0, "other": 0})
+        c[r["cause"]] += 1
+        c["missing"] += r["cause"] != fc.BAD
+        c["other"] += r["other_source_has"] == "yes"
+    info = {"store_days": len(days), "compare_files": len(summary), "problems": len(problems), "per_store": per,
+            "best_missing": sum(len(x) for x in best_missing.values()), "best_days": len(best_missing),
+            "both": len(fc.missing_in_both(rows)), "not_adding_up": int((~summ["adds_up"].astype(bool)).sum())
+            if len(summ) else 0}
+    return gaps, info, lst, summ
 
 
 # ---- (e) ICICI ----
@@ -475,7 +536,7 @@ def previous_audit(folder, out):
     return max(dirs, key=os.path.getmtime) if dirs else None
 
 
-KEY = ["store", "security_id", "underlying", "source", "date"]
+KEY = ["store", "security_id", "underlying", "source", "variant", "date"]
 
 
 def changes(gaps, prev):
@@ -483,6 +544,9 @@ def changes(gaps, prev):
     if prev is None:
         return pd.DataFrame(columns=cols), "first audit: no older audit folder"
     old = pd.read_csv(os.path.join(prev, "gaps.csv"), dtype=str, keep_default_na=False)
+    for c in KEY:                                # an audit folder made before a column existed (variant, #253)
+        if c not in old.columns:
+            old[c] = ""
     new = gaps.astype(str).replace({"None": "", "nan": ""})
     o = {tuple(r[k] for k in KEY): r["reason"] for r in old.to_dict("records")}
     n = {tuple(r[k] for k in KEY): r["reason"] for r in new.to_dict("records")}
@@ -527,11 +591,13 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
         paths, fno = resolve_paths(folder, stores, fno_folder, raw_kite, raw_dhan)
         out = out_folder(folder, out, now)
         check_locks(folder, stores, fno)
+        fno_days = fno_store_days(fno)
     except Refused as e:
         log(f"Refused: {e}")
         return 2
     paths["output folder"] = out
-    before = snapshot(folder, fno)
+    compares = [fc.compare_path(p) for p in fno_days.values()]
+    before = snapshot(folder, fno, compares)
     manual_df = read_manual(paths["manual file"])
     manual = Manual(manual_df)
     special = set(ss.load_special_sessions(folder)["date"])
@@ -577,15 +643,18 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
     if "master" in stores:
         g, notes["master"] = audit_master(folder, eod_info["newest_ok"] if eod_info else None)
         gaps += g
+    fno_tables = None
     if "fno" in stores:
         g, notes["fno"] = audit_fno(fno, manual, now, eod_info["holidays"], special)
+        gaps += g
+        g, notes["fno_contracts"], *fno_tables = audit_fno_contracts(fno, fno_days, manual, now)
         gaps += g
     if "icici" in stores:
         g, notes["icici"] = audit_icici(folder)
         gaps += g
 
     df = pd.DataFrame(gaps, columns=GAP_COLUMNS)
-    after = snapshot(folder, fno)
+    after = snapshot(folder, fno, compares)
     moved = changed(before, after)
     n_unexp = int((df["kind"] == UNEXPLAINED).sum())
     n_wait = int((df["kind"] == "WAITING").sum())
@@ -620,6 +689,17 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
             + f"; NOT_DOWNLOADED_KIND (not in the minute stores): {other:,}")
     if "fno" in notes:
         say("  F&O days.csv rows: " + ", ".join(f"{x} {v}" for x, v in notes["fno"].items()))
+    if "fno_contracts" in notes:
+        c = notes["fno_contracts"]
+        say(f"  F&O contracts (#253): {c['store_days']:,} raw store-days, bhav_compare.csv read {c['compare_files']:,}, "
+            f"missing or stale {c['problems']:,}")
+        for (u, v, s), n in sorted(c["per_store"].items()):
+            say(f"    {u:<6} {v:<7} {s:<4} missing {n['missing']:,} (zero-volume dropped {n[fc.ZERO_DROPPED]:,}, "
+                f"not downloaded {n[fc.NOT_DOWNLOADED]:,}; other source has {n['other']:,}); "
+                f"bad names {n[fc.BAD]:,}")
+        say(f"    missing in the best source: {c['best_missing']:,} contracts on {c['best_days']:,} store-days "
+            f"(gaps {FNO_CONTRACT}); missing in both sources: {c['both']:,}")
+        say(f"    store-days where traded files + missing != bhav traded: {c['not_adding_up']:,}")
     if "icici" in notes:
         i = notes["icici"]
         say(f"  ICICI progress: {i.get('failed', 0)} FAILED chunks, {i.get('review', 0)} REVIEW stocks; "
@@ -652,6 +732,9 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
     sm.write_csv(df[df["kind"] == UNEXPLAINED], os.path.join(out, "unexplained.csv"))
     sm.write_csv(df[df["kind"] == "WAITING"], os.path.join(out, "waiting.csv"))
     sm.write_csv(chg, os.path.join(out, "changes.csv"))
+    if fno_tables:
+        sm.write_csv(fno_tables[0], os.path.join(out, "fno_missing_contracts.csv"))
+        sm.write_csv(fno_tables[1], os.path.join(out, "fno_contracts_summary.csv"))
     code = 2 if moved else (0 if verdict == "CLEAN" else 1)
     info = {"started": f"{now:%Y-%m-%d %H:%M:%S}", "ended": f"{md.as_ist(None):%Y-%m-%d %H:%M:%S}",
             "commit": git_commit(), "stores": list(stores), "paths": paths,
@@ -659,6 +742,8 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
                        for p, s in before.items()},
             "icici_plan_days": ({"path": plan_days_path(folder), "rows": plan[1], "read": plan[2] is None,
                                  "error": plan[2]} if plan else None),
+            "fno_contracts": ({k: v for k, v in notes["fno_contracts"].items() if k != "per_store"}
+                              if "fno_contracts" in notes else None),
             "stores_changed": moved, "verdict": verdict, "unexplained": n_unexp, "waiting": n_wait,
             "peak_memory_mb": round(peak / 2**20), "exit_code": code}
     sm.write_text(os.path.join(out, "run_info.json"), json.dumps(info, indent=2, default=str) + "\n")
