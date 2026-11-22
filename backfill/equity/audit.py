@@ -23,6 +23,7 @@ import pyarrow.parquet as pq
 import config
 from backfill.equity import audit_dhan_rolling as dr
 from backfill.equity import audit_fno_contracts as fc
+from backfill.equity import audit_prices as ap
 from backfill.equity import icici_store as st
 from backfill.equity import minute_combined as mc
 from backfill.equity import minute_download as md
@@ -211,6 +212,10 @@ def snapshot(folder, fno, compare_files=()):
     years = sm.year_files(mp.store_dir(folder)) if os.path.isdir(mp.store_dir(folder)) else []
     if years:
         files.append(max(years, key=os.path.getmtime))
+    files.append(ap.events_path(folder))                    # #251 inputs: split / bonus events, dividends
+    divs = ap.dividend_files(folder)
+    if divs:
+        files.append(max(divs, key=os.path.getmtime))
     if fno:
         files += list(fno_days_paths(fno["backtest"]).values())
     return {p: (_stat(p), held(p) if p.endswith(".lock") else False) for p in files}
@@ -316,12 +321,15 @@ def classify_equity(reason, day, sid, manual, newest_kite, now, plan_days=None):
     return UNEXPLAINED, reason, ""
 
 
-def audit_equity(folder, ids, symbols, manual, now, log=print, plan_days=None):
+def audit_equity(folder, ids, symbols, manual, now, log=print, plan_days=None, prices=None):
+    """prices: an audit_prices.PriceCheck fed with every stock's day table (#251, a flag only; never raises)."""
     none_rows, flags = [], {"day_empty": 0, "no_bhav_row": 0, "frozen": 0, "stocks": 0, "traded": 0}
     newest = None
     for sid, t in equity_tables(folder, ids, log):
         if t is None or not len(t):
             continue
+        if prices is not None:
+            prices.stock(sid, t)
         flags["stocks"] += 1
         tr = t[t["traded"]]
         flags["traded"] += len(tr)
@@ -558,6 +566,35 @@ def changes(gaps, prev):
     return pd.DataFrame(rows, columns=cols), f"compared with {prev}"
 
 
+def price_check(folder, manual, now, symbols, log):
+    """The #251 PriceCheck, or None when it cannot even be built (a flag only: never stops the audit)."""
+    try:
+        return ap.PriceCheck(folder, manual, now.date(), symbols, log)
+    except Exception as e:
+        log(f"  prices (#251): not run ({type(e).__name__}: {e})")
+        return None
+
+
+def price_lines(prices):
+    try:
+        return prices.report_lines()
+    except Exception as e:
+        return [f"  prices (#251): report failed ({type(e).__name__}: {e})"]
+
+
+def write_prices(prices, out):
+    """price_days.csv / price_summary.csv and the run_info part; None when the check did not run."""
+    if prices is None:
+        return None
+    try:
+        if prices.ok:
+            sm.write_csv(prices.frame(), os.path.join(out, "price_days.csv"))
+            sm.write_csv(prices.summary(), os.path.join(out, "price_summary.csv"))
+        return prices.info()
+    except Exception as e:
+        return {"ran": False, "error": f"{type(e).__name__}: {e}"}
+
+
 def git_commit():
     try:
         root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -640,7 +677,7 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
         say(f"  MANUAL FILE MISSING: {paths['manual file']}: its LOST / P65_RETRY days stay UNEXPLAINED")
     say("")
 
-    gaps, notes = [], {}
+    gaps, notes, prices = [], {}, None
     master = sm.load_master(folder)
     secs = master["securities"]
     symbols = dict(zip(secs["security_id"], secs["last_symbol"]))
@@ -652,7 +689,8 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
     if "equity" in stores:
         ids = sorted({ms.resolve(k, folder) for k in stocks}) if stocks else \
             sorted(secs.loc[secs["instrument_kind"] == "STOCK", "security_id"])
-        g, notes["equity"] = audit_equity(folder, ids, symbols, manual, now, log, plan[0])
+        prices = price_check(folder, manual, now, symbols, log)
+        g, notes["equity"] = audit_equity(folder, ids, symbols, manual, now, log, plan[0], prices)
         gaps += g
     if "master" in stores:
         g, notes["master"] = audit_master(folder, eod_info["newest_ok"] if eod_info else None)
@@ -699,6 +737,9 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
         vendor = int((df["reason"] == "VENDOR").sum())
         say(f"  vendor cross-check (info): VENDOR days {vendor:,}; newest vendor_days.csv "
             f"{vp or 'none'} rows {vn if vn is not None else '-'}")
+    if prices is not None:
+        for x in price_lines(prices):
+            say(x)
     if eod_info:
         say(f"  EOD days.csv rows {eod_info['rows']:,} = ok {eod_info['ok']:,} + holiday {eod_info['holiday']:,} "
             f"(+ others); newest ok {eod_info['newest_ok']}")
@@ -762,6 +803,7 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
         sm.write_csv(fno_tables[1], os.path.join(out, "fno_contracts_summary.csv"))
     if rolling is not None:
         sm.write_csv(dr.frame(rolling), os.path.join(out, "fno_dhan_rolling.csv"))
+    price_info = write_prices(prices, out)
     code = 2 if moved else (0 if verdict == "CLEAN" else 1)
     info = {"started": f"{now:%Y-%m-%d %H:%M:%S}", "ended": f"{md.as_ist(None):%Y-%m-%d %H:%M:%S}",
             "commit": git_commit(), "stores": list(stores), "paths": paths,
@@ -773,6 +815,7 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
                              if rolling is not None else None),
             "fno_contracts": ({k: v for k, v in notes["fno_contracts"].items() if k != "per_store"}
                               if "fno_contracts" in notes else None),
+            "prices": price_info,
             "stores_changed": moved, "verdict": verdict, "unexplained": n_unexp, "waiting": n_wait,
             "peak_memory_mb": round(peak / 2**20), "exit_code": code}
     sm.write_text(os.path.join(out, "run_info.json"), json.dumps(info, indent=2, default=str) + "\n")
