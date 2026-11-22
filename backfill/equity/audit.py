@@ -21,6 +21,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 import config
+from backfill.equity import audit_dhan_rolling as dr
 from backfill.equity import audit_fno_contracts as fc
 from backfill.equity import icici_store as st
 from backfill.equity import minute_combined as mc
@@ -581,9 +582,18 @@ def newest_vendor_days(folder):
 
 # ---- the run ----
 
+def rolling_stat(root):
+    """Before / after stat of the Dhan rolling files (#254); {} when they cannot be listed (a flag, never an error)."""
+    try:
+        return dr.stat(dr.input_files(root))
+    except Exception:
+        return {}
+
+
 def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, out=None, stocks=None, now=None,
-        log=print):
-    """The audit; returns the exit code (0 CLEAN, 1 GAPS, 2 refused / error / stores changed)."""
+        log=print, dhan_rolling=None):
+    """The audit; returns the exit code (0 CLEAN, 1 GAPS, 2 refused / error / stores changed). The Dhan rolling
+    check (#254, with fno) is a flag only: it never changes a reason, a kind or the exit code."""
     t0 = time.time()
     now = md.as_ist(now)
     stores = tuple(s for s in STORES if s in stores)
@@ -597,6 +607,10 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
         return 2
     paths["output folder"] = out
     compares = [fc.compare_path(p) for p in fno_days.values()]
+    rolling_root = (dhan_rolling or dr.default_root(fno["backtest"])) if fno else None
+    if fno:
+        paths["Dhan rolling (#254)"] = rolling_root
+    rolling_before = rolling_stat(rolling_root) if fno else {}
     before = snapshot(folder, fno, compares)
     manual_df = read_manual(paths["manual file"])
     manual = Manual(manual_df)
@@ -649,6 +663,11 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
         gaps += g
         g, notes["fno_contracts"], *fno_tables = audit_fno_contracts(fno, fno_days, manual, now)
         gaps += g
+    rolling = None
+    if "fno" in stores:
+        lost_days = {(x["underlying"], str(x["date"])) for x in gaps if x["store"] == "fno" and x["reason"] == "LOST"}
+        rolling = dr.read(rolling_root, lost_days)
+        dr.attach(gaps, rolling)
     if "icici" in stores:
         g, notes["icici"] = audit_icici(folder)
         gaps += g
@@ -656,6 +675,9 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
     df = pd.DataFrame(gaps, columns=GAP_COLUMNS)
     after = snapshot(folder, fno, compares)
     moved = changed(before, after)
+    rolling_after = rolling_stat(rolling_root) if rolling is not None else {}
+    rolling_moved = sorted(p for p in set(rolling_before) | set(rolling_after)
+                           if rolling_before.get(p) != rolling_after.get(p))    # a flag only, never in moved
     n_unexp = int((df["kind"] == UNEXPLAINED).sum())
     n_wait = int((df["kind"] == "WAITING").sum())
     verdict = "CLEAN" if not (n_unexp or n_wait) else "GAPS"
@@ -700,6 +722,9 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
         say(f"    missing in the best source: {c['best_missing']:,} contracts on {c['best_days']:,} store-days "
             f"(gaps {FNO_CONTRACT}); missing in both sources: {c['both']:,}")
         say(f"    store-days where traded files + missing != bhav traded: {c['not_adding_up']:,}")
+    if rolling is not None:
+        for x in dr.report_lines(rolling, rolling_moved):
+            say(x)
     if "icici" in notes:
         i = notes["icici"]
         say(f"  ICICI progress: {i.get('failed', 0)} FAILED chunks, {i.get('review', 0)} REVIEW stocks; "
@@ -735,6 +760,8 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
     if fno_tables:
         sm.write_csv(fno_tables[0], os.path.join(out, "fno_missing_contracts.csv"))
         sm.write_csv(fno_tables[1], os.path.join(out, "fno_contracts_summary.csv"))
+    if rolling is not None:
+        sm.write_csv(dr.frame(rolling), os.path.join(out, "fno_dhan_rolling.csv"))
     code = 2 if moved else (0 if verdict == "CLEAN" else 1)
     info = {"started": f"{now:%Y-%m-%d %H:%M:%S}", "ended": f"{md.as_ist(None):%Y-%m-%d %H:%M:%S}",
             "commit": git_commit(), "stores": list(stores), "paths": paths,
@@ -742,6 +769,8 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
                        for p, s in before.items()},
             "icici_plan_days": ({"path": plan_days_path(folder), "rows": plan[1], "read": plan[2] is None,
                                  "error": plan[2]} if plan else None),
+            "dhan_rolling": (dr.info(rolling, rolling_before, rolling_after, rolling_moved)
+                             if rolling is not None else None),
             "fno_contracts": ({k: v for k, v in notes["fno_contracts"].items() if k != "per_store"}
                               if "fno_contracts" in notes else None),
             "stores_changed": moved, "verdict": verdict, "unexplained": n_unexp, "waiting": n_wait,
@@ -760,6 +789,8 @@ def main(argv=None):
     r.add_argument("--fno-folder", help="F&O backtest store (absolute; default .env FNO_BACKTEST_DIR)")
     r.add_argument("--fno-raw-kite", help="F&O raw base of Kite (absolute; default .env FNO_RAW_KITE)")
     r.add_argument("--fno-raw-dhan", help="F&O raw base of Dhan (absolute; default .env FNO_RAW_DHAN)")
+    r.add_argument("--dhan-rolling", help="Dhan rolling folder (absolute; default <parent of --fno-folder>/dhan_rolling;"
+                                          " a flag only, #254)")
     r.add_argument("--out", help="new output folder (default <folder>/analysis/audit_<IST date>[_b ...])")
     r.add_argument("--stores", default=",".join(STORES), help="comma-separated: " + ",".join(STORES))
     r.add_argument("--stocks", help="comma-separated security_ids or symbols (default: every STOCK)")
@@ -770,7 +801,8 @@ def main(argv=None):
         p.error(f"unknown store(s): {', '.join(bad)}")
     stocks = [x.strip() for x in a.stocks.split(",") if x.strip()] if a.stocks else None
     try:
-        return run(a.folder, stores, a.fno_folder, a.fno_raw_kite, a.fno_raw_dhan, a.out, stocks)
+        return run(a.folder, stores, a.fno_folder, a.fno_raw_kite, a.fno_raw_dhan, a.out, stocks,
+                   dhan_rolling=a.dhan_rolling)
     except (Refused, mp.MinutePlanError) as e:
         print(f"Refused: {e}")
         return 2

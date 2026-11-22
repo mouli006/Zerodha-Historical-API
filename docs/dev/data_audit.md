@@ -10,7 +10,7 @@ WAITING = 0**: only PERMANENT reasons left.
 ## Command
 ```
 python -m backfill.equity.audit run --folder F [--fno-folder B] [--fno-raw-kite K] [--fno-raw-dhan D] [--out DIR]
-                                   [--stores equity,eod,master,fno,icici] [--stocks SID,...]
+                                   [--stores equity,eod,master,fno,icici] [--stocks SID,...] [--dhan-rolling R]
 ```
 - `--fno-folder` defaults to `.env` FNO_BACKTEST_DIR (`config.fno_backtest_dir()`), `--fno-raw-*` to FNO_RAW_KITE /
   FNO_RAW_DHAN (`config.fno_raw_dir`). A worktree has no `.env`: the backtest default is then empty (refused) and the
@@ -75,9 +75,26 @@ P188 both sources. COMPINFO (P215) is not added.
 | `gaps.csv` | store, security_id, symbol, underlying, source, variant (with / without for F&O, else empty; #253), date, reason, kind, evidence, clears_when |
 | `fno_missing_contracts.csv` | (with `fno`) every contract a raw store lacks: date, underlying, variant, source, contract, expiry, bucket, type, strike, bhav_volume, bhav_oi, status, cause (ZERO_VOLUME_DROPPED = a without store lacks it and the same source's with store has it at volume 0; NOT_DOWNLOADED; BAD_NAME = a bhavcopy row that could not be named, never a gap), other_source_has (yes / no / empty = no compare file that day), best_source, day_folder |
 | `fno_contracts_summary.csv` | per store-day: bhav_traded, traded_files, extra_files, files, missing, zero_volume_dropped, not_downloaded, bad_names, other_source_has, best_source, adds_up (traded_files + missing = bhav_traded) |
+| `fno_dhan_rolling.csv` | (with `fno`, #254; header only when nothing is found) one row per day and contract of every Dhan rolling expiry folder, covered or traded: date, underlying, expiry, contract (the #253 name), type, strike, coverage (full = every minute of that day / partly / none = traded, not covered), minutes, bars, first, last, labels, bhav_volume (contracts, from the folder's `bhav_compare.csv`), lost_row (yes = an fno LOST gap on that underlying and day), folder |
 | `unexplained.csv` / `waiting.csv` | the rows of those kinds |
 | `changes.csv` | FILLED / NEW / REASON vs the newest older `audit_*` **folder** (a `audit_*.log` file is ignored), keyed by store, security_id, underlying, source, variant, date (an older gaps.csv without `variant` reads it as empty). A test run written with `--out` to a name not starting `audit_` is never the baseline |
 | `run_info.json` | start / end, git commit, stores, every path, input mtimes / sizes / held, verdict, counts, peak memory, exit code |
+
+## Dhan rolling (#254, a flag only)
+NIFTY 8 + 9 Nov 2026 are fno LOST in both sources (P188); on 11 Nov (#219) Dhan's expired-options endpoint gave the
+9-Nov-expiry ATM ± 10 strikes, saved outside the backtest store in `<R>\<UNDERLYING>\exp-YYYY-MM-DD\`
+(`by_strike.parquet`, `bhav_compare.csv`, `bhav\BhavCopy_NSE_FO_*_YYYYMMDD_F_0000.csv.zip`; written by the one-off
+scripts in that folder, not the repo). Module `backfill/equity/audit_dhan_rolling.py` (pandas / pyarrow / zipfile only;
+its `contract_name` is a copy of `backfill/fno.py`'s, a test compares them). Tests: `tests/test_audit_dhan_rolling.py` (8).
+- `R` = `--dhan-rolling` (absolute), default `<parent of the F&O backtest folder>\dhan_rolling` (`D:\Data\fno\dhan_rolling`).
+- `report.txt` (Flags): per day and expiry folder: contracts (CE / PE), bars, minutes first-last, strike range; the
+  bhavcopy's traded contracts of that expiry covered full / partly / none; all traded NIFTY options + futures of the day
+  (from the zip); `-` when a file is missing. Info lines: a rolling day with no fno LOST row, folder not found, NOT read.
+- Each fno LOST gap of that underlying and day gets ` | Dhan rolling exp …: N contracts, M bars (traded of that expiry:
+  full a, partly b of t); fno_dhan_rolling.csv` added to its evidence. Reason, kind, clears_when, `summary.csv`,
+  `changes.csv`, the verdict and the **exit code never change**; a missing folder, an unreadable file or a file changed
+  during the run is a report line only (the rolling files have their own before / after list in `run_info.json`
+  `dhan_rolling`, never in "stores changed").
 
 **May run together:** with nothing that writes what it reads (6.3): not with a Kite update / fix, an ICICI download,
 `equity_update.py`, an F&O download or publish. Memory: the equity pass is `minute_combined`'s (990 MB peak on all
