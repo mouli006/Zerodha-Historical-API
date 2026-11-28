@@ -28,6 +28,17 @@ SUMMARY_COLUMNS = ["date", "underlying", "variant", "source", "bhav_traded", "tr
                    "missing", "zero_volume_dropped", "not_downloaded", "bad_names", "other_source_has", "best_source",
                    "adds_up"]
 
+# #265 price flags (D234 flag only, D235 limit): the stored last price (column Kite_last = close of the day's last
+# bar, also on the Dhan stores) against the bhavcopy LAST (Bhav_last). Own constants: backfill/equity/ may not import
+# backfill.bhav (tests/test_equity_imports.py).
+TICK = 0.05
+PRICE_PCT = 0.05                          # 5 % of Bhav_last
+PRICE_FLOOR = 0.20                        # Rs 0.20 = 4 ticks, the cheap-option floor
+PRICE_FIELDS = ("Bhav_last", "Kite_last")
+PRICE_COLUMNS = ["date", "underlying", "variant", "source", "contract", "expiry", "bucket", "type", "strike",
+                 "bhav_volume", "store_volume", "bhav_last", "store_last", "store_last_regular", "last_bar",
+                 "bhav_close", "bhav_settle", "diff", "diff_pct", "other_source_flagged", "best_source", "day_folder"]
+
 
 class DayFolderError(Exception):
     """A raw store has two folders for one trading day."""
@@ -155,6 +166,71 @@ def check(days, best):
                         "other_source_has": counts["other"], "best_source": b,
                         "adds_up": n_tf + n_miss == n_traded})
     return rows, summary, problems, best_missing
+
+
+def _price(x):
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
+def price_flags(days, best, pct=PRICE_PCT, floor=PRICE_FLOOR):
+    """#265: contracts whose stored last price is off the bhavcopy LAST by more than max(pct x Bhav_last, floor).
+
+    A flag only (D234): never a gap. Reads the same bhav_compare.csv files as check() (a missing file is already a
+    problem there); a file without the price columns is counted in no_price_columns, never an error. Skipped rows:
+    BAD_NAME, no stored file, Bhav_volume 0, Bhav_last 0 or empty, no stored last price.
+    Returns (rows in PRICE_COLUMNS, info)."""
+    compared, flagged, no_cols = {}, {}, 0
+    for key, day_dir in sorted(days.items()):
+        p = compare_path(day_dir)
+        if not os.path.isfile(p):
+            continue
+        df = read_compare(p)
+        if not all(c in df.columns for c in PRICE_FIELDS):
+            no_cols += 1
+            continue
+        seen, hits = {}, []
+        for r in df.to_dict("records"):
+            if str(r.get("Status", "")).startswith(BAD) or r.get("Kite_volume", "") == "":
+                continue
+            bl, sl = _price(r["Bhav_last"]), _price(r["Kite_last"])
+            if _num(r.get("Bhav_volume")) <= 0 or bl is None or bl <= 0 or sl is None:
+                continue
+            diff = round(abs(sl - bl), 6)
+            flag = diff > round(max(pct * bl, floor), 6)
+            seen[r.get("Contract", "")] = flag
+            if flag:
+                hits.append((r, diff, bl))
+        compared[key] = seen
+        flagged[key] = hits
+
+    rows, per = [], {}
+    for (s, v, u, day), hits in sorted(flagged.items()):
+        c = per.setdefault((u, v, s), {"flags": 0, "compared": 0})
+        c["compared"] += len(compared[(s, v, u, day)])
+        c["flags"] += len(hits)
+        other = compared.get((OTHER[s], v, u, day))
+        for r, diff, bl in hits:
+            name = r.get("Contract", "")
+            o = "" if other is None or name not in other else ("yes" if other[name] else "no")
+            rows.append({"date": day, "underlying": u, "variant": v, "source": s, "contract": name,
+                         "expiry": r.get("Expiry", ""), "bucket": r.get("Bucket", ""), "type": r.get("Type", ""),
+                         "strike": r.get("Strike", ""), "bhav_volume": r.get("Bhav_volume", ""),
+                         "store_volume": r.get("Kite_volume", ""), "bhav_last": r.get("Bhav_last", ""),
+                         "store_last": r.get("Kite_last", ""), "store_last_regular": r.get("Kite_last_regular", ""),
+                         "last_bar": r.get("Last_bar", ""), "bhav_close": r.get("Bhav_close", ""),
+                         "bhav_settle": r.get("Bhav_settle", ""), "diff": round(diff, 2),
+                         "diff_pct": round(diff / bl * 100, 2), "other_source_flagged": o,
+                         "best_source": best.get((v, u, day), ""), "day_folder": os.path.basename(days[(s, v, u, day)])})
+    both = {(r["date"], r["underlying"], r["variant"], r["contract"]) for r in rows if r["other_source_flagged"] == "yes"}
+    info = {"limit_pct": round(pct * 100, 4), "limit_ticks": round(floor / TICK),
+            "compared": sum(map(len, compared.values())), "flags": len(rows),
+            "store_days": sum(1 for h in flagged.values() if h),
+            "best_flags": sum(1 for r in rows if r["source"] == r["best_source"]), "both": len(both),
+            "no_price_columns": no_cols, "per_store": per}
+    return rows, info
 
 
 def missing_in_both(rows):

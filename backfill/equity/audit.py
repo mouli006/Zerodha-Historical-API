@@ -462,24 +462,43 @@ def best_sources(fno):
     return out
 
 
+def fno_newest(fno):
+    """{(variant, underlying): newest date of the backtest days.csv, or None when it has no rows} (as audit_fno)."""
+    out = {}
+    for (v, u), p in fno_days_paths(fno["backtest"]).items():
+        df = pd.read_csv(p, dtype=str, keep_default_na=False)
+        dates = [sm.as_date(x) for x in df["date"]] if "date" in df.columns else []
+        out[(v, u)] = max(dates) if dates else None
+    return out
+
+
 def audit_fno_contracts(fno, days, manual, now):
     """#253: (gaps, info, missing list frame, summary frame). Only contracts missing in the day's best source are a
     gap (one row per date, underlying, variant, source; manual store 'fno_contract' by underlying and date); a raw day
-    folder without bhav_compare.csv or with a stale one is UNEXPLAINED; every other missing contract is listed only."""
+    folder without bhav_compare.csv or with a stale one is a gap too; every other missing contract is listed only.
+    #264: a gap is first matched with the manual file, then time_reason (NOT_FINISHED before D+1 01:00 IST,
+    UPDATE_PENDING while the day is newer than the backtest days.csv), else UNEXPLAINED."""
     rows, summary, problems, best_missing = fc.check(days, best_sources(fno))
+    newest = fno_newest(fno)
     gaps = []
-    for s, v, u, day, ev in problems:
-        gaps.append(gap(FNO_CONTRACT, sm.as_date(day), UNEXPLAINED, f"{v} zero volume: {ev}", underlying=u, source=s,
-                        variant=v))
-    for (v, u, day, s), names in sorted(best_missing.items()):
-        d = sm.as_date(day)
-        ev = (f"{v} zero volume: {len(names)} contract{'s' if len(names) != 1 else ''} missing in the best source "
-              f"({', '.join(names[:3])}{' ...' if len(names) > 3 else ''}); list in fno_missing_contracts.csv")
+
+    def add(d, u, s, v, ev):
         hit = manual.hit(FNO_CONTRACT, u, d, now.date())
         if hit:
             gaps.append(gap(FNO_CONTRACT, d, hit[0], hit[1] or ev, underlying=u, source=s, clears=hit[2], variant=v))
+            return
+        t = time_reason("fno", d, newest.get((v, u)), now)
+        if t:
+            gaps.append(gap(FNO_CONTRACT, d, t[0], ev, underlying=u, source=s, clears=t[1], variant=v))
         else:
             gaps.append(gap(FNO_CONTRACT, d, UNEXPLAINED, ev, underlying=u, source=s, variant=v))
+
+    for s, v, u, day, ev in problems:
+        add(sm.as_date(day), u, s, v, f"{v} zero volume: {ev}")
+    for (v, u, day, s), names in sorted(best_missing.items()):
+        ev = (f"{v} zero volume: {len(names)} contract{'s' if len(names) != 1 else ''} missing in the best source "
+              f"({', '.join(names[:3])}{' ...' if len(names) > 3 else ''}); list in fno_missing_contracts.csv")
+        add(sm.as_date(day), u, s, v, ev)
     lst = pd.DataFrame(rows, columns=fc.LIST_COLUMNS)
     summ = pd.DataFrame(summary, columns=fc.SUMMARY_COLUMNS)
     per = {}
@@ -701,6 +720,9 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
         gaps += g
         g, notes["fno_contracts"], *fno_tables = audit_fno_contracts(fno, fno_days, manual, now)
         gaps += g
+        price_rows, notes["fno_prices"] = fc.price_flags(fno_days, best_sources(fno))   # #265: a flag only (D234)
+        fno_tables.append(pd.DataFrame(price_rows, columns=fc.PRICE_COLUMNS).sort_values(
+            ["date", "underlying", "variant", "source", "contract"], kind="stable"))
     rolling = None
     if "fno" in stores:
         lost_days = {(x["underlying"], str(x["date"])) for x in gaps if x["store"] == "fno" and x["reason"] == "LOST"}
@@ -763,6 +785,14 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
         say(f"    missing in the best source: {c['best_missing']:,} contracts on {c['best_days']:,} store-days "
             f"(gaps {FNO_CONTRACT}); missing in both sources: {c['both']:,}")
         say(f"    store-days where traded files + missing != bhav traded: {c['not_adding_up']:,}")
+    if "fno_prices" in notes:
+        pf = notes["fno_prices"]
+        say(f"  F&O price flags (#265, flag only; last vs NSE/BSE LAST, > {pf['limit_pct']:g} % and "
+            f"> Rs {fc.PRICE_FLOOR:.2f} = {pf['limit_ticks']} ticks): {pf['flags']:,} rows on {pf['store_days']:,} "
+            f"store-days; in the best source {pf['best_flags']:,}; in both sources {pf['both']:,}; "
+            f"compared {pf['compared']:,}; no price columns {pf['no_price_columns']:,} files")
+        for (u, v, s), n in sorted(pf["per_store"].items()):
+            say(f"    {u:<6} {v:<7} {s:<4} price flags {n['flags']:,} of {n['compared']:,} compared")
     if rolling is not None:
         for x in dr.report_lines(rolling, rolling_moved):
             say(x)
@@ -801,6 +831,7 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
     if fno_tables:
         sm.write_csv(fno_tables[0], os.path.join(out, "fno_missing_contracts.csv"))
         sm.write_csv(fno_tables[1], os.path.join(out, "fno_contracts_summary.csv"))
+        sm.write_csv(fno_tables[2], os.path.join(out, "fno_price_flags.csv"))
     if rolling is not None:
         sm.write_csv(dr.frame(rolling), os.path.join(out, "fno_dhan_rolling.csv"))
     price_info = write_prices(prices, out)
@@ -815,6 +846,8 @@ def run(folder, stores=STORES, fno_folder=None, raw_kite=None, raw_dhan=None, ou
                              if rolling is not None else None),
             "fno_contracts": ({k: v for k, v in notes["fno_contracts"].items() if k != "per_store"}
                               if "fno_contracts" in notes else None),
+            "fno_prices": ({k: v for k, v in notes["fno_prices"].items() if k not in ("per_store", "store_days")}
+                           if "fno_prices" in notes else None),
             "prices": price_info,
             "stores_changed": moved, "verdict": verdict, "unexplained": n_unexp, "waiting": n_wait,
             "peak_memory_mb": round(peak / 2**20), "exit_code": code}

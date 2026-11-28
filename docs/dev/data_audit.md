@@ -43,7 +43,7 @@ python -m backfill.equity.audit run --folder F [--fno-folder B] [--fno-raw-kite 
 | EOD | every weekday 2015-01-01 -> today (IST) plus the special-session weekend days, minus `days.csv` holiday rows | holiday row -> HOLIDAY (listed); `ok` row with its raw file = present; else manual LOST -> NOT_FINISHED / UPDATE_PENDING -> UNEXPLAINED |
 | master | `build_info.json` last_date vs the newest `ok` bhavcopy day | older -> UNEXPLAINED; kinds counted, ETF / RIGHTS = NOT_DOWNLOADED_KIND (one count line) |
 | F&O | each `days.csv` x kite / dhan, the EOD expected days from the set's first row -> today | `<src>_available` True: present, but an empty / `unchecked` `<src>_check` -> UNEXPLAINED; missing row / not available: manual LOST -> NOT_FINISHED / UPDATE_PENDING -> UNEXPLAINED |
-| F&O contracts (#253, store `fno_contract`) | every raw day folder of the 8 raw stores, its `bhavcopy\bhav_compare.csv` (written by the bhavcopy check / "Check all"; the audit never compares again: `backfill/equity/` may not import `backfill.bhav`) | no compare file, or one listing another number of files than the folder holds (stale) -> UNEXPLAINED; a contract `MISSING_IN_KITE` in the day's `best_source` store (backtest `days.csv`, per variant): manual `fno_contract` row (key underlying, date) -> else UNEXPLAINED, one row per date / underlying / variant / source (decision: option A, Mouli 22 Nov); missing in the other source = listed only |
+| F&O contracts (#253, store `fno_contract`) | every raw day folder of the 8 raw stores, its `bhavcopy\bhav_compare.csv` (written by the bhavcopy check / "Check all"; the audit never compares again: `backfill/equity/` may not import `backfill.bhav`) | no compare file, or one listing another number of files than the folder holds (stale); a contract `MISSING_IN_KITE` in the day's `best_source` store (backtest `days.csv`, per variant), one row per date / underlying / variant / source (decision: option A, Mouli 22 Nov): manual `fno_contract` row (key underlying, date) -> NOT_FINISHED / UPDATE_PENDING (#264; `newest` = that variant / underlying's newest backtest `days.csv` row) -> UNEXPLAINED; missing in the other source = listed only |
 | ICICI | progress db (`mode=ro&immutable=1`, own connection: `icici_download.Progress` opens without `immutable=1`) | FAILED chunk / REVIEW stock -> UNEXPLAINED |
 
 Why this order (approved option A): the equity base is traded days, so HOLIDAY / NO_TRADE / listing reasons cannot
@@ -75,12 +75,39 @@ P188 both sources. COMPINFO (P215) is not added.
 | `gaps.csv` | store, security_id, symbol, underlying, source, variant (with / without for F&O, else empty; #253), date, reason, kind, evidence, clears_when |
 | `fno_missing_contracts.csv` | (with `fno`) every contract a raw store lacks: date, underlying, variant, source, contract, expiry, bucket, type, strike, bhav_volume, bhav_oi, status, cause (ZERO_VOLUME_DROPPED = a without store lacks it and the same source's with store has it at volume 0; NOT_DOWNLOADED; BAD_NAME = a bhavcopy row that could not be named, never a gap), other_source_has (yes / no / empty = no compare file that day), best_source, day_folder |
 | `fno_contracts_summary.csv` | per store-day: bhav_traded, traded_files, extra_files, files, missing, zero_volume_dropped, not_downloaded, bad_names, other_source_has, best_source, adds_up (traded_files + missing = bhav_traded) |
+| `fno_price_flags.csv` | (with `fno`, #265; header only when nothing is flagged) one row per flagged contract and store-day: date, underlying, variant, source, contract, expiry, bucket, type, strike, bhav_volume, store_volume, bhav_last, store_last, store_last_regular (the bar before 15:30), last_bar, bhav_close, bhav_settle, diff, diff_pct, other_source_flagged (yes / no / empty), best_source, day_folder |
 | `fno_dhan_rolling.csv` | (with `fno`, #254; header only when nothing is found) one row per day and contract of every Dhan rolling expiry folder, covered or traded: date, underlying, expiry, contract (the #253 name), type, strike, coverage (full = every minute of that day / partly / none = traded, not covered), minutes, bars, first, last, labels, bhav_volume (contracts, from the folder's `bhav_compare.csv`), lost_row (yes = an fno LOST gap on that underlying and day), folder |
 | `price_days.csv` | (with `equity`, #251; header only when nothing is listed) one row per listed loaded day: security_id, symbol, date, source, list (CLOSE / HIGHLOW), loaded_close / high / low, bhav_close / last / high / low, close_off_pct, hl_off_pct, reason, problem_id, evidence |
 | `price_summary.csv` | (#251) list, source, reason, days, stocks |
 | `unexplained.csv` / `waiting.csv` | the rows of those kinds |
 | `changes.csv` | FILLED / NEW / REASON vs the newest older `audit_*` **folder** (a `audit_*.log` file is ignored), keyed by store, security_id, underlying, source, variant, date (an older gaps.csv without `variant` reads it as empty). A test run written with `--out` to a name not starting `audit_` is never the baseline |
 | `run_info.json` | start / end, git commit, stores, every path, input mtimes / sizes / held, verdict, counts, peak memory, exit code |
+
+## F&O fresh days (#264)
+A raw day folder without (or with a stale) `bhav_compare.csv`, and a best-source missing contract, go through the
+same order as the F&O days: manual `fno_contract` row -> `time_reason` -> UNEXPLAINED. Before D+1 01:00 IST the day is
+WAITING NOT_FINISHED (the evening download / Check all has not run yet); after that, a day newer than the backtest
+`days.csv` is WAITING UPDATE_PENDING ("after the next F&O download + check + publish"); a finished, published day stays
+UNEXPLAINED. A best-source gap only exists on a day that is in `days.csv` (its best source comes from there), so it can
+only be NOT_FINISHED, never UPDATE_PENDING. There is no F&O clock of its own: the equity D+1 01:00 IST rule is reused,
+as `audit_fno` does. Tests 18-20 of `tests/test_audit_fno_contracts.py`.
+
+## F&O price flags (#265, a flag only)
+Is the stored last price of each contract-day near NSE / BSE's LAST? `audit_fno_contracts.price_flags` reads the same
+`bhav_compare.csv` files as the #253 check (CSV only, no import of `backfill.bhav`, so own constants).
+- **Rule (D235):** flag when `|stored last − Bhav_last| > max(5 % × Bhav_last, ₹0.20 = 4 ticks)`
+  (`PRICE_PCT = 0.05`, `PRICE_FLOOR = 0.20`). Stored last = the `Kite_last` column (close of the day's last bar, also on
+  the Dhan stores). `Bhav_close` / `Bhav_settle` / the 15:29 bar are shown, never the flag: F&O close and settlement are
+  not the last trade (discovery 26 Nov: stored last vs LAST agreed within 0.5 % on 98 % of compared rows).
+- **Skipped rows:** BAD_NAME, no stored file, Bhav_volume 0, Bhav_last 0 / empty, no stored last. A compare file
+  without the price columns (old) is counted as "no price columns", never an error; a missing one is already a #253 gap.
+- **Flag only (D234):** never in `gaps.csv`; reason, kind, VERDICT and exit code never change. After a week of daily
+  counts Mouli looks again at "best source only".
+- `report.txt` (Flags): one line "F&O price flags (#265, flag only; …): N rows on M store-days; in the best source K;
+  in both sources J (contract-days flagged in kite and dhan); compared C; no price columns F files", then one line per
+  store. `run_info.json` `fno_prices`: limit_pct, limit_ticks, compared, flags, best_flags, both, no_price_columns.
+  The compare files are read before the stores-changed snapshot is taken, so a change during the run still gives exit 2.
+- Tests 11-17 of `tests/test_audit_fno_contracts.py`.
 
 ## Dhan rolling (#254, a flag only)
 NIFTY 8 + 9 Nov 2026 are fno LOST in both sources (P188); on 11 Nov (#219) Dhan's expired-options endpoint gave the
